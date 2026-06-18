@@ -16,9 +16,10 @@
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    Context, EventEmitter, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    SharedString, Styled, Window, div, prelude::*, px, svg, uniform_list,
+    ClipboardItem, Context, EventEmitter, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    Render, SharedString, Styled, Window, div, prelude::*, px, svg, uniform_list,
 };
+use gpui_component::menu::{ContextMenuExt, PopupMenu};
 use gpui_component::{ActiveTheme, tooltip::Tooltip};
 use notify::{EventKind, RecursiveMode, Watcher, event::ModifyKind};
 use parking_lot::Mutex;
@@ -594,6 +595,7 @@ impl Render for FileTreeView {
                     };
 
                     let weak = weak.clone();
+                    let path_for_menu = path.clone();
                     div()
                         .id(("file-row", idx))
                         .debug_selector(move || format!("file-tree-row-{idx}"))
@@ -696,6 +698,9 @@ impl Render for FileTreeView {
                                 }
                             },
                         )
+                        .context_menu(move |menu, _window, _cx| {
+                            build_file_context_menu(menu, path_for_menu.clone())
+                        })
                         .into_any_element()
                 })
                 .collect()
@@ -711,6 +716,42 @@ impl Render for FileTreeView {
             .child(list)
             .into_any_element()
     }
+}
+
+/// Text copied by the "Copy Path" row action: the full path as displayed.
+fn copy_path_text(path: &Path) -> String {
+    path.display().to_string()
+}
+
+/// Text copied by the "Copy Name" row action: the final path component.
+///
+/// Returns an empty string for paths without a final component (for example
+/// a filesystem root), matching what the clipboard receives in that case.
+fn copy_name_text(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// Build the context menu for a file/directory row in the file tree.
+fn build_file_context_menu(menu: PopupMenu, path: PathBuf) -> PopupMenu {
+    use gpui_component::menu::PopupMenuItem;
+
+    let path_for_copy = path.clone();
+    let copy_path_item = PopupMenuItem::new("Copy Path").on_click(move |_event, _window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(copy_path_text(&path_for_copy)));
+    });
+
+    let path_for_copy_name = path;
+    let copy_name_item = PopupMenuItem::new("Copy Name").on_click(move |_event, _window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(copy_name_text(
+            &path_for_copy_name,
+        )));
+    });
+
+    menu.min_w(px(180.0))
+        .item(copy_path_item)
+        .item(copy_name_item)
 }
 
 #[cfg(test)]
@@ -1249,5 +1290,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn copy_path_text_keeps_the_whole_path() {
+        let path = Path::new("/project/src/main.rs");
+        assert_eq!(copy_path_text(path), "/project/src/main.rs");
+    }
+
+    #[test]
+    fn copy_name_text_keeps_the_final_component() {
+        assert_eq!(copy_name_text(Path::new("/project/src/main.rs")), "main.rs");
+        // A directory row copies the directory name, not its contents.
+        assert_eq!(copy_name_text(Path::new("/project/src")), "src");
+        // Paths without a final component copy an empty string.
+        assert_eq!(copy_name_text(Path::new("/")), "");
     }
 }
