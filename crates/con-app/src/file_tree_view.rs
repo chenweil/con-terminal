@@ -13,10 +13,11 @@
 //! - No borders — surface separation via bg opacity.
 
 use gpui::{
-    Context, EventEmitter, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    SharedString, Styled, Window, div, prelude::*, px, svg, uniform_list,
+    ClipboardItem, Context, EventEmitter, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Render, SharedString, Styled, Window, div, prelude::*, px, svg, uniform_list,
 };
 use gpui_component::ActiveTheme;
+use gpui_component::menu::{ContextMenuExt, PopupMenu};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -317,6 +318,9 @@ impl Render for FileTreeView {
                     };
 
                     let weak = weak.clone();
+                    let weak_for_menu = weak.clone();
+                    let path_for_menu = path.clone();
+                    let is_dir_for_menu = is_dir;
                     div()
                         .id(("file-row", idx))
                         .h(px(ROW_HEIGHT))
@@ -373,6 +377,14 @@ impl Render for FileTreeView {
                                 });
                             }
                         })
+                        .context_menu(move |menu, _window, _cx| {
+                            build_file_context_menu(
+                                menu,
+                                weak_for_menu.clone(),
+                                path_for_menu.clone(),
+                                is_dir_for_menu,
+                            )
+                        })
                         .into_any_element()
                 })
                 .collect()
@@ -388,6 +400,42 @@ impl Render for FileTreeView {
             .child(list)
             .into_any_element()
     }
+}
+
+/// Build the context menu for a file/directory row in the file tree.
+fn build_file_context_menu(
+    menu: PopupMenu,
+    _weak: gpui::WeakEntity<FileTreeView>,
+    path: PathBuf,
+    _is_dir: bool,
+) -> PopupMenu {
+    use gpui_component::menu::PopupMenuItem;
+
+    let path_for_copy = path.clone();
+    let path_for_copy_name = path.clone();
+
+    // Copy full path
+    let copy_path_item = PopupMenuItem::new("Copy Path").on_click(
+        move |_event, _window, cx| {
+            let path_str = path_for_copy.display().to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(path_str));
+        },
+    );
+
+    // Copy file/directory name
+    let copy_name_item = PopupMenuItem::new("Copy Name").on_click(
+        move |_event, _window, cx| {
+            let name = path_for_copy_name
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            cx.write_to_clipboard(ClipboardItem::new_string(name));
+        },
+    );
+
+    menu.min_w(px(180.0))
+        .item(copy_path_item)
+        .item(copy_name_item)
 }
 
 #[cfg(test)]
