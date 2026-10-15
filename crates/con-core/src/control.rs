@@ -107,6 +107,36 @@ pub struct ControlMethodInfo {
 
 const CONTROL_METHODS: &[(&str, &str)] = &[
     (
+        "handoffs.agents",
+        "List installed local agents and handoff capabilities.",
+    ),
+    (
+        "handoffs.open",
+        "Open Agent Handoff for the active terminal (macOS).",
+    ),
+    (
+        "handoffs.sources",
+        "List exact local sessions for the selected agent (macOS).",
+    ),
+    (
+        "handoffs.prepare",
+        "Prepare a filtered handoff preview for a handoff job.",
+    ),
+    ("handoffs.list", "List durable handoffs for a directory."),
+    ("handoffs.get", "Read handoff state and preview."),
+    (
+        "handoffs.start",
+        "Open a one-shot native agent startup helper in a new surface.",
+    ),
+    (
+        "handoffs.respond",
+        "Explicitly confirm delivery, receipt, or stopped work.",
+    ),
+    (
+        "handoffs.cancel",
+        "Cancel preparation or request a visible stop confirmation.",
+    ),
+    (
         "system.identify",
         "Return app identity, active tab, socket path, and method inventory.",
     ),
@@ -244,6 +274,7 @@ pub struct AgentAskResult {
 
 #[derive(Debug, Clone)]
 pub enum ControlCommand {
+    Handoff(crate::handoff::HandoffRpc),
     SystemIdentify,
     SystemCapabilities,
     TabsList,
@@ -396,6 +427,7 @@ pub enum ControlCommand {
 impl ControlCommand {
     pub fn method_name(&self) -> &'static str {
         match self {
+            Self::Handoff(command) => command.method(),
             Self::SystemIdentify => "system.identify",
             Self::SystemCapabilities => "system.capabilities",
             Self::TabsList => "tabs.list",
@@ -433,6 +465,7 @@ impl ControlCommand {
 
     pub fn params_json(&self) -> Value {
         match self {
+            Self::Handoff(command) => command.params(),
             Self::SystemIdentify | Self::SystemCapabilities | Self::TabsList | Self::TabsNew => {
                 json!({})
             }
@@ -675,6 +708,11 @@ impl ControlCommand {
     }
 
     pub fn from_rpc(method: &str, params: Value) -> Result<Self, ControlError> {
+        if method.starts_with("handoffs.") {
+            return crate::handoff::HandoffRpc::parse(method, params)
+                .map(Self::Handoff)
+                .map_err(|error| ControlError::invalid_params(error.to_string()));
+        }
         match method {
             "system.identify" => Ok(Self::SystemIdentify),
             "system.capabilities" => Ok(Self::SystemCapabilities),
@@ -1018,10 +1056,25 @@ impl Drop for ControlSocketHandle {
 }
 
 pub fn control_socket_path() -> PathBuf {
-    match env::var("CON_SOCKET_PATH") {
-        Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
-        _ => PathBuf::from(DEFAULT_SOCKET_PATH),
+    if let Ok(value) = env::var("CON_SOCKET_PATH")
+        && !value.trim().is_empty()
+    {
+        return PathBuf::from(value);
     }
+    #[cfg(unix)]
+    {
+        if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR")
+            && !runtime_dir.trim().is_empty()
+        {
+            let socket_name = if cfg!(debug_assertions) {
+                "con-debug.sock"
+            } else {
+                "con.sock"
+            };
+            return PathBuf::from(runtime_dir).join("con").join(socket_name);
+        }
+    }
+    PathBuf::from(DEFAULT_SOCKET_PATH)
 }
 
 #[cfg(unix)]
@@ -1257,7 +1310,26 @@ async fn handle_json_rpc_request(
 #[cfg(unix)]
 fn prepare_socket_path(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if parent.exists() && !parent.is_dir() {
+            anyhow::bail!(
+                "control socket parent is not a directory: {}",
+                parent.display()
+            );
+        }
+
+        // Apply private permissions atomically to directories we create while
+        // leaving existing parents such as /tmp or XDG_RUNTIME_DIR untouched.
+        // A post-create chmod has both an ownership failure mode and a window
+        // where a newly created directory can be more permissive than intended.
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(parent).with_context(|| {
+            format!(
+                "failed to create control socket directory {}",
+                parent.display()
+            )
+        })?;
     }
 
     if path.exists() {
@@ -1692,6 +1764,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn unique_scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "con-control-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// Regression: a pre-existing parent directory must be left untouched.
+    /// chmod-ing a foreign parent (e.g. /tmp, root-owned 1777) fails with
+    /// EPERM for non-root users and previously aborted the socket bind.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_socket_path_preserves_existing_parent_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_scratch_dir("existing-parent");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+            .expect("set scratch permissions");
+        let socket = dir.join("con.sock");
+
+        prepare_socket_path(&socket).expect("prepare with existing parent");
+
+        let mode = std::fs::metadata(&dir)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755, "existing parent permissions must be untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Flatpak hardening this code was added for: a parent created by Con
+    /// starts with private permissions.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_socket_path_hardens_newly_created_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = unique_scratch_dir("new-parent");
+        let socket = base.join("fresh").join("con.sock");
+
+        prepare_socket_path(&socket).expect("prepare with new parent");
+
+        let mode = std::fs::metadata(socket.parent().expect("parent"))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "newly created parent must be hardened");
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn control_command_round_trips_from_rpc() {

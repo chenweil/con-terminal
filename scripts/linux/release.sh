@@ -69,15 +69,71 @@ echo "    arch    : ${art_arch}"
 echo "    tarball : ${tarball}"
 echo
 
-# ── Build ───────────────────────────────────────────────────────────────────
-
 # Match the Windows + macOS pipelines: bake version + channel into
 # the binary at compile time so option_env!() in
-# crates/con-core/src/release_channel.rs picks them up. The Linux
-# updater (added alongside this script) reads the channel to decide
-# which Sparkle-shaped appcast to poll.
+# crates/con-core/src/release_channel.rs picks them up.
 export CON_RELEASE_VERSION="${version}"
 export CON_RELEASE_CHANNEL="${channel}"
+
+# Optional Zig-based cross-linker wrapper to target GLIBC 2.38 for
+# backward compatibility and Flatpak runtime compatibility.
+zig_bin=""
+if command -v zig >/dev/null 2>&1; then
+  zig_bin="$(command -v zig)"
+elif [[ -n "${CON_ZIG_BIN:-}" && -x "${CON_ZIG_BIN:-}" ]]; then
+  zig_bin="${CON_ZIG_BIN}"
+else
+  # Check common install locations
+  zig_candidate="$(ls -d "$HOME"/.local/zig-*-linux-*/zig /tmp/zig-*-linux-*/zig /tmp/zig-*/zig 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$zig_candidate" && -x "$zig_candidate" ]]; then
+    zig_bin="$zig_candidate"
+  fi
+fi
+
+# Setup helper lib symlinks if missing (e.g. libxkbcommon-x11.so on systems without -devel)
+mkdir -p target/syslibs
+for libpath in /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
+  if [[ -f "${libpath}/libxkbcommon-x11.so.0" && ! -f "target/syslibs/libxkbcommon-x11.so" ]]; then
+    ln -sf "${libpath}/libxkbcommon-x11.so.0" "target/syslibs/libxkbcommon-x11.so"
+  fi
+done
+
+if [[ -n "$zig_bin" ]]; then
+  zig_target=""
+  linker_wrapper=""
+  case "$art_arch" in
+    x86_64)
+      zig_target="x86_64-linux-gnu.2.38"
+      ;;
+    arm64)
+      zig_target="aarch64-linux-gnu.2.38"
+      ;;
+  esac
+
+  if [[ -n "$zig_target" ]]; then
+    linker_wrapper="$(mktemp "${TMPDIR:-/tmp}/con-zig-linker-${art_arch}.XXXXXX")"
+    trap 'rm -f "$linker_wrapper"' EXIT
+    case "$art_arch" in
+      x86_64) export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$linker_wrapper" ;;
+      arm64) export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$linker_wrapper" ;;
+    esac
+    cat > "$linker_wrapper" <<EOF
+#!/bin/bash
+args=()
+for arg in "\$@"; do
+  # Rust's aarch64 target adds this GNU ld workaround by default. Zig's
+  # lld does not implement it; dropping only this optional flag keeps the
+  # rest of the linker invocation and ABI unchanged.
+  if [[ "\$arg" == "-Wl,--fix-cortex-a53-843419" ]]; then
+    continue
+  fi
+  args+=("\$arg")
+done
+exec "$zig_bin" cc -target "$zig_target" -L"$repo_root/target/syslibs" "\${args[@]}"
+EOF
+    chmod +x "$linker_wrapper"
+  fi
+fi
 
 echo "==> cargo build -p con -p con-cli --release"
 cargo build -p con -p con-cli --release
@@ -120,20 +176,25 @@ Type=Application
 Name=con
 GenericName=Terminal
 Comment=GPU-accelerated terminal emulator with a built-in AI agent harness
+TryExec=con
 Exec=/usr/local/bin/con %U
-Icon=con
+Icon=${linux_app_id}
 Terminal=false
 Categories=System;TerminalEmulator;Utility;
 Keywords=terminal;shell;command;cli;ai;agent;
 StartupWMClass=${linux_app_id}
+X-TerminalArgExec=-e
+X-TerminalArgAppId=--app-id=
+X-TerminalArgTitle=--title=
+X-TerminalArgDir=--working-directory=
 EOF
 
 # 256x256 icon — freedesktop hicolor's bread-and-butter size, and
 # what GNOME / KDE / xfce / wayland launchers all hit-test against
 # first. Pull from the macOS app-icon set we already ship.
-icon_src="assets/Con-macOS-Dark-256x256@2x.png"
+icon_src="assets/app-icons/con-raccoon-tail-A6.png"
 if [[ -f "$icon_src" ]]; then
-  cp "$icon_src" "${stage_dir}/con.png"
+  cp "$icon_src" "${stage_dir}/${linux_app_id}.png"
 else
   echo "warning: ${icon_src} missing — Linux tarball ships without an app icon" >&2
 fi

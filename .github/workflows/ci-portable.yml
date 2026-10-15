@@ -7,33 +7,37 @@ name: ci-portable
 #   - con-cli   (control client, Unix socket + named pipe transport)
 #   - con-agent (tokio, rig)
 #   - con-terminal (theme helpers)
-#   - con-ghostty  (stub backend on non-macOS, libghostty wrapper on macOS)
-#   - con          (the UI binary — stub terminal view on non-macOS)
+#   - con-ghostty  (real libghostty-vt backend on Windows and Linux)
+#   - con          (the cross-platform UI binary)
 #
-# Jobs run `cargo check` (not `cargo build`) to keep CI fast; they also
-# run the test suite for crates that can run hermetic tests on the host.
+# Jobs run both checks and linked tests so libghostty-vt ABI or symbol drift
+# cannot hide behind Cargo's non-linking `check` path.
 
 on:
   push:
     branches: [main]
     paths:
       - ".github/workflows/ci-portable.yml"
+      - ".github/workflows/publish-flatpak.yml"
       - ".github/workflows/release-*.yml"
       - ".cargo/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "assets/**"
+      - "packaging/**"
       - "docs/**"
       - "crates/**"
       - "scripts/**"
   pull_request:
     paths:
       - ".github/workflows/ci-portable.yml"
+      - ".github/workflows/publish-flatpak.yml"
       - ".github/workflows/release-*.yml"
       - ".cargo/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "assets/**"
+      - "packaging/**"
       - "docs/**"
       - "crates/**"
       - "scripts/**"
@@ -54,14 +58,9 @@ jobs:
     # the ancestor directory is still `con`. We sidestep the whole tree
     # by cloning into C:\src\repo outside $GITHUB_WORKSPACE and pointing
     # every subsequent step there.
-    #
-    # CON_SKIP_GHOSTTY_VT tells con-ghostty's build.rs to skip the
-    # zig-driven libghostty-vt build. `cargo check` doesn't link, so
-    # unresolved symbols don't matter; Zig 0.13+ isn't preinstalled on
-    # windows-latest images so trying to build would panic.
     env:
-      CON_SKIP_GHOSTTY_VT: "1"
       CON_CHECKOUT_DIR: C:\src\repo
+      ZIG_GLOBAL_CACHE_DIR: C:\zc
     defaults:
       run:
         working-directory: C:\src\repo
@@ -84,6 +83,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: C:\src\repo
+      - name: Prepare short-path Zig cache
+        working-directory: C:\
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path $env:ZIG_GLOBAL_CACHE_DIR | Out-Null
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
       - name: PowerShell installer parse check
         shell: pwsh
         run: |
@@ -99,15 +106,28 @@ jobs:
             throw "PowerShell parse errors in scripts/install.ps1"
           }
       - name: cargo check — portable crates
-        run: cargo check -p con-core -p con-cli -p con-agent -p con-terminal -p con-ghostty
-      - name: cargo check — UI binary (stub terminal backend)
+        run: cargo check --locked -p con-core -p con-cli -p con-agent -p con-terminal -p con-ghostty
+      - name: cargo check — UI binary
         # The default `bin-con` target compiles to `con.exe`, which Win32
         # file APIs reject because CON is a reserved device name. The
         # `bin-con-app` feature routes the same `main.rs` to `con-app.exe`
         # instead — mirrors what `cargo wbuild` / `cargo wrun` do locally.
-        run: cargo check -p con --no-default-features --features con/bin-con-app
+        run: cargo check --locked -p con --no-default-features --features con/bin-con-app
       - name: cargo test — portable crates
-        run: cargo test -p con-core -p con-cli -p con-agent -p con-terminal
+        run: cargo test --locked -p con-core -p con-cli -p con-agent -p con-terminal -p con-ghostty
+      - name: State presentation layout tests
+        run: |
+          cargo test --locked -p con --no-default-features --features con/bin-con-app --bin con-app sidebar::
+          cargo test --locked -p con --no-default-features --features con/bin-con-app --bin con-app terminal_geometry::
+          cargo test --locked -p con --no-default-features --features con/bin-con-app --bin con-app app_icon::
+          cargo test --locked -p con --no-default-features --features con/bin-con-app --bin con-app agent_panel::tests
+          cargo test --locked -p con --no-default-features --features con/bin-con-app --bin con-app workspace::render::top_bar
+          cargo test --locked -p con --no-default-features --features con/bin-con-app --bin con-app workspace::tests::horizontal_tab_reorder
+          cargo test --locked -p con --no-default-features --features con/bin-con-app --bin con-app input_bar::tests
+      - name: Program status acceptance fixture tests
+        run: |
+          python -m unittest discover -s scripts/terminal -p 'test_*.py'
+          cargo test --locked -p con-core --example program_status_bench
 
   linux:
     name: check (ubuntu-latest)
@@ -116,6 +136,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Docs manifest validation
         run: python3 scripts/docs/validate-manifest.py
+      - name: Program status acceptance fixture tests
+        run: python3 -m unittest discover -s scripts/terminal -p 'test_*.py'
       - name: Release script syntax checks
         shell: bash
         run: |
@@ -124,16 +146,20 @@ jobs:
           bash -n scripts/linux/release.sh
           bash -n scripts/release/verify-artifacts.sh
           bash -n scripts/release/verify-release-gate.sh
+          ./scripts/release/verify-artifacts.sh desktop \
+            packaging/flatpak/co.nowledge.con.desktop
           for script in scripts/macos/*.sh scripts/sparkle/*.sh; do
             bash -n "$script"
           done
+          bash scripts/macos/test-stapler-retry.sh
+          bash scripts/macos/test-dependencies.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.16.0
         shell: bash
         run: |
           set -euo pipefail
-          ZIG_VERSION="0.15.2"
+          ZIG_VERSION="0.16.0"
           ZIG_ARCH="x86_64"
           ZIG_DIR="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
           ZIG_TARBALL="${ZIG_DIR}.tar.xz"
@@ -164,8 +190,19 @@ jobs:
             libwayland-dev libvulkan-dev \
             libfreetype-dev libfontconfig1-dev
       - name: cargo check — portable crates
-        run: cargo check -p con-core -p con-cli -p con-agent -p con-terminal -p con-ghostty
-      - name: cargo check — UI binary (stub terminal backend)
-        run: cargo check -p con
+        run: cargo check --locked -p con-core -p con-cli -p con-agent -p con-terminal -p con-ghostty
+      - name: cargo check — UI binary
+        run: cargo check --locked -p con
       - name: cargo test — portable crates
-        run: cargo test -p con-core -p con-cli -p con-agent -p con-terminal
+        run: cargo test --locked -p con-core -p con-cli -p con-agent -p con-terminal -p con-ghostty
+      - name: State presentation layout tests
+        run: |
+          cargo test --locked -p con --bin con sidebar::
+          cargo test --locked -p con --bin con terminal_geometry::
+          cargo test --locked -p con --bin con app_icon::
+          cargo test --locked -p con --bin con agent_panel::tests
+          cargo test --locked -p con --bin con workspace::render::top_bar
+          cargo test --locked -p con --bin con workspace::tests::horizontal_tab_reorder
+          cargo test --locked -p con --bin con input_bar::tests
+      - name: Program status reducer benchmark correctness
+        run: cargo test --locked -p con-core --example program_status_bench

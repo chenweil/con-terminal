@@ -1,8 +1,8 @@
 use gpui::*;
 use gpui_component::{
-    ActiveTheme,
-    input::{Input, InputEvent, InputState, Position},
-    tooltip::Tooltip,
+    ActiveTheme, Colorize,
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    input::{InputEvent, Position, Textarea, TextareaState},
 };
 
 use crate::ui_scale::{mono_density_scale, mono_px, mono_space_px};
@@ -17,6 +17,42 @@ fn input_bar_content_rows(value: &str) -> usize {
 
 fn input_bar_rendered_height_for_rows(rows: usize, mono_scale: f32) -> f32 {
     (INPUT_BAR_MIN_HEIGHT + rows.saturating_sub(1) as f32 * INPUT_BAR_ROW_HEIGHT) * mono_scale
+}
+
+/// Append terminal-selection context to the agent input as a fenced code
+/// block. The fence grows when the selection itself contains backticks so
+/// the block never terminates early.
+pub(crate) fn append_ask_ai_context(current: &str, context: &str) -> String {
+    let longest_backtick_run = context
+        .split(|ch| ch != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat((longest_backtick_run + 1).max(3));
+
+    let mut updated = String::new();
+    let trimmed_current = current.trim_end();
+    if !trimmed_current.is_empty() {
+        updated.push_str(trimmed_current);
+        updated.push('\n');
+    }
+    updated.push_str(&fence);
+    updated.push('\n');
+    updated.push_str(context);
+    updated.push('\n');
+    updated.push_str(&fence);
+    updated.push('\n');
+    updated
+}
+
+pub(crate) fn text_end_position(text: &str) -> Position {
+    let line = text.matches('\n').count() as u32;
+    let character = text
+        .rsplit('\n')
+        .next()
+        .map(|last| last.chars().count() as u32)
+        .unwrap_or(0);
+    Position::new(line, character)
 }
 
 actions!(
@@ -60,17 +96,9 @@ impl InputMode {
 
     fn icon(self) -> &'static str {
         match self {
-            Self::Smart => "phosphor/magic-wand.svg",
-            Self::Shell => "phosphor/terminal.svg",
-            Self::Agent => "phosphor/sparkle.svg",
-        }
-    }
-
-    fn tint(self, cx: &App) -> Hsla {
-        match self {
-            Self::Smart => cx.theme().muted_foreground,
-            Self::Shell => cx.theme().success,
-            Self::Agent => cx.theme().primary,
+            Self::Smart => "input-mode-smart.png",
+            Self::Shell => "input-mode-shell.png",
+            Self::Agent => "input-mode-agent.png",
         }
     }
 
@@ -119,8 +147,8 @@ enum PaneScopeMode {
 }
 
 pub struct InputBar {
-    agent_input_state: Entity<InputState>,
-    shell_input_state: Entity<InputState>,
+    agent_input_state: Entity<TextareaState>,
+    shell_input_state: Entity<TextareaState>,
     mode: InputMode,
     cwd: String,
     panes: Vec<PaneInfo>,
@@ -139,10 +167,6 @@ pub struct InputBar {
     inline_suggestion_source: Option<SuggestionSource>,
     path_completion_candidates: Vec<String>,
     path_completion_selection: usize,
-    /// Tracks whether shift was held on the last enter keystroke.
-    /// Set by observe_keystrokes (fires before PressEnter), consumed by PressEnter handler.
-    shift_enter: bool,
-    ui_opacity: f32,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -190,7 +214,7 @@ impl InputBar {
         ]);
     }
 
-    fn current_input_state(&self) -> Entity<InputState> {
+    fn current_input_state(&self) -> Entity<TextareaState> {
         match self.mode {
             InputMode::Agent => self.agent_input_state.clone(),
             InputMode::Smart | InputMode::Shell => self.shell_input_state.clone(),
@@ -242,7 +266,7 @@ impl InputBar {
 
     fn pane_scope_summary(&self) -> (String, &'static str) {
         match self.pane_scope_mode {
-            PaneScopeMode::Broadcast => ("All panes".to_string(), "phosphor/squares-four.svg"),
+            PaneScopeMode::Broadcast => ("All panes".to_string(), "phosphor/broadcast-duotone.svg"),
             PaneScopeMode::Focused => ("Focused".to_string(), "phosphor/target.svg"),
             PaneScopeMode::Custom => {
                 let targets = self.effective_target_ids();
@@ -265,7 +289,7 @@ impl InputBar {
     }
 
     fn subscribe_input_state(
-        input_state: &Entity<InputState>,
+        input_state: &Entity<TextareaState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Subscription {
@@ -302,22 +326,10 @@ impl InputBar {
                         cx.emit(InputEdited);
                         cx.notify();
                     }
-                    InputEvent::PressEnter { .. } => {
-                        if this.shift_enter {
-                            this.shift_enter = false;
+                    InputEvent::PressEnter { shift, .. } => {
+                        if *shift {
                             return;
                         }
-
-                        let active_state = this.current_input_state();
-                        active_state.update(cx, |s, cx| {
-                            let cursor = s.cursor();
-                            let val = s.value().to_string();
-                            if cursor > 0 && val.as_bytes().get(cursor - 1) == Some(&b'\n') {
-                                let mut cleaned = val[..cursor - 1].to_string();
-                                cleaned.push_str(&val[cursor..]);
-                                s.set_value(&cleaned, window, cx);
-                            }
-                        });
 
                         let matches = this.filtered_skills(cx);
                         if !matches.is_empty() {
@@ -400,15 +412,16 @@ impl InputBar {
 
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let agent_input_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder("Ask anything…")
                 .auto_grow(1, INPUT_BAR_MAX_ROWS)
+                .submit_on_enter(true)
         });
         let shell_input_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder("Type a command or ask AI…")
-                .code_editor("con-shell")
                 .auto_grow(1, INPUT_BAR_MAX_ROWS)
+                .submit_on_enter(true)
         });
         shell_input_state.update(cx, |state, cx| {
             state.set_highlighter("con-shell", cx);
@@ -419,12 +432,6 @@ impl InputBar {
             state.set_cursor_position(Position::new(0, 0), window, cx);
         });
         let _subscriptions = vec![
-            // Track shift state on enter keystrokes — fires BEFORE PressEnter
-            cx.observe_keystrokes(|this, event, _window, _cx| {
-                if event.keystroke.key == "enter" {
-                    this.shift_enter = event.keystroke.modifiers.shift;
-                }
-            }),
             cx.observe_keystrokes(|this, event, window, cx| {
                 if !Self::should_fallback_handle_history_key(event)
                     || !this.is_current_input_focused(window, cx)
@@ -459,8 +466,6 @@ impl InputBar {
             inline_suggestion_source: None,
             path_completion_candidates: Vec::new(),
             path_completion_selection: 0,
-            shift_enter: false,
-            ui_opacity: 0.90,
             _subscriptions,
         }
     }
@@ -507,10 +512,10 @@ impl InputBar {
         self.focused_pane_id = focused_id;
         let valid_ids: Vec<usize> = self.panes.iter().map(|p| p.id).collect();
         self.selected_pane_ids.retain(|id| valid_ids.contains(id));
-        if let Some(last_single) = self.last_single_target_id {
-            if !valid_ids.contains(&last_single) {
-                self.last_single_target_id = None;
-            }
+        if let Some(last_single) = self.last_single_target_id
+            && !valid_ids.contains(&last_single)
+        {
+            self.last_single_target_id = None;
         }
         if self.selected_pane_ids.is_empty() && previous_focused_id != focused_id {
             self.last_single_target_id = Some(focused_id);
@@ -521,12 +526,10 @@ impl InputBar {
         } else if self.panes.len() <= 1 {
             self.pane_scope_mode = PaneScopeMode::Focused;
             self.selected_pane_ids.clear();
-        } else if matches!(self.pane_scope_mode, PaneScopeMode::Focused)
-            && self.last_single_target_id.is_none()
-        {
-            self.pane_scope_mode = PaneScopeMode::Broadcast;
-        } else if matches!(self.pane_scope_mode, PaneScopeMode::Custom)
-            && self.selected_pane_ids.is_empty()
+        } else if (matches!(self.pane_scope_mode, PaneScopeMode::Focused)
+            && self.last_single_target_id.is_none())
+            || (matches!(self.pane_scope_mode, PaneScopeMode::Custom)
+                && self.selected_pane_ids.is_empty())
         {
             self.pane_scope_mode = PaneScopeMode::Broadcast;
         }
@@ -795,7 +798,7 @@ impl InputBar {
 
     pub fn complete_skill(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.current_input_state().update(cx, |s, cx| {
-            s.set_value(&format!("/{name} "), window, cx);
+            s.set_value(format!("/{name} "), window, cx);
         });
         self.skill_selection = 0;
         self.clear_completion_ui();
@@ -826,6 +829,36 @@ impl InputBar {
     pub fn cycle_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_mode(self.mode.next(), window, cx);
         self.clear_completion_ui();
+        cx.emit(InputScopeChanged);
+        cx.emit(InputEdited);
+        cx.notify();
+    }
+
+    /// Switch to Agent mode and append quoted context (e.g. a terminal
+    /// selection) to the input, leaving the cursor at the end so the user
+    /// can type their question right away.
+    pub fn ask_ai_with_context(
+        &mut self,
+        context: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mode != InputMode::Agent {
+            self.set_mode(InputMode::Agent, window, cx);
+        }
+        self.clear_completion_ui();
+
+        if let Some(context) = context.map(str::trim_end).filter(|text| !text.is_empty()) {
+            let state = self.current_input_state();
+            let current = state.read(cx).value().to_string();
+            let updated = append_ask_ai_context(&current, context);
+            let end = text_end_position(&updated);
+            state.update(cx, |s, cx| {
+                s.set_value(&updated, window, cx);
+                s.set_cursor_position(end, window, cx);
+            });
+        }
+
         cx.emit(InputScopeChanged);
         cx.emit(InputEdited);
         cx.notify();
@@ -929,10 +962,6 @@ impl InputBar {
         });
     }
 
-    pub fn set_ui_opacity(&mut self, opacity: f32) {
-        self.ui_opacity = opacity.clamp(0.35, 1.0);
-    }
-
     fn move_cursor_to_line_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input_state = self.current_input_state();
         let cursor_position = input_state.read(cx).cursor_position();
@@ -980,22 +1009,14 @@ impl InputBar {
 
         let mut boundary = cursor;
         while boundary > 0 {
-            let prev = text[..boundary]
-                .char_indices()
-                .last()
-                .map(|(idx, ch)| (idx, ch))
-                .unwrap();
+            let prev = text[..boundary].char_indices().last().unwrap();
             if !prev.1.is_whitespace() {
                 break;
             }
             boundary = prev.0;
         }
         while boundary > 0 {
-            let prev = text[..boundary]
-                .char_indices()
-                .last()
-                .map(|(idx, ch)| (idx, ch))
-                .unwrap();
+            let prev = text[..boundary].char_indices().last().unwrap();
             if prev.1.is_whitespace() {
                 break;
             }
@@ -1212,39 +1233,38 @@ impl Render for InputBar {
         let input_value = input_state.read(cx).value().to_string();
         let input_cursor = input_state.read(cx).cursor();
         let mono_scale = mono_density_scale(theme);
-        let control_size = mono_space_px(theme, 28.0);
-        let mode_icon_size = mono_space_px(theme, 15.0);
+        let control_size = mono_space_px(theme, crate::input_chrome::CONTROL_SIZE);
+        let mode_icon_size = mono_space_px(theme, 22.0);
         let compact_icon_size = mono_space_px(theme, 14.0);
 
-        let mode_tint = self.mode.tint(cx);
-
         // ── Mode prefix — icon-only, minimal ──
-        let mode_prefix = div()
-            .id("mode-toggle")
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(control_size)
-            .rounded(px(7.0 * mono_scale))
-            .cursor_pointer()
-            .bg(mode_tint.opacity(0.075))
-            .hover(|s| s.bg(mode_tint.opacity(0.12)))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.cycle_mode(window, cx);
-                }),
+        let mode_prefix = Button::new("mode-toggle")
+            .custom(
+                ButtonCustomVariant::new(cx)
+                    .color(theme.transparent)
+                    .hover(theme.foreground.opacity(0.055))
+                    .active(theme.foreground.opacity(0.10)),
             )
-            .tooltip({
-                let mode_label = self.mode.tooltip().to_string();
-                move |window, cx| Tooltip::new(mode_label.clone()).build(window, cx)
-            })
-            .child(
-                svg()
-                    .path(self.mode.icon())
-                    .size(mode_icon_size)
-                    .text_color(mode_tint),
-            );
+            .accessibility_label(format!("{}; switch mode", self.mode.tooltip()))
+            .tooltip_with_action(self.mode.tooltip(), &crate::CycleInputMode, None)
+            .debug_selector(|| "command-mode-toggle".into())
+            .tab_stop(false)
+            .size(control_size)
+            .w(control_size)
+            .h(control_size)
+            .p_0()
+            .cursor_pointer()
+            .rounded(px(8.0 * mono_scale))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.cycle_mode(window, cx);
+                this.current_input_state()
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }))
+            .child(crate::assets::tab_identity_icon(
+                self.mode.icon(),
+                mode_icon_size,
+                theme.foreground,
+            ));
 
         // ── Pane target control — scales to many panes without growing the row ──
         let all_selected = self.all_panes_selected();
@@ -1253,61 +1273,60 @@ impl Render for InputBar {
             let scope_is_expanded =
                 all_selected || matches!(self.pane_scope_mode, PaneScopeMode::Custom);
             let scope_tint = if scope_is_expanded {
-                theme.primary.opacity(0.86)
+                theme.primary
             } else {
-                theme.muted_foreground.opacity(0.78)
+                theme.muted_foreground
             };
             Some(
                 div()
                     .flex()
                     .items_center()
                     .child(
-                        div()
-                            .id("pane-scope")
+                        Button::new("pane-scope")
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(theme.foreground.opacity(0.045))
+                                    .hover(theme.foreground.opacity(0.09))
+                                    .active(theme.foreground.opacity(0.14)),
+                            )
+                            .accessibility_label("Choose target panes")
+                            .tooltip_with_action(
+                                format!("Target panes: {scope_label}"),
+                                &crate::TogglePaneScopePicker,
+                                None,
+                            )
+                            .debug_selector(|| "command-pane-scope".into())
+                            .tab_stop(false)
+                            .size(control_size)
+                            .w(px(96.0 * mono_scale))
                             .h(control_size)
-                            .px(px(11.0 * mono_scale))
-                            .rounded(px(8.0 * mono_scale))
+                            .px(px(9.0 * mono_scale))
+                            .rounded(px(6.0 * mono_scale))
                             .cursor_pointer()
                             .flex()
                             .items_center()
-                            .gap(px(8.0 * mono_scale))
-                            .bg(if scope_is_expanded {
-                                theme.primary.opacity(0.050)
-                            } else {
-                                theme.foreground.opacity(0.045)
-                            })
-                            .hover(|s| {
-                                s.bg(if scope_is_expanded {
-                                    theme.primary.opacity(0.082)
-                                } else {
-                                    theme.foreground.opacity(0.065)
-                                })
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                    cx.emit(TogglePaneScopePicker);
-                                    this.current_input_state()
-                                        .update(cx, |state, cx| state.focus(window, cx));
-                                }),
-                            )
+                            .gap(px(6.0 * mono_scale))
+                            .bg(theme.foreground.opacity(0.045))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.emit(TogglePaneScopePicker);
+                                this.current_input_state()
+                                    .update(cx, |state, cx| state.focus(window, cx));
+                            }))
                             .child(
                                 svg()
+                                    .debug_selector(|| "command-pane-scope-icon".into())
                                     .path(scope_icon)
                                     .size(compact_icon_size)
                                     .text_color(scope_tint),
                             )
                             .child(
                                 div()
+                                    .debug_selector(|| "command-pane-scope-label".into())
                                     .text_size(mono_px(theme, 11.0))
                                     .line_height(mono_px(theme, 14.0))
-                                    .font_family(theme.mono_font_family.clone())
+                                    .font_family(theme.font_family.clone())
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(if scope_is_expanded {
-                                        theme.primary.opacity(0.92)
-                                    } else {
-                                        theme.muted_foreground.opacity(0.76)
-                                    })
+                                    .text_color(theme.foreground)
                                     .max_w(px(128.0 * mono_scale))
                                     .overflow_hidden()
                                     .whitespace_nowrap()
@@ -1322,58 +1341,34 @@ impl Render for InputBar {
         };
 
         // ── Send button — inside container, right edge ──
-        let send_button = div()
-            .id("send-button")
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(control_size)
-            .rounded(px(8.0 * mono_scale))
-            .cursor_pointer()
-            .flex_shrink_0()
-            .bg(if has_text {
-                theme.primary
+        let send_button = crate::input_chrome::send_button("send-button", has_text, theme, cx)
+            .accessibility_label("Submit input")
+            .tooltip(if self.mode == InputMode::Agent {
+                "Send message"
             } else {
-                theme.foreground.opacity(0.055)
+                "Run input"
             })
-            .hover(|s| {
-                if has_text {
-                    s.bg(theme.primary_hover)
-                } else {
-                    s.bg(theme.foreground.opacity(0.075))
-                }
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_this, _, _, cx| {
-                    cx.emit(SubmitInput);
-                }),
-            )
-            .child(
-                svg()
-                    .path("phosphor/arrow-up.svg")
-                    .size(mono_space_px(theme, 13.0))
-                    .text_color(if has_text {
-                        theme.primary_foreground
-                    } else {
-                        theme.muted_foreground.opacity(0.44)
-                    }),
-            );
+            .debug_selector(|| "command-send-button".into())
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.emit(SubmitInput);
+                this.current_input_state()
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }));
 
-        // Keep all terminal-adjacent inputs in the mono family for consistency.
-        let input_font = theme.mono_font_family.clone();
+        // Shell input is terminal chrome; natural-language agent input uses
+        // the UI font so its prose reads like the agent panel.
+        let input_font = if self.mode == InputMode::Agent {
+            theme.font_family.clone()
+        } else {
+            theme.mono_font_family.clone()
+        };
         let input_text_size = match self.mode {
             InputMode::Agent => mono_px(theme, 14.0),
             _ => mono_px(theme, 13.0),
         };
-        let input_line_height = match self.mode {
-            InputMode::Agent => rems(1.15),
-            _ => rems(1.25),
-        };
-        let input_vertical_offset = match self.mode {
-            InputMode::Agent => px(-4.0),
-            _ => px(0.0),
-        };
+        // Switching between UI and mono fonts must not change the line box.
+        let input_line_height = rems(1.25);
+        let input_vertical_offset = px(0.0);
         let show_inline_suggestion = self.mode != InputMode::Agent
             && input_cursor == input_value.len()
             && !input_value.is_empty()
@@ -1388,9 +1383,9 @@ impl Render for InputBar {
                 .as_deref()
                 .is_some_and(|suffix| !suffix.is_empty());
         let ghost_tint = match self.inline_suggestion_source {
-            Some(SuggestionSource::Path) => theme.success.opacity(0.68),
-            Some(SuggestionSource::Ai) => theme.primary.opacity(0.64),
-            _ => theme.muted_foreground.opacity(0.56),
+            Some(SuggestionSource::Path) => theme.success.mix_oklab(theme.muted_foreground, 0.55),
+            Some(SuggestionSource::Ai) => theme.primary.mix_oklab(theme.muted_foreground, 0.55),
+            _ => theme.muted_foreground,
         };
         let ghost_prefix = input_value.replace(' ', "\u{00A0}");
         let ghost_suffix = self
@@ -1407,10 +1402,14 @@ impl Render for InputBar {
             Self::should_hide_native_command_text(&input_value, command_overlay_runs.is_some());
 
         let input_field = div()
+            .debug_selector(|| "command-input-field".into())
             .flex_1()
             .min_h(control_size)
             .relative()
             .key_context("ConCommandInput")
+            // Submit mode bubbles Enter; consume it before native text fallback.
+            // The PressEnter subscription owns completion and submission.
+            .on_action(|_: &gpui_component::input::Enter, _, _| {})
             .on_action(cx.listener(|this, _: &AcceptSuggestion, window, cx| {
                 let _ = this.accept_inline_suggestion(window, cx);
             }))
@@ -1493,27 +1492,26 @@ impl Render for InputBar {
                             cx.stop_propagation();
                         }
                     }
-                    "up" | "down" => {
-                        if this.handle_history_navigation_key(key, window, cx) {
-                            window.prevent_default();
-                            cx.stop_propagation();
-                        }
+                    "up" | "down" if this.handle_history_navigation_key(key, window, cx) => {
+                        window.prevent_default();
+                        cx.stop_propagation();
                     }
-                    "right" if !mods.control && !mods.platform && !mods.alt => {
-                        if this.accept_selected_path_completion(window, cx)
-                            || this.accept_inline_suggestion(window, cx)
-                        {
-                            window.prevent_default();
-                            cx.stop_propagation();
-                        }
+                    "right"
+                        if !mods.control
+                            && !mods.platform
+                            && !mods.alt
+                            && (this.accept_selected_path_completion(window, cx)
+                                || this.accept_inline_suggestion(window, cx)) =>
+                    {
+                        window.prevent_default();
+                        cx.stop_propagation();
                     }
-                    "end" => {
+                    "end"
                         if this.accept_selected_path_completion(window, cx)
-                            || this.accept_inline_suggestion(window, cx)
-                        {
-                            window.prevent_default();
-                            cx.stop_propagation();
-                        }
+                            || this.accept_inline_suggestion(window, cx) =>
+                    {
+                        window.prevent_default();
+                        cx.stop_propagation();
                     }
                     "e" if mods.control || mods.platform => {
                         if !(this.accept_selected_path_completion(window, cx)
@@ -1524,13 +1522,13 @@ impl Render for InputBar {
                         window.prevent_default();
                         cx.stop_propagation();
                     }
-                    "right" if mods.platform => {
-                        if this.accept_selected_path_completion(window, cx)
-                            || this.accept_inline_suggestion(window, cx)
-                        {
-                            window.prevent_default();
-                            cx.stop_propagation();
-                        }
+                    "right"
+                        if mods.platform
+                            && (this.accept_selected_path_completion(window, cx)
+                                || this.accept_inline_suggestion(window, cx)) =>
+                    {
+                        window.prevent_default();
+                        cx.stop_propagation();
                     }
                     "w" if mods.control || mods.platform => {
                         this.delete_previous_word(window, cx);
@@ -1587,26 +1585,12 @@ impl Render for InputBar {
                             .child(div().text_color(ghost_tint).child(ghost_suffix)),
                     )
             }))
-            .child(div().relative().top(input_vertical_offset).child(
-                if self.mode == InputMode::Agent {
-                    Input::new(&input_state)
+            .child(
+                div().relative().top(input_vertical_offset).child(
+                    Textarea::new(&input_state)
                         .appearance(false)
-                        .cleanable(false)
-                        .font_family(input_font)
-                        .text_color(if input_value.is_empty() {
-                            theme.muted_foreground.opacity(0.88)
-                        } else {
-                            theme.foreground.opacity(0.94)
-                        })
-                        .text_size(input_text_size)
-                        .line_height(input_line_height)
-                        .pl(px(12.0 * mono_scale))
-                        .min_h(control_size)
-                        .into_any_element()
-                } else {
-                    Input::new(&input_state)
-                        .appearance(false)
-                        .cleanable(false)
+                        // Match the workspace slot instead of the editor's default minimum.
+                        .h(self.rendered_height(cx) - px(12.0 * mono_scale))
                         .font_family(input_font)
                         .text_color(if hide_native_command_text {
                             gpui::transparent_black()
@@ -1616,26 +1600,31 @@ impl Render for InputBar {
                         .text_size(input_text_size)
                         .line_height(input_line_height)
                         .min_h(control_size)
-                        .into_any_element()
-                },
-            ));
+                        .into_any_element(),
+                ),
+            );
 
         // ── Main layout — flat bar, no rounded bubble ──
         div()
+            // Cached views lay out this subtree as an independent root; the
+            // cache shell's width does not stretch an auto-width flex root.
+            .w_full()
             .flex()
             .flex_col()
-            .bg(theme.title_bar.opacity(self.ui_opacity))
+            // The workspace owns the background, including the reserved slot
+            // during show/hide. Painting it here too doubles the glass alpha.
             .font_family(theme.font_family.clone())
             .text_size(input_text_size)
             // ── Flat container ──
             .child(
                 div()
-                    .px(px(12.0 * mono_scale))
+                    .debug_selector(|| "command-input-row".into())
+                    .px(px(crate::input_chrome::BAR_INSET * mono_scale))
                     .py(px(6.0 * mono_scale))
                     .min_h(px(44.0 * mono_scale))
                     .flex()
                     .items_center()
-                    .gap(px(9.0 * mono_scale))
+                    .gap(px(crate::input_chrome::CONTROL_GAP * mono_scale))
                     .child(mode_prefix)
                     .children(pane_row)
                     .child(div().flex_1().min_w_0().child(input_field))
@@ -1647,9 +1636,230 @@ impl Render for InputBar {
 #[cfg(test)]
 mod tests {
     use super::{
-        INPUT_BAR_MAX_ROWS, InputBar, input_bar_content_rows,
-        input_bar_rendered_height_for_rows,
+        INPUT_BAR_MAX_ROWS, InputBar, SkillEntry, SubmitInput, append_ask_ai_context,
+        input_bar_content_rows, input_bar_rendered_height_for_rows, text_end_position,
     };
+    use gpui::{Entity, Focusable as _, VisualTestContext};
+    use gpui_component::input::Position;
+    use std::{cell::Cell, rc::Rc};
+
+    fn test_input_bar(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<InputBar>, &mut VisualTestContext, Rc<Cell<usize>>) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let submit_count = Rc::new(Cell::new(0));
+        let observed_count = submit_count.clone();
+        let (bar, view) = cx.add_window_view(|window, cx| {
+            let bar = InputBar::new(window, cx);
+            bar.focus_handle(cx).focus(window, cx);
+            bar
+        });
+        view.update(|_, cx| {
+            cx.subscribe(&bar, move |_, _: &SubmitInput, _| {
+                observed_count.set(observed_count.get() + 1);
+            })
+            .detach();
+        });
+        (bar, view, submit_count)
+    }
+
+    #[gpui::test]
+    fn enter_submit_mode_preserves_shift_newline_and_submits_plain_and_secondary(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (bar, cx, submit_count) = test_input_bar(cx);
+        cx.simulate_input("echo one");
+        cx.simulate_keystrokes("shift-enter");
+        cx.update(|window, cx| {
+            assert_eq!(
+                bar.read(cx).current_input_state().read(cx).value(),
+                "echo one\n"
+            );
+            assert_eq!(submit_count.get(), 0);
+            assert!(bar.read(cx).focus_handle(cx).is_focused(window));
+        });
+
+        cx.simulate_input("echo two");
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("secondary-enter");
+        cx.update(|window, cx| {
+            assert_eq!(
+                bar.read(cx).current_input_state().read(cx).value(),
+                "echo one\necho two"
+            );
+            assert_eq!(submit_count.get(), 2);
+            assert!(bar.read(cx).focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn enter_completion_does_not_depend_on_newline_cleanup_at_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (bar, cx, submit_count) = test_input_bar(cx);
+        cx.update(|window, cx| {
+            bar.update(cx, |bar, cx| {
+                bar.set_skills(
+                    vec![SkillEntry {
+                        name: "build".into(),
+                        description: "Build the project".into(),
+                    }],
+                    cx,
+                );
+                bar.current_input_state().update(cx, |state, cx| {
+                    state.set_value("/bu", window, cx);
+                    state.set_cursor_position(Position::new(0, 1), window, cx);
+                });
+            });
+        });
+        cx.simulate_keystrokes("shift-right enter");
+        cx.update(|window, cx| {
+            assert_eq!(
+                bar.read(cx).current_input_state().read(cx).value(),
+                "/build "
+            );
+            assert_eq!(submit_count.get(), 0, "completion must win over submission");
+            assert!(bar.read(cx).focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn path_completion_rejects_a_middle_cursor_without_mutating_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (bar, cx, _) = test_input_bar(cx);
+        cx.update(|window, cx| {
+            bar.update(cx, |bar, cx| {
+                bar.current_input_state().update(cx, |state, cx| {
+                    state.set_value("cat src", window, cx);
+                    state.set_cursor_position(Position::new(0, 3), window, cx);
+                });
+                bar.set_path_completion_candidates("cat src", vec!["cat src/".into()]);
+                assert!(!bar.accept_selected_path_completion(window, cx));
+                assert_eq!(bar.current_input_state().read(cx).value(), "cat src");
+                assert!(bar.path_completion_candidates().is_empty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn cached_input_bar_preserves_available_width(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+
+        struct Host {
+            bar: Entity<InputBar>,
+            cached: bool,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let bar = if self.cached {
+                    self.bar
+                        .clone()
+                        .cached(
+                            StyleRefinement::default()
+                                .w_full()
+                                .h(self.bar.read(cx).rendered_height(cx)),
+                        )
+                        .into_any_element()
+                } else {
+                    self.bar.clone().into_any_element()
+                };
+                div().flex().flex_col().w_full().child(bar)
+            }
+        }
+
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let mut mode_row_top = [None, None];
+        for (mode, pane_count) in [
+            super::InputMode::Smart,
+            super::InputMode::Shell,
+            super::InputMode::Agent,
+        ]
+        .into_iter()
+        .flat_map(|mode| [1, 2].map(|pane_count| (mode, pane_count)))
+        {
+            for (cache_index, cached) in [false, true].into_iter().enumerate() {
+                let (_, view) = cx.add_window_view(|window, cx| {
+                    let bar = cx.new(|cx| {
+                        let mut bar = InputBar::new(window, cx);
+                        bar.set_mode(mode, window, cx);
+                        bar.set_panes(
+                            (1..=pane_count)
+                                .map(|id| super::PaneInfo {
+                                    id,
+                                    name: format!("Pane {id}"),
+                                    hostname: None,
+                                    is_busy: false,
+                                    is_alive: true,
+                                })
+                                .collect(),
+                            1,
+                            window,
+                            cx,
+                        );
+                        bar
+                    });
+                    Host { bar, cached }
+                });
+                for width in [1100.0, 420.0, 800.0] {
+                    view.simulate_resize(size(px(width), px(200.0)));
+                    let input = view
+                        .debug_bounds("command-input-field")
+                        .expect("input field");
+                    let send = view
+                        .debug_bounds("command-send-button")
+                        .expect("send button");
+                    let mode_toggle = view
+                        .debug_bounds("command-mode-toggle")
+                        .expect("mode toggle");
+                    let row = view.debug_bounds("command-input-row").unwrap();
+                    let leading_inset = mode_toggle.left() - row.left();
+                    let bottom_inset = row.bottom() - mode_toggle.bottom();
+                    assert!(
+                        (leading_inset - bottom_inset).abs() <= px(1.0),
+                        "{mode:?}, cached={cached}: row={row:?}, mode={mode_toggle:?}, leading={leading_inset:?}, bottom={bottom_inset:?}"
+                    );
+                    assert_eq!(mode_toggle.center().y, send.center().y);
+                    match mode_row_top[cache_index] {
+                        Some(top) => {
+                            assert_eq!(mode_toggle.top(), top, "{mode:?}, cached={cached}")
+                        }
+                        None => mode_row_top[cache_index] = Some(mode_toggle.top()),
+                    }
+                    assert!(
+                        input.size.width > px(width * 0.5),
+                        "{mode:?}, cached={cached}: {input:?}"
+                    );
+                    assert!(
+                        send.right() > px(width - 40.0),
+                        "{mode:?}, cached={cached}: {send:?}"
+                    );
+                    assert!(input.right() <= send.left(), "input overlaps send button");
+                    assert!(send.right() <= px(width), "send button outside viewport");
+                    if pane_count > 1 && mode != super::InputMode::Agent {
+                        let scope = view
+                            .debug_bounds("command-pane-scope")
+                            .expect("pane scope control");
+                        assert!(mode_toggle.right() <= scope.left());
+                        assert!(scope.right() <= input.left());
+                        assert_eq!(scope.size.height, send.size.height);
+                        let icon = view
+                            .debug_bounds("command-pane-scope-icon")
+                            .expect("scope icon participates in painting");
+                        let label = view
+                            .debug_bounds("command-pane-scope-label")
+                            .expect("scope label participates in painting");
+                        assert!(icon.size.width > px(0.0));
+                        assert!(label.size.width > px(0.0));
+                        assert!(icon.left() >= scope.left());
+                        assert!(label.right() <= scope.right());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn content_rows_counts_trailing_newline_and_clamps() {
@@ -1671,11 +1881,45 @@ mod tests {
 
     #[test]
     fn native_command_text_stays_visible_when_multiline_overlay_is_unavailable() {
-        assert!(!InputBar::should_hide_native_command_text("echo one\necho two", false));
+        assert!(!InputBar::should_hide_native_command_text(
+            "echo one\necho two",
+            false
+        ));
     }
 
     #[test]
     fn native_command_text_hides_when_single_line_overlay_is_available() {
         assert!(InputBar::should_hide_native_command_text("echo one", true));
+    }
+
+    #[test]
+    fn ask_ai_context_wraps_selection_in_fence() {
+        assert_eq!(
+            append_ask_ai_context("", "error: it broke"),
+            "```\nerror: it broke\n```\n"
+        );
+    }
+
+    #[test]
+    fn ask_ai_context_appends_after_existing_input() {
+        assert_eq!(
+            append_ask_ai_context("why does this fail?  ", "error: it broke"),
+            "why does this fail?\n```\nerror: it broke\n```\n"
+        );
+    }
+
+    #[test]
+    fn ask_ai_context_fence_grows_past_embedded_backticks() {
+        let context = "see ```rust\ncode\n```";
+        let updated = append_ask_ai_context("", context);
+        assert!(updated.starts_with("````\n"));
+        assert!(updated.ends_with("\n````\n"));
+    }
+
+    #[test]
+    fn text_end_position_counts_lines_and_last_column() {
+        assert_eq!(text_end_position(""), Position::new(0, 0));
+        assert_eq!(text_end_position("ask"), Position::new(0, 3));
+        assert_eq!(text_end_position("a\n```\nxy\n```\n"), Position::new(4, 0));
     }
 }

@@ -2,7 +2,7 @@
 
 con ships on macOS, has a working Windows beta, and now has a real
 Linux preview built around Unix PTY + `libghostty-vt` + a GPUI-owned
-per-row `StyledText` paint path. The same `con` binary that runs on
+cached text-span canvas paint path. The same `con` binary that runs on
 macOS now opens on Linux with client-side decorations (no native WM
 titlebar stacked on top of the GPUI shell), a transparent ARGB
 window with rounded corners, the same caption cluster Windows
@@ -14,7 +14,7 @@ the recommended architecture, and the staged path from today's
 preview pane to a fully shippable Linux terminal backend (the
 remaining work is the long-term GPUI-owned glyph-atlas grid
 renderer matching the D3D11/DirectWrite path Windows uses, plus
-mouse reporting and packaging).
+scrollback gestures and packaging).
 
 This is a planning document, not an implementation log. The live issue
 tracker is GitHub issue #18. The deeper architecture notes live in
@@ -30,13 +30,36 @@ Current platform state:
 |:-------|:---------:|:-------------:|:--------------:|:----------------------:|
 | macOS  | ✅ real   | ✅ libghostty + Metal | `/tmp/con.sock` | ✅ |
 | Windows | ✅ real  | ✅ libghostty-vt + ConPTY + D3D11/DirectWrite | `\\.\pipe\con` | ✅ |
-| Linux  | ✅ real   | ✅ Unix PTY + `libghostty-vt` + GPUI per-row `StyledText` paint (preview — long-term glyph-atlas grid renderer pending) | `/tmp/con.sock` | ✅ |
+| Linux  | ✅ real   | ✅ Unix PTY + `libghostty-vt` + GPUI cached text spans on a fixed cell grid (preview — dedicated glyph-atlas renderer pending) | `/tmp/con.sock` | ✅ |
 
 On Linux today:
 
 ```bash
 cargo build -p con --release
 ```
+
+### Desktop terminal contract
+
+The installed desktop entry advertises Con as an `xdg-terminal-exec`
+provider. Desktop launchers and compositors can therefore open a shell in a
+specific directory or run a TUI without wrapping the request in a shell:
+
+```bash
+con --dir "/path/with spaces"
+con --app-id=org.example.editor --title="Editor" -e nvim -- notes.md
+```
+
+`-e` consumes the remaining arguments as one command invocation. Con preserves
+argument boundaries, starts that command exactly once in the first pane, and
+does not add login-shell flags. `--working-directory` is the canonical spelling;
+`--dir` is supported for launcher compatibility. A positional path retains its
+existing meaning as a Con workspace profile, and cannot be mixed with a command
+or working-directory request.
+
+The tarball and Flatpak desktop entries carry the same `X-TerminalArgExec`,
+`X-TerminalArgDir`, `X-TerminalArgTitle`, and `X-TerminalArgAppId` declarations.
+The one-line installer rewrites only `Exec` and `TryExec` to the selected install
+location, so the capability metadata stays intact.
 
 What that gives you:
 
@@ -48,13 +71,20 @@ What that gives you:
 - Unix-domain control socket at `/tmp/con.sock`
 - `con-cli` and all portable crates working
 - a real Linux terminal pane backed by Unix PTY + `libghostty-vt` and
-  rendered as one GPUI `StyledText` per VT row, with one `TextRun`
-  per styled span: SGR colors, bold (`FontWeight::BOLD`), italic
+  rendered through one GPUI canvas per VT row. ASCII cells are batched;
+  non-ASCII native cells are shaped independently with complete graphemes
+  and positioned using Ghostty's cell widths. SGR colors, bold (`FontWeight::BOLD`), italic
   (`FontStyle::Italic`), underline, strikethrough, inverse, and a
   block cursor (fg/bg swap on the cursor cell) all survive
 - terminal text selection with left-drag, `Ctrl+C` copy-and-clear
   semantics, and `Ctrl+Shift+C` clipboard copy. Plain `Ctrl+C` still
   sends interrupt when no text is selected.
+- terminal mouse reporting through the shared Ghostty encoder: left, middle,
+  and right buttons, drag/hover motion, and vertical/horizontal wheel reports.
+  Legacy, UTF-8, SGR, URXVT, and SGR-pixel formats follow the child's modes;
+  Ctrl/Alt modifiers and physical grid coordinates reach the encoder. Shift
+  starts local selection instead, without dropping releases for an already
+  captured terminal gesture.
 - terminal-local Tab / Shift+Tab capture, so shell completion and TUI
   focus/navigation keys reach the Linux pane instead of being swallowed
   by GPUI focus traversal
@@ -91,20 +121,19 @@ What that gives you:
   and `Vec<Cell>` deep-equality compares were removed, PTY output now
   wakes the Linux terminal view directly instead of waiting for the
   workspace's idle poll loop to discover new output, the view caches
-  per-row `StyledText` text/runs and only rebuilds rows flagged dirty
-  by the VT snapshot (plus cursor-affected rows), and the placeholder
+  per-row text spans and shaped layouts. Changed VT generations still
+  check every visible row for alternate-screen restore correctness, but
+  unchanged spans retain their shaped layouts. The placeholder
   for "Waiting for shell prompt…" only ever shows before the first
   prompt — alt-screen TUIs (htop, vim, less, fzf) no longer flash
   the placeholder during their startup gap
 
 What it still does **not** give you:
 
-- a real glyph-atlas / GPU grid renderer (today's per-row
-  `StyledText` shape covers SGR + bold/italic/underline/inverse +
-  a block cursor correctly, but per-cell metrics still come from
-  layout-time text shaping rather than a fixed cell grid the way
-  the Windows D3D11/DirectWrite path does)
-- mouse reporting for terminal apps that request it
+- a dedicated terminal glyph-atlas renderer (the canvas positions cached
+  GPUI-shaped spans on a fixed grid, but still delegates glyph rasterization
+  and painting to GPUI instead of owning a terminal-specific atlas)
+- local scrollback wheel gestures and alternate-screen wheel-to-arrow fallback
 - native packaging artifacts (`.deb`, AppImage, Flatpak, …); the
   current release pipeline already ships a tarball, one-line installer,
   `co.nowledge.con.desktop` launcher identity, icon install, appcast,
@@ -293,28 +322,27 @@ can ship.
 | 2c | Architecture decision | pick Linux backend lane | one recommended implementation path, no split-brain plan | ✅ landed |
 | 3 | Linux backend scaffold | `con-ghostty/src/linux/` plus `con-app/src/linux_view.rs` (or equivalent) with real lifecycle types | Linux no longer routes through the generic stub path conceptually | ✅ landed |
 | 4 | First real terminal surface | PTY spawn, resize, exit, `libghostty-vt` state, GPUI-owned pane paint, real product chrome (no native WM titlebar), embedded mono font, transparent + rounded window | VT-backed Linux pane compiles and displays live shell state with SGR colors / bold / italic / underline / strikethrough / inverse, cursor block, theme palette synced from settings, IoskeleyMono shaping, client-side titlebar with min/max/close caption cluster, transparent ARGB window with rounded corners and per-pane / per-surface opacity, fast paint pipeline (16 ms keystroke-echo round-trip), no placeholder flash on alt-screen TUIs | ✅ landed (preview) |
-| 5 | Input + selection + glyph-atlas grid renderer | keyboard, mouse, clipboard, bracketed paste, DECCKM, CJK IME text/preedit input, selection, plus the long-term GPUI-owned glyph-atlas grid renderer matching the D3D11/DirectWrite path Windows uses | vim/tmux/fzf/less usable on Linux at full speed | 🚧 in progress (DECCKM, bracketed paste, CJK IME text/preedit input, terminal-local Tab / Shift+Tab capture, and basic left-drag text selection are wired; mouse reporting, scrollback gestures, desktop IME validation matrix, and the glyph-atlas renderer remain) |
+| 5 | Input + selection + glyph-atlas grid renderer | keyboard, mouse, clipboard, bracketed paste, DECCKM, CJK IME text/preedit input, selection, plus the long-term GPUI-owned glyph-atlas grid renderer matching the D3D11/DirectWrite path Windows uses | vim/tmux/fzf/less usable on Linux at full speed | 🚧 in progress (DECCKM, bracketed paste, CJK IME text/preedit input, terminal-local Tab / Shift+Tab capture, mouse reporting, and basic left-drag text selection are wired; scrollback gestures, desktop IME validation matrix, and the glyph-atlas renderer remain) |
 | 6 | Packaging | one-line installer, tarball release, desktop entry, icon integration, appcast / notify-only updater, plus native artifact strategy (`.deb`, AppImage, Flatpak, etc.) | tarball installer exists; runtime Linux app id, desktop-file basename, and `StartupWMClass` are aligned as `co.nowledge.con`; native package format decision remains | 🚧 partially landed |
 
 ## Immediate next work
 
 With phase 4 landed (preview), the remaining Linux tasks are:
 
-1. Replace the per-row `StyledText` paint path with the long-term
+1. Replace the per-row cached text-span paint path with the long-term
    GPUI-owned glyph-atlas grid renderer that paints background runs
    under the text and pre-rasterizes per-cell glyphs, matching the
    D3D11/DirectWrite path used on Windows. Today's view already
    honors fg / bg / bold / italic / underline / strikethrough /
-   inverse and draws a block cursor, and the preview path now caches
-   row text/runs so steady-state updates only rebuild dirty rows.
-   The remaining cost is structural: per-cell metrics still come from
-   layout-time text shaping rather than a fixed cell grid, and the
-   shared `libghostty-vt` snapshot contract still clones the full cell
+   inverse and draws a block cursor. Native cell boundaries survive
+   shaping, and unchanged row spans retain cached layouts. The remaining
+   cost is structural: non-ASCII cells still need independent GPUI text
+   layouts, and the shared `libghostty-vt` snapshot contract clones the full cell
    buffer each changed frame. That limits how dense the renderer can
    stay on huge panes (the gap shows up first on `top -d 0.1`-class
    workloads and large command-start redraws).
-2. Finish Linux input correctness: mouse reporting (button + wheel),
-   scrollback gestures, drag-to-scroll selection polish, and a real
+2. Finish Linux input correctness: scrollback gestures, alternate-screen
+   wheel-to-arrow fallback, drag-to-scroll selection polish, and a real
    desktop/IME validation matrix across Wayland and X11. DECCKM,
    bracketed paste, basic left-drag text selection, and CJK IME
    commit/preedit input are already wired through `libghostty-vt`

@@ -31,7 +31,9 @@ pub struct TerminalColors {
 #[derive(Debug, Clone, Default)]
 pub struct GhosttyConfigPatch {
     pub colors: Option<TerminalColors>,
+    pub shell: Option<String>,
     pub font_family: Option<String>,
+    pub font_fallback: Option<Vec<String>>,
     pub font_size: Option<f32>,
     pub background_opacity: Option<f32>,
     pub background_opacity_cells: Option<bool>,
@@ -42,6 +44,7 @@ pub struct GhosttyConfigPatch {
     pub background_image_position: Option<String>,
     pub background_image_fit: Option<String>,
     pub background_image_repeat: Option<bool>,
+    pub clipboard_write: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +72,7 @@ pub enum MouseButton {
     Five,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceSize {
     pub columns: u16,
     pub rows: u16,
@@ -109,7 +112,9 @@ impl GhosttyApp {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         _colors: Option<&TerminalColors>,
+        _shell: Option<&str>,
         _font_family: Option<&str>,
+        _font_fallback: Option<&[String]>,
         _font_size: Option<f32>,
         _background_opacity: Option<f32>,
         _background_blur: Option<bool>,
@@ -119,6 +124,7 @@ impl GhosttyApp {
         _background_image_position: Option<&str>,
         _background_image_fit: Option<&str>,
         _background_image_repeat: Option<bool>,
+        _clipboard_write_enabled: bool,
     ) -> Result<Self, String> {
         Ok(Self { _sealed: () })
     }
@@ -140,6 +146,7 @@ impl GhosttyApp {
         &self,
         _colors: &TerminalColors,
         _font_family: &str,
+        _font_fallback: &[String],
         _font_size: f32,
         _background_opacity: f32,
         _background_blur: bool,
@@ -158,6 +165,10 @@ impl GhosttyApp {
     }
 
     pub fn set_color_scheme(&self, _dark: bool) {}
+
+    pub fn set_clipboard_write_enabled(&self, _enabled: bool) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // SAFETY: the stub has no interior state, so it is trivially Send+Sync.
@@ -172,6 +183,9 @@ pub struct GhosttyTerminal {
 }
 
 impl GhosttyTerminal {
+    pub const SUPPORTS_FOREGROUND_PROCESS_GROUP_ID: bool = false;
+    pub const SUPPORTS_TTY_NAME: bool = false;
+
     pub fn draw(&self) {}
     pub fn refresh(&self) {}
     pub fn set_size(&self, _w: u32, _h: u32) {}
@@ -187,8 +201,11 @@ impl GhosttyTerminal {
     }
     pub fn set_content_scale(&self, _scale: f64) {}
     pub fn set_focus(&self, _focused: bool) {}
-    pub fn set_occlusion(&self, _occluded: bool) {}
+    pub fn set_visible(&self, _visible: bool) {}
     pub fn set_color_scheme(&self, _dark: bool) {}
+    pub fn set_clipboard_write_enabled(&self, _enabled: bool) -> Result<(), String> {
+        Ok(())
+    }
     pub fn perform_binding_action(&self, _action: &str) -> Result<bool, String> {
         Ok(false)
     }
@@ -205,6 +222,7 @@ impl GhosttyTerminal {
         &self,
         _colors: &TerminalColors,
         _font_family: &str,
+        _font_fallback: &[String],
         _font_size: f32,
         _background_opacity: f32,
         _background_blur: bool,
@@ -233,8 +251,23 @@ impl GhosttyTerminal {
     pub fn current_dir(&self) -> Option<String> {
         None
     }
+    pub fn foreground_process_group_id(&self) -> Option<u64> {
+        None
+    }
+    pub fn tty_name(&self) -> Option<String> {
+        None
+    }
+    pub fn progress(&self) -> Option<crate::TerminalProgress> {
+        None
+    }
+    pub fn take_program_events(&self) -> Vec<crate::ProgramStatusEvent> {
+        Vec::new()
+    }
     pub fn is_alive(&self) -> bool {
         false
+    }
+    pub fn prompt_state(&self) -> crate::TerminalPromptState {
+        crate::TerminalPromptState::default()
     }
     pub fn is_busy(&self) -> bool {
         false

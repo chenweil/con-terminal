@@ -88,12 +88,12 @@ kingston/
 │   │       ├── ffi.rs         # C API bindings (libghostty types, functions)
 │   │       └── terminal.rs    # GhosttyApp, GhosttyTerminal, TerminalState, action callbacks
 │   │
-│   ├── con-agent/             # AI agent harness (Rig 0.34)
+│   ├── con-agent/             # AI agent harness (Rig 0.40)
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       ├── provider.rs    # Multi-provider Rig Agent (13 providers)
-│   │       ├── hook.rs        # ConHook — PromptHook lifecycle bridge
-│   │       ├── tools.rs       # Rig Tool trait impls (terminal_exec, shell, file, edit, list, search)
+│   │       ├── provider.rs    # Multi-provider Rig agent construction and streaming
+│   │       ├── hook.rs        # ConHook — AgentHook lifecycle bridge
+│   │       ├── tools.rs       # Rig Tool impls for terminals, tmux, files, and workspaces
 │   │       ├── context.rs     # terminal context extraction for agent
 │   │       ├── conversation.rs # conversation state + Rig Message conversion
 │   │       └── skills.rs      # skill registry + AGENTS.md parser
@@ -231,14 +231,14 @@ See `docs/study/terminal-control-plane.md`.
 
 - `CompletionClient::agent()` builder — preamble + tools + model config in one chain
 - `Tool` trait — type-safe tool definitions with `Args` (Deserialize), `Output` (Serialize), `Error`
-- `Chat` trait — multi-turn conversation with `Vec<Message>` history
-- `PromptHook` trait — lifecycle callbacks (on_text_delta, on_tool_call, on_tool_result) for streaming UI
+- streaming prompt requests with explicit `Vec<Message>` history
+- `AgentHook` events for text deltas, tool approval, and tool results
 - `anthropic::Client::new(api_key)` — direct Anthropic provider with model constants (`CLAUDE_4_SONNET`)
 - Agent loop with automatic tool calling (up to N turns)
 
-**Current integration:** con-agent implements 7 tools as Rig `Tool` impls (terminal_exec, shell_exec, file_read, file_write, edit_file, list_files, search), supports 13 providers (Anthropic, OpenAI, OpenAI-compatible, DeepSeek, Groq, Gemini, Ollama, OpenRouter, Mistral, Together, Cohere, Perplexity, xAI) with custom base_url for proxy endpoints. The harness runs on a shared tokio runtime. Provider settings are configurable via Cmd+, settings panel.
+**Current integration:** con-agent implements 34 Rig tools spanning visible terminal control, tmux, local files, remote workspaces, and agent CLI orchestration. Provider-native clients and OpenAI-compatible endpoints share one harness path, with configurable models, credentials, and base URLs. The harness runs on a shared tokio runtime. Provider settings are configurable from the settings window.
 
-**Agent lifecycle (PromptHook):** Each agent request uses `agent.prompt().with_hook(hook).with_history(history)` instead of `agent.chat()`. The `ConHook` struct implements Rig's `PromptHook<M>` trait, emitting `AgentEvent`s for every tool call start/result and text delta. For dangerous tools (`shell_exec`, `terminal_exec`, `file_write`, `edit_file`), the hook blocks on a per-request approval channel — the UI must explicitly allow or deny execution before the agent proceeds. Safe tools (`file_read`, `list_files`, `search`) execute immediately. A 5-minute timeout prevents indefinite hangs if the UI becomes unresponsive.
+**Agent lifecycle (AgentHook):** Each agent request builds a streaming prompt with its conversation history and a `ConHook` registered on the agent. The hook maps Rig's typed lifecycle events into Con's UI events for tool-call start, tool result, and text deltas. For dangerous tools (`shell_exec`, `terminal_exec`, `file_write`, `edit_file`), the hook waits on a per-request approval channel before execution. Safe tools (`file_read`, `list_files`, `search`) execute immediately. A 5-minute timeout prevents indefinite hangs if the UI becomes unresponsive. Rig 0.40 uses an exact total model-call budget; Con converts its existing `max_turns` setting through a compatibility function that preserves the previously shipped ceiling.
 
 **Visible terminal tool:** The `terminal_exec` tool is con's core differentiator. Instead of running commands in a hidden subprocess, it writes commands to the user's visible Ghostty pane. Output is captured via Ghostty's command-finished signal, with a bounded recent-output fallback when shell integration is unavailable. The user sees every command the agent runs in real time — full transparency.
 
@@ -298,7 +298,7 @@ Important consequence:
 - [x] Application cursor keys (SS3 mode for vim/less/top)
 - [x] Text style rendering: italic, underline, strikethrough, dim, inverse
 - [x] Basic tabs (Cmd+T / Cmd+W) with tab bar and OSC title
-- [x] Font size from config (config.toml terminal.font_size)
+- [x] Font size from config (`font-size` in `con.conf`)
 - [x] CWD display in input bar from OSC 7
 - [x] Mouse text selection (click-drag, auto-copy, Cmd+C copy)
 - [x] Clipboard paste (Cmd+V) with bracketed paste mode support
@@ -313,14 +313,14 @@ Important consequence:
 - [x] Side panel for AI chat (Cmd+L to toggle)
 - [x] Terminal context injection (last N lines, current command, cwd)
 - [x] Tool execution: agent can run shell commands in terminal
-- [x] Multi-provider config (13 providers via Rig 0.34)
+- [x] Multi-provider config via Rig 0.40
 - [x] Settings panel (Cmd+,) with provider selector and model config
 - [x] Smart input bar (shell/agent/smart modes)
 - [x] Agent notification system (blue dot on tab when agent responds)
 
 ### Phase 3: Agent Lifecycle & Tool Transparency
 
-- [x] PromptHook integration — tool calls visible in agent panel
+- [x] AgentHook integration — tool calls visible in agent panel
 - [x] Tool danger classification (safe: file_read, search; dangerous: shell_exec, file_write)
 - [x] Per-request approval channels (no cross-request interference)
 - [x] Approval timeout (5 minutes, denies on expiry)
@@ -368,14 +368,14 @@ Important consequence:
 - [x] Command palette expanded (clear, focus, toggle sidebar, cycle mode)
 - [x] Terminal settings in Settings UI (font size, theme)
 - [x] Cmd+A select all, Cmd+K clear scrollback
-- [x] Configurable keybindings (config.toml keybindings section)
+- [x] Configurable keybindings (`con.keybindings.*` in `con.conf`)
 - [ ] Plugin system (Lua or WASM)
 - [ ] Auto-update (Sparkle on macOS)
 - [ ] CLI tool (`con` command for scripting)
 
 ### Phase 7: Agent Capabilities & Terminal Polish
 
-- [x] Rig 0.32 → 0.34 upgrade (stable API, `rustls` feature rename)
+- [x] Rig 0.36 → 0.40 migration (hooks v2, structured tool metadata, unified prompt responses)
 - [x] Rich context injection (git diff, project structure, XML-tagged system prompt)
 - [x] Visible terminal tool (terminal_exec — commands execute in user's visible PTY)
 - [x] Surgical file editing tool (edit_file — find & replace, not full overwrite)
@@ -486,33 +486,33 @@ cargo test --workspace         # test everything
 
 ## Config
 
-```toml
-# ~/.config/con/config.toml
+```ini
+# ~/Library/Application Support/con/con.conf on macOS
+# ~/.config/con/con.conf on Linux
 
-[terminal]
+# Native terminal settings use Ghostty names.
 font-family = "JetBrains Mono"
 font-size = 14
-theme = "catppuccin-mocha"        # or any ghostty theme
-scrollback-lines = 10000
-cursor-style = "block"
+theme = "catppuccin-mocha"
+cursor-style = block
 
-[agent]
-provider = "anthropic"             # anthropic, openai, openai-compatible, deepseek,
-                                   # groq, gemini, ollama, openrouter, mistral,
-                                   # together, cohere, perplexity, xai
-model = "claude-sonnet-4-0"        # leave empty for provider default
-api_key_env = "ANTHROPIC_API_KEY"  # reads from env var
-base_url = ""                      # optional: custom/proxy endpoint
-max_tokens = 4096
-max_turns = 10
-auto_context = true                # inject terminal context automatically
-auto_approve_tools = false         # require approval for shell_exec, file_write
+# Con-owned settings live under the con.* namespace.
+con.agent.provider = anthropic
+con.agent.providers.anthropic.model = claude-sonnet-4-6
+con.agent.providers.anthropic.api_key_env = ANTHROPIC_API_KEY
+con.agent.providers.anthropic.max_tokens = 4096
+con.agent.max_turns = 10
+con.agent.auto_context = true
+con.agent.auto_approve_tools = false
 
-[keybindings]
-toggle-agent = "cmd+l"
-command-palette = "cmd+shift+p"
-new-tab = "cmd+t"
+con.keybindings.toggle_agent = secondary-l
+con.keybindings.command_palette = secondary-shift-p
+con.keybindings.new_tab = secondary-t
 ```
+
+Windows uses `%APPDATA%\con-terminal\con-terminal.conf`. See
+[`docs/impl/configuration.md`](docs/impl/configuration.md) for migration,
+imports, native ownership, and the portable subset.
 
 ---
 

@@ -74,13 +74,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.16.0
         # Same Zig the linux CI smoke test installs — needed for
         # con-ghostty's libghostty-vt build.
         shell: bash
         run: |
           set -euo pipefail
-          ZIG_VERSION="0.15.2"
+          ZIG_VERSION="0.16.0"
           ZIG_ARCH="x86_64"
           ZIG_DIR="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
           ZIG_TARBALL="${ZIG_DIR}.tar.xz"
@@ -222,6 +222,12 @@ jobs:
 
   update-appcast:
     name: Update Sparkle appcast (linux-x86_64)
+    concurrency:
+      # Each platform owns a different appcast file. Do not put these jobs
+      # in one GitHub concurrency group: it has only one pending slot, so a
+      # later platform completion silently cancels an earlier appcast job.
+      group: con-gh-pages-publish-linux
+      cancel-in-progress: false
     # Run on macOS because Sparkle's `sign_update` tool ships only in
     # the macOS Sparkle distribution. Identical pattern to
     # release-windows.yml's appcast job — same Ed25519 keypair, same
@@ -389,5 +395,15 @@ jobs:
             exit 0
           fi
           git commit -m "Update Linux appcast for $GITHUB_REF_NAME"
-          git pull --rebase origin gh-pages 2>/dev/null || true
-          git push origin gh-pages
+          for attempt in 1 2 3 4 5; do
+            git fetch origin gh-pages
+            if git rebase origin/gh-pages && git push origin gh-pages; then
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "::error::Unable to push Linux appcast after $attempt attempts"
+              exit 1
+            fi
+            sleep $((attempt * 2))
+          done

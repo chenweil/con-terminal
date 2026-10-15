@@ -15,27 +15,52 @@ use std::cell::Cell;
 use std::ops::Range;
 #[cfg(target_os = "macos")]
 use std::os::raw::c_void;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use con_ghostty::GhosttyScrollbar;
 use con_ghostty::ffi;
 use con_ghostty::{
     GhosttyApp, GhosttySplitDirection, GhosttySurfaceEvent, GhosttyTerminal, MouseButton,
+    TerminalProgress,
 };
 use gpui::{prelude::FluentBuilder as _, *};
-use gpui_component::ActiveTheme;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::clipboard::Clipboard;
 use gpui_component::menu::ContextMenuExt;
+use gpui_component::{ActiveTheme, Icon, Sizable as _};
 
+use crate::mouse_sequence::MouseButtonSequence;
+use crate::terminal_find::{TerminalFind, TerminalFindDismissed};
 use crate::terminal_paste::{
     TerminalPastePayload, payload_from_clipboard, payload_from_external_paths,
 };
 use crate::terminal_restore::key_down_may_write_terminal;
+use crate::terminal_url::{Osc8UrlDecision, Osc8UrlDenial, evaluate_osc8_url};
+use crate::ui_scale::mono_icon_px;
 
-// Actions to intercept Tab/Shift-Tab before Root's focus-cycling handler.
+// Actions owned by the embedded terminal view.
 actions!(ghostty, [ConsumeTab, ConsumeTabPrev]);
+
+/// The native surface can become visible during prepaint. Decide fallback
+/// coverage after layout, never from the earlier Render snapshot.
+fn terminal_surface_canvas(
+    fallback_color: Hsla,
+    layout: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App) -> bool,
+    paint_input: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App),
+) -> Canvas<bool> {
+    canvas(layout, move |bounds, show_fallback, window, cx| {
+        if show_fallback {
+            window.paint_quad(fill(bounds, fallback_color));
+        }
+        paint_input(bounds, window, cx);
+    })
+}
 
 #[cfg(target_os = "macos")]
 use cocoa::appkit::NSWindowOrderingMode;
@@ -57,11 +82,26 @@ const NS_VIEW_LAYER_CONTENTS_REDRAW_DURING_VIEW_RESIZE: isize = 2;
 #[cfg(target_os = "macos")]
 const NATIVE_SEAM_OVERDRAW_PT: f64 = 2.0;
 #[cfg(target_os = "macos")]
+const SCROLLBAR_INSET_PX: f32 = 6.0;
+#[cfg(target_os = "macos")]
+const SCROLLBAR_HIT_WIDTH_PX: f32 = 14.0;
+#[cfg(target_os = "macos")]
+const SCROLLBAR_THUMB_WIDTH_PX: f32 = 4.0;
+#[cfg(target_os = "macos")]
+const SCROLLBAR_MIN_THUMB_PX: f32 = 28.0;
+#[cfg(target_os = "macos")]
 static NATIVE_TRANSITION_UNDERLAY_ASSOCIATION_KEY: u8 = 0;
 #[cfg(target_os = "macos")]
 static NATIVE_TRANSITION_UNDERLAY_OWNERS_ASSOCIATION_KEY: u8 = 0;
 #[cfg(target_os = "macos")]
 static NEXT_NATIVE_TRANSITION_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    // AppKit visibility is app-wide; an old pane must not undo a newer pane's
+    // hide. Accessed only by the GPUI main thread, never by Ghostty callbacks.
+    static HIDDEN_MOUSE_OWNER: Cell<Option<u64>> = const { Cell::new(None) };
+}
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +116,11 @@ unsafe extern "C" {
     fn objc_setAssociatedObject(object: id, key: *const c_void, value: id, policy: usize);
     fn con_ghostty_surface_install_backing_observer(view: *mut c_void, surface: *mut c_void);
     fn con_ghostty_surface_remove_backing_observer(view: *mut c_void);
+    fn con_ghostty_surface_sync_occlusion(view: *mut c_void);
+    fn con_ghostty_surface_current_key_text(
+        view: *mut c_void,
+        text_length: *mut usize,
+    ) -> *const std::ffi::c_char;
     fn con_ghostty_surface_sync_backing(
         view: *mut c_void,
         surface: *mut c_void,
@@ -100,8 +145,11 @@ fn perf_trace_enabled() -> bool {
 }
 
 /// Emitted when the terminal title changes.
-#[allow(dead_code)]
-pub struct GhosttyTitleChanged(pub Option<String>);
+pub struct GhosttyTitleChanged {
+    pub content_changed: bool,
+}
+
+pub struct GhosttyBell;
 
 /// Emitted when the terminal process exits.
 pub struct GhosttyProcessExited;
@@ -111,12 +159,179 @@ pub struct GhosttyFocusChanged;
 /// Emitted when Ghostty requests a new split from this surface.
 pub struct GhosttySplitRequested(pub GhosttySplitDirection);
 pub struct GhosttyCwdChanged(pub Option<String>);
+pub struct GhosttyProgressChanged;
+
+impl EventEmitter<crate::terminal_file_link::TerminalFileLink> for GhosttyView {}
 
 impl EventEmitter<GhosttyTitleChanged> for GhosttyView {}
+impl EventEmitter<GhosttyBell> for GhosttyView {}
 impl EventEmitter<GhosttyProcessExited> for GhosttyView {}
 impl EventEmitter<GhosttyFocusChanged> for GhosttyView {}
 impl EventEmitter<GhosttySplitRequested> for GhosttyView {}
 impl EventEmitter<GhosttyCwdChanged> for GhosttyView {}
+impl EventEmitter<GhosttyProgressChanged> for GhosttyView {}
+
+#[derive(Default)]
+struct PendingTerminalFind {
+    needle: String,
+    total: Option<Option<usize>>,
+    selected: Option<Option<usize>>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarDrag {
+    grab_offset: f32,
+}
+
+/// A mouse-reporting TUI can own a drag selection while Ghostty has none.
+/// Remember that gesture so Cmd+C can invoke the TUI's copy key once.
+#[derive(Default)]
+struct TuiCopyGesture {
+    press_origin: Option<(f32, f32)>,
+    dragged: bool,
+    pending: bool,
+}
+
+impl TuiCopyGesture {
+    fn begin(&mut self, x: f32, y: f32, mouse_reported: bool) {
+        self.press_origin = mouse_reported.then_some((x, y));
+        self.dragged = false;
+        self.pending = false;
+    }
+
+    fn observe_move(&mut self, x: f32, y: f32) {
+        const DRAG_THRESHOLD_PX: f32 = 4.0;
+        if let Some((start_x, start_y)) = self.press_origin {
+            self.dragged |= (x - start_x).abs() >= DRAG_THRESHOLD_PX
+                || (y - start_y).abs() >= DRAG_THRESHOLD_PX;
+        }
+    }
+
+    fn finish(&mut self, terminal_has_selection: bool) {
+        self.pending = self.press_origin.is_some() && self.dragged && !terminal_has_selection;
+        self.press_origin = None;
+        self.dragged = false;
+    }
+
+    fn take_pending(&mut self, mouse_captured: bool) -> bool {
+        std::mem::take(&mut self.pending) && mouse_captured
+    }
+
+    fn cancel(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Distance between the OSC 8 hover / blocked cards and the pane edges.
+const OSC8_CARD_INSET_PX: f32 = 10.0;
+
+/// Surface color for the OSC 8 hover and blocked cards.
+///
+/// The cards float over live terminal output (the Ghostty view sits below the
+/// GPUI layer), so a bare tint such as `warning.opacity(0.12)` lets the
+/// terminal text bleed straight through the card. Start from the same
+/// near-opaque popover base the find overlay uses and blend the warning tint
+/// onto it, so the card reads as an elevated surface rather than a color wash.
+fn osc8_card_surface(theme: &gpui_component::Theme, warning: bool) -> Hsla {
+    let base = theme.popover.opacity(0.96);
+    if warning {
+        base.blend(
+            theme
+                .warning
+                .opacity(if theme.is_dark() { 0.18 } else { 0.12 }),
+        )
+    } else {
+        base
+    }
+}
+
+/// Hover card for an OSC 8 link: icon, the canonical target, and a status word.
+///
+/// The card is sized by flex layout from its children and never from a
+/// hand-measured text width. GPUI rounds every text element's measured width
+/// up to a whole pixel (`TextLayout::layout` → `.ceil()`), so any fixed width
+/// derived from unrounded shaping is short by up to 1px per text child, and
+/// `truncate()` turns even a 0.2px deficit into a dropped character plus an
+/// ellipsis. Letting the target keep its own content width as its flex basis
+/// guarantees it receives at least the width it measured; it only shrinks
+/// (and truncates) once the whole card reaches `max_width`, because the icon
+/// and status are `flex_none`.
+fn osc8_link_preview_card(
+    decision: &Osc8UrlDecision,
+    theme: &gpui_component::Theme,
+    max_width: Pixels,
+) -> Div {
+    let (display, will_open) = match decision {
+        Osc8UrlDecision::Allow(url) => (url, true),
+        Osc8UrlDecision::Deny(denial) => (&denial.display, false),
+    };
+    let accent = if will_open {
+        theme.foreground.opacity(0.72)
+    } else {
+        theme.warning
+    };
+    let status = if will_open { "⌘C Copy" } else { "Blocked" };
+
+    div()
+        .debug_selector(|| "osc8-link-preview-card".into())
+        .max_w(max_width)
+        .min_w_0()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(8.0))
+        .py(px(5.0))
+        .rounded(px(6.0))
+        .bg(osc8_card_surface(theme, !will_open))
+        .child(
+            Icon::default()
+                .path(if will_open {
+                    "phosphor/link.svg"
+                } else {
+                    "phosphor/shield-warning-fill.svg"
+                })
+                .size(mono_icon_px(theme, 12.0))
+                .text_color(accent),
+        )
+        .child(
+            // No `flex_1` here: a zero flex basis would make this child absorb
+            // every sub-pixel rounding difference in the row. With the default
+            // `flex: 0 1 auto` its basis is its own (ceil-rounded) text width.
+            div()
+                .debug_selector(|| "osc8-link-preview-target".into())
+                .min_w_0()
+                .truncate()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(px(11.0))
+                .text_color(theme.foreground.opacity(0.86))
+                .child(display.clone()),
+        )
+        .child(
+            div()
+                .debug_selector(|| "osc8-link-preview-status".into())
+                .flex_none()
+                .text_size(px(10.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(accent)
+                .child(status),
+        )
+}
+
+fn copyable_terminal_text(
+    has_selection: bool,
+    selection: Option<String>,
+    hovered_link: Option<&Osc8UrlDecision>,
+) -> Option<String> {
+    if has_selection {
+        return selection;
+    }
+    match hovered_link? {
+        Osc8UrlDecision::Allow(url) => Some(url.clone()),
+        Osc8UrlDecision::Deny(_) => None,
+    }
+}
 
 /// GPUI view wrapping a ghostty terminal surface.
 pub struct GhosttyView {
@@ -143,11 +358,16 @@ pub struct GhosttyView {
     native_underlay_color: Option<(u8, u8, u8, u8)>,
     #[cfg(target_os = "macos")]
     pending_native_layout: bool,
+    #[cfg(target_os = "macos")]
+    mouse_cursor: CursorStyle,
+    #[cfg(target_os = "macos")]
+    pending_mouse_visible: Cell<Option<bool>>,
     initialized: bool,
     last_bounds: Option<Bounds<Pixels>>,
     scale_factor: f32,
-    last_title: Option<String>,
+    pub(crate) terminal_title: con_core::terminal_title::TerminalTitle,
     last_cwd: Option<String>,
+    last_progress: Option<TerminalProgress>,
     /// Data queued for the PTY before the surface was created.
     /// Flushed once in `ensure_initialized()` after the terminal exists.
     pending_write: Option<Vec<u8>>,
@@ -167,22 +387,40 @@ pub struct GhosttyView {
     process_exit_emitted: bool,
     /// Retry surface creation after transient libghostty initialization failures.
     next_surface_init_retry_at: Option<Instant>,
-    /// Last mouse position seen by GPUI. Ghostty link hover state depends on
-    /// both position and modifiers, but macOS sends modifier changes without a
-    /// mouse-move event when the pointer is stationary.
+    /// Last mouse position seen by GPUI, used for link previews and mouse input.
     #[cfg(target_os = "macos")]
     last_mouse_position: Option<Point<Pixels>>,
+    #[cfg(target_os = "macos")]
+    last_forwarded_modifiers: Cell<Modifiers>,
+    /// Decision for the OSC 8 target under the pointer; shown while hovering.
+    hovered_osc8_url: Option<Osc8UrlDecision>,
+    /// The last OSC 8 target denied on click; shown until dismissed.
+    blocked_osc8_url: Option<Osc8UrlDenial>,
+    #[cfg(target_os = "macos")]
+    scrollbar_drag: Option<ScrollbarDrag>,
+    #[cfg(target_os = "macos")]
+    last_scrollbar: Option<GhosttyScrollbar>,
     #[cfg(target_os = "macos")]
     native_transition_underlay_visible: Cell<bool>,
     #[cfg(target_os = "macos")]
     native_transition_underlay_owner_id: u64,
+    left_mouse_sequence: MouseButtonSequence<i32>,
+    tui_copy_gesture: TuiCopyGesture,
+    plain_link_generation: u64,
+    right_mouse_sequence: MouseButtonSequence<i32>,
+    /// Whether the most recent right-button press was consumed by libghostty.
+    right_click_consumed: Rc<Cell<bool>>,
+    /// In-memory `experimental.handoff` gate pushed in by the workspace, so
+    /// the right-click menu matches the toolbar without re-reading config.
+    handoff_menu_entry_enabled: Cell<bool>,
     ime_marked_text: Option<String>,
+    terminal_find: Option<Entity<TerminalFind>>,
+    pending_terminal_find: Option<PendingTerminalFind>,
+    restore_terminal_focus: bool,
 }
 
-/// Register ghostty key bindings. Call once at startup.
+/// Register ghostty view key bindings. Call once at startup.
 pub fn init(cx: &mut App) {
-    // Bind Tab/Shift-Tab to our consume actions within the GhosttyTerminal context.
-    // This prevents Root's Tab handler from intercepting Tab when the terminal is focused.
     cx.bind_keys([
         KeyBinding::new("tab", ConsumeTab, Some("GhosttyTerminal")),
         KeyBinding::new("shift-tab", ConsumeTabPrev, Some("GhosttyTerminal")),
@@ -219,11 +457,16 @@ impl GhosttyView {
             native_underlay_color: None,
             #[cfg(target_os = "macos")]
             pending_native_layout: false,
+            #[cfg(target_os = "macos")]
+            mouse_cursor: CursorStyle::IBeam,
+            #[cfg(target_os = "macos")]
+            pending_mouse_visible: Cell::new(None),
             initialized: false,
             last_bounds: None,
             scale_factor: 1.0,
-            last_title: None,
+            terminal_title: Default::default(),
             last_cwd: cwd,
+            last_progress: None,
             pending_write: None,
             restored_screen_text,
             native_view_visible: Cell::new(true),
@@ -234,11 +477,381 @@ impl GhosttyView {
             #[cfg(target_os = "macos")]
             last_mouse_position: None,
             #[cfg(target_os = "macos")]
+            last_forwarded_modifiers: Cell::new(Modifiers::default()),
+            hovered_osc8_url: None,
+            blocked_osc8_url: None,
+            #[cfg(target_os = "macos")]
+            scrollbar_drag: None,
+            #[cfg(target_os = "macos")]
+            last_scrollbar: None,
+            #[cfg(target_os = "macos")]
             native_transition_underlay_visible: Cell::new(false),
             #[cfg(target_os = "macos")]
             native_transition_underlay_owner_id: NEXT_NATIVE_TRANSITION_OWNER_ID
                 .fetch_add(1, Ordering::Relaxed),
+            left_mouse_sequence: MouseButtonSequence::default(),
+            tui_copy_gesture: TuiCopyGesture::default(),
+            plain_link_generation: 0,
+            right_mouse_sequence: MouseButtonSequence::default(),
+            right_click_consumed: Rc::new(Cell::new(false)),
+            handoff_menu_entry_enabled: Cell::new(false),
             ime_marked_text: None,
+            terminal_find: None,
+            pending_terminal_find: None,
+            restore_terminal_focus: false,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn scrollbar_metrics(&self) -> Option<(GhosttyScrollbar, f32, f32, f32)> {
+        let terminal = self.terminal.as_ref()?;
+        let scrollbar = terminal.scrollbar()?;
+        if scrollbar.total <= scrollbar.len || scrollbar.len == 0 {
+            return None;
+        }
+
+        let bounds = self.last_bounds?;
+        let track_height = (bounds.size.height.as_f32() - SCROLLBAR_INSET_PX * 2.0).max(0.0);
+        if track_height <= 0.0 {
+            return None;
+        }
+
+        let thumb_height = ((scrollbar.len as f32 / scrollbar.total as f32) * track_height)
+            .clamp(SCROLLBAR_MIN_THUMB_PX.min(track_height), track_height);
+        let max_offset = scrollbar.total.saturating_sub(scrollbar.len).max(1);
+        let travel = (track_height - thumb_height).max(0.0);
+        let thumb_top = if travel == 0.0 {
+            0.0
+        } else {
+            (scrollbar.offset.min(max_offset) as f32 / max_offset as f32) * travel
+        };
+        Some((scrollbar, track_height, thumb_height, thumb_top))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn scroll_to_row(&self, row: u64) {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return;
+        };
+        let _ = terminal.perform_binding_action(&format!("scroll_to_row:{row}"));
+        terminal.refresh();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn scroll_page(&self, upward: bool) {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return;
+        };
+        let action = if upward {
+            "scroll_page_up"
+        } else {
+            "scroll_page_down"
+        };
+        let _ = terminal.perform_binding_action(action);
+        terminal.refresh();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_scrollbar_interaction(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+    ) -> bool {
+        let Some((_scrollbar, _, thumb_height, thumb_top)) = self.scrollbar_metrics() else {
+            return false;
+        };
+        self.tui_copy_gesture.cancel();
+        let (_, local_y) = self.view_local_pos(position);
+        let track_y = (local_y as f32 - SCROLLBAR_INSET_PX).clamp(0.0, f32::MAX);
+        if (thumb_top..=thumb_top + thumb_height).contains(&track_y) {
+            self.scrollbar_drag = Some(ScrollbarDrag {
+                grab_offset: track_y - thumb_top,
+            });
+        } else {
+            self.scroll_page(track_y < thumb_top);
+        }
+        window.prevent_default();
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn drag_scrollbar(&mut self, position: Point<Pixels>) {
+        let Some(drag) = self.scrollbar_drag else {
+            return;
+        };
+        let Some((scrollbar, track_height, thumb_height, _)) = self.scrollbar_metrics() else {
+            self.scrollbar_drag = None;
+            return;
+        };
+        let (_, local_y) = self.view_local_pos(position);
+        let travel = (track_height - thumb_height).max(0.0);
+        if travel == 0.0 {
+            return;
+        }
+        let thumb_top = (local_y as f32 - SCROLLBAR_INSET_PX - drag.grab_offset).clamp(0.0, travel);
+        let max_offset = scrollbar.total.saturating_sub(scrollbar.len);
+        let row = ((thumb_top / travel) * max_offset as f32).round() as u64;
+        self.scroll_to_row(row.min(max_offset));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn render_terminal_scrollbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_scrollbar, _track_height, thumb_height, thumb_top) = self.scrollbar_metrics()?;
+        let foreground = cx.theme().foreground;
+
+        Some(
+            div()
+                .absolute()
+                .top(px(SCROLLBAR_INSET_PX))
+                .right(px(0.0))
+                .bottom(px(SCROLLBAR_INSET_PX))
+                .w(px(SCROLLBAR_HIT_WIDTH_PX))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if this.start_scrollbar_interaction(event.position, window) {
+                            window.focus(&this.focus_handle, cx);
+                            cx.emit(GhosttyFocusChanged);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                        if this.scrollbar_drag.take().is_some() {
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child(
+                    div()
+                        .id("terminal-scrollbar-thumb")
+                        .absolute()
+                        .top(px(thumb_top))
+                        .right(px((SCROLLBAR_HIT_WIDTH_PX - SCROLLBAR_THUMB_WIDTH_PX) / 2.0))
+                        .w(px(SCROLLBAR_THUMB_WIDTH_PX))
+                        .h(px(thumb_height))
+                        .rounded(px(SCROLLBAR_THUMB_WIDTH_PX / 2.0))
+                        .bg(foreground.opacity(0.2))
+                        .hover(|style| style.bg(foreground.opacity(0.38))),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn dismiss_blocked_osc8_url(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.blocked_osc8_url.take().is_none() {
+            return false;
+        }
+        self.hovered_osc8_url = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+        true
+    }
+
+    fn render_osc8_link_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.blocked_osc8_url.is_some() {
+            return None;
+        }
+        let decision = self.hovered_osc8_url.as_ref()?;
+        let theme = cx.theme();
+        let bounds = self.last_bounds?;
+        let align_right = self
+            .last_mouse_position
+            .is_some_and(|mouse| mouse.x < bounds.origin.x + bounds.size.width / 2.0);
+
+        // The card may use the whole overlay width (pane minus the side
+        // insets): the target is security-relevant text, so prefer showing it
+        // in full over truncating it to a fraction of the pane.
+        let inset = px(OSC8_CARD_INSET_PX);
+        let max_width = (bounds.size.width - inset * 2.0).max(px(0.0));
+
+        let mut overlay = div()
+            .absolute()
+            .left(inset)
+            .right(inset)
+            .bottom(inset)
+            .flex();
+        if align_right {
+            overlay = overlay.justify_end();
+        }
+
+        Some(
+            overlay
+                .child(osc8_link_preview_card(decision, theme, max_width))
+                .into_any_element(),
+        )
+    }
+
+    fn render_blocked_osc8_url(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let denial = self.blocked_osc8_url.as_ref()?;
+        let theme = cx.theme();
+        let warning = theme.warning;
+        let display: SharedString = denial.display.clone().into();
+        let inset = px(OSC8_CARD_INSET_PX);
+
+        Some(
+            div()
+                .absolute()
+                .left(inset)
+                .right(inset)
+                .bottom(inset)
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .occlude()
+                        .w_full()
+                        .max_w(px(620.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .p(px(10.0))
+                        .rounded(px(8.0))
+                        .bg(osc8_card_surface(theme, true))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(|_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|_this, _event, _window, cx| {
+                            cx.stop_propagation();
+                        }))
+                        .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| {
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    Icon::default()
+                                        .path("phosphor/shield-warning-fill.svg")
+                                        .small()
+                                        .text_color(warning),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .text_size(px(11.0))
+                                        .line_height(px(15.0))
+                                        .text_color(theme.foreground.opacity(0.78))
+                                        .child(denial.reason.message()),
+                                )
+                                .child(
+                                    Button::new("dismiss-blocked-osc8-url")
+                                        .icon(
+                                            Icon::default()
+                                                .path("phosphor/x.svg")
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip("Dismiss")
+                                        .on_click(cx.listener(|this, _event, window, cx| {
+                                            cx.stop_propagation();
+                                            this.dismiss_blocked_osc8_url(window, cx);
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .px(px(8.0))
+                                .py(px(6.0))
+                                .rounded(px(6.0))
+                                .bg(theme.foreground.opacity(0.06))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .font_family(theme.mono_font_family.clone())
+                                        .text_size(px(11.0))
+                                        .text_color(theme.foreground.opacity(0.84))
+                                        .child(display.clone()),
+                                )
+                                .child(
+                                    // Keyed by the displayed text so the
+                                    // "copied" state cannot carry over to a
+                                    // different blocked target.
+                                    Clipboard::new(display.clone())
+                                        .value(display)
+                                        .tooltip("Copy displayed target"),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    pub(crate) fn show_terminal_find(
+        &mut self,
+        needle: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(find) = self.terminal_find.as_ref() {
+            find.update(cx, |find, cx| find.set_needle(needle, window, cx));
+            return;
+        }
+
+        let Some(terminal) = self.terminal.clone() else {
+            return;
+        };
+        let terminal_focus = self.focus_handle.clone();
+        let find = cx.new(|cx| TerminalFind::new(terminal, terminal_focus, needle, window, cx));
+        let find_id = find.entity_id();
+        cx.subscribe_in(
+            &find,
+            window,
+            move |this, _, _: &TerminalFindDismissed, _window, cx| {
+                if this
+                    .terminal_find
+                    .as_ref()
+                    .is_some_and(|active| active.entity_id() == find_id)
+                {
+                    this.terminal_find = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        find.update(cx, |find, cx| find.focus(window, cx));
+        self.terminal_find = Some(find);
+        cx.notify();
+    }
+
+    fn flush_pending_terminal_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending_terminal_find.take() else {
+            return;
+        };
+
+        self.show_terminal_find(pending.needle, window, cx);
+        if let Some(find) = self.terminal_find.as_ref() {
+            find.update(cx, |find, cx| {
+                if let Some(total) = pending.total {
+                    find.set_total(total, cx);
+                }
+                if let Some(selected) = pending.selected {
+                    find.set_selected(selected, cx);
+                }
+            });
         }
     }
 
@@ -253,6 +866,12 @@ impl GhosttyView {
 
         let started = perf_trace_enabled().then(Instant::now);
         let mut changed = false;
+
+        if terminal.take_bell() {
+            changed = true;
+            cx.emit(GhosttyBell);
+        }
+
         for event in terminal.take_pending_events() {
             changed = true;
             match event {
@@ -260,16 +879,98 @@ impl GhosttyView {
                     cx.emit(GhosttySplitRequested(direction));
                 }
                 GhosttySurfaceEvent::OpenUrl(url) => {
-                    cx.open_url(&url);
+                    use crate::terminal_file_link::{PlainLink, resolve_plain_link};
+                    self.plain_link_generation = self.plain_link_generation.wrapping_add(1);
+                    let generation = self.plain_link_generation;
+                    let cwd = self.current_dir().map(std::path::PathBuf::from);
+                    // File type checks may touch a slow filesystem. Keep them
+                    // off the UI thread, capturing this terminal's CWD now.
+                    cx.spawn(async move |this, cx| {
+                        let target = cx
+                            .background_executor()
+                            .spawn(async move { resolve_plain_link(&url, cwd.as_deref()) })
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            if this.plain_link_generation != generation {
+                                return;
+                            }
+                            match target {
+                                PlainLink::File(link) => cx.emit(link),
+                                PlainLink::Url(url) => cx.open_url(&url),
+                                PlainLink::Ignore => {}
+                            }
+                        });
+                    })
+                    .detach();
+                }
+                GhosttySurfaceEvent::OpenOsc8Url(url) => match evaluate_osc8_url(&url) {
+                    Osc8UrlDecision::Allow(url) => cx.open_url(&url),
+                    Osc8UrlDecision::Deny(denial) => self.blocked_osc8_url = Some(denial),
+                },
+                GhosttySurfaceEvent::Osc8LinkHoverChanged(url) => {
+                    self.hovered_osc8_url = url.map(|url| evaluate_osc8_url(&url));
                 }
                 GhosttySurfaceEvent::PwdChanged(cwd) => {
                     self.last_cwd = Some(cwd.clone());
                     cx.emit(GhosttyCwdChanged(Some(cwd)));
                 }
+                GhosttySurfaceEvent::StartSearch(needle) => {
+                    self.pending_terminal_find = Some(PendingTerminalFind {
+                        needle,
+                        ..PendingTerminalFind::default()
+                    });
+                }
+                GhosttySurfaceEvent::EndSearch => {
+                    let mut had_find = self.pending_terminal_find.take().is_some();
+                    if let Some(find) = self.terminal_find.take() {
+                        had_find = true;
+                        find.update(cx, |find, _cx| find.mark_ended());
+                    }
+                    self.restore_terminal_focus |= had_find;
+                }
+                GhosttySurfaceEvent::SearchTotal(total) => {
+                    if let Some(find) = self.terminal_find.as_ref() {
+                        find.update(cx, |find, cx| find.set_total(total, cx));
+                    } else if let Some(pending) = self.pending_terminal_find.as_mut() {
+                        pending.total = Some(total);
+                    }
+                }
+                GhosttySurfaceEvent::SearchSelected(selected) => {
+                    if let Some(find) = self.terminal_find.as_ref() {
+                        find.update(cx, |find, cx| find.set_selected(selected, cx));
+                    } else if let Some(pending) = self.pending_terminal_find.as_mut() {
+                        pending.selected = Some(selected);
+                    }
+                }
             }
         }
 
         let _ = terminal.take_needs_render();
+
+        #[cfg(target_os = "macos")]
+        {
+            let (shape, visible, scrollbar) = {
+                let mut state = terminal.state().lock();
+                (
+                    state.mouse_shape.take(),
+                    state.mouse_visible.take(),
+                    state.scrollbar,
+                )
+            };
+            if let Some(shape) = shape {
+                let cursor = ghostty_mouse_cursor(shape);
+                changed |= self.mouse_cursor != cursor;
+                self.mouse_cursor = cursor;
+            }
+            if let Some(visible) = visible {
+                self.pending_mouse_visible.set(Some(visible));
+                changed = true;
+            }
+            if scrollbar != self.last_scrollbar {
+                self.last_scrollbar = scrollbar;
+                changed = true;
+            }
+        }
 
         if !terminal.is_alive() && !self.process_exit_emitted {
             self.process_exit_emitted = true;
@@ -278,10 +979,9 @@ impl GhosttyView {
         }
 
         let title = terminal.title();
-        if title != self.last_title {
-            self.last_title = title.clone();
+        if let Some(content_changed) = self.terminal_title.update(title) {
             changed = true;
-            cx.emit(GhosttyTitleChanged(title));
+            cx.emit(GhosttyTitleChanged { content_changed });
         }
 
         let cwd = terminal.current_dir().or_else(|| self.initial_cwd.clone());
@@ -291,25 +991,32 @@ impl GhosttyView {
             cx.emit(GhosttyCwdChanged(cwd));
         }
 
+        let progress = terminal.progress();
+        if progress != self.last_progress {
+            self.last_progress = progress;
+            changed = true;
+            cx.emit(GhosttyProgressChanged);
+        }
+
         #[cfg(target_os = "macos")]
         if sync_native_scroll {
             self.sync_native_scroll_view();
         }
 
-        if let Some(started) = started {
-            if changed {
-                log::info!(
-                    target: "con::perf",
-                    "drain_surface_state changed=1 elapsed_ms={:.3}",
-                    started.elapsed().as_secs_f64() * 1000.0
-                );
-            }
+        if let Some(started) = started
+            && changed
+        {
+            log::info!(
+                target: "con::perf",
+                "drain_surface_state changed=1 elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         changed
     }
 
-    fn send_terminal_paste_payload(&self, payload: TerminalPastePayload) -> bool {
+    fn handle_terminal_paste_payload(&self, payload: TerminalPastePayload) -> bool {
         let Some(terminal) = &self.terminal else {
             return false;
         };
@@ -335,6 +1042,18 @@ impl GhosttyView {
         }
     }
 
+    fn send_tui_copy_key(terminal: &GhosttyTerminal) {
+        terminal.send_key(ffi::ghostty_input_key_s {
+            action: ffi::ghostty_input_action_e::GHOSTTY_ACTION_PRESS,
+            mods: ffi::GHOSTTY_MODS_CTRL,
+            consumed_mods: 0,
+            keycode: 0x08, // kVK_ANSI_C
+            text: std::ptr::null(),
+            unshifted_codepoint: 'c' as u32,
+            composing: false,
+        });
+    }
+
     fn paste_from_clipboard(&self, cx: &mut Context<Self>) -> bool {
         let Some(payload) = cx
             .read_from_clipboard()
@@ -343,7 +1062,7 @@ impl GhosttyView {
             return false;
         };
 
-        self.send_terminal_paste_payload(payload)
+        self.handle_terminal_paste_payload(payload)
     }
 
     pub fn pump_deferred_work(&mut self, cx: &mut Context<Self>) -> bool {
@@ -393,6 +1112,10 @@ impl GhosttyView {
             .or_else(|| self.initial_cwd.clone())
     }
 
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        self.last_progress
+    }
+
     pub fn is_alive(&self) -> bool {
         self.terminal.as_ref().is_some_and(|t| t.is_alive())
     }
@@ -410,8 +1133,21 @@ impl GhosttyView {
         self.terminal.as_ref().and_then(|t| t.selection_text())
     }
 
+    pub fn release_mouse_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(position) = self.last_mouse_position else {
+            return;
+        };
+        if self.release_left_mouse_sequence(position, None, cx) {
+            self.drain_surface_state(true, cx);
+            cx.notify();
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn detach_host_view(&mut self) {
+        self.set_mouse_hidden_by_typing(false);
+        self.pending_mouse_visible.set(None);
+        self.mouse_cursor = CursorStyle::IBeam;
         if let Some(underlay_view) = self.native_underlay_view {
             Self::set_transition_underlay_owner_visible(
                 underlay_view,
@@ -535,12 +1271,20 @@ impl GhosttyView {
         }
     }
 
-    pub fn shutdown_surface(&mut self) {
+    pub fn shutdown_surface(&mut self, _window: Option<&mut Window>, cx: &mut App) {
+        self.finish_active_mouse_sequences();
+        self.tui_copy_gesture.cancel();
         self.native_view_visible.set(false);
+
+        if let Some(find) = self.terminal_find.take() {
+            find.update(cx, |find, _cx| find.end());
+        }
+        self.pending_terminal_find = None;
+        self.restore_terminal_focus = false;
 
         if let Some(ref terminal) = self.terminal {
             terminal.set_focus(false);
-            terminal.set_occlusion(true);
+            terminal.set_visible(false);
         }
 
         self.detach_host_view();
@@ -548,7 +1292,8 @@ impl GhosttyView {
         self.initialized = false;
         self.awaiting_first_layout_visibility = false;
         self.last_bounds = None;
-        self.last_title = None;
+        self.terminal_title = Default::default();
+        self.last_progress = None;
         self.pending_write = None;
         self.restored_screen_text = None;
         self.next_surface_init_retry_at = None;
@@ -562,6 +1307,15 @@ impl GhosttyView {
     }
 
     pub fn set_surface_focus_state(&mut self, focused: bool) {
+        if !focused {
+            self.finish_active_mouse_sequences();
+            self.tui_copy_gesture.cancel();
+            #[cfg(target_os = "macos")]
+            {
+                self.set_mouse_hidden_by_typing(false);
+                self.pending_mouse_visible.set(None);
+            }
+        }
         let changed = self.surface_focused.replace(focused) != focused;
         if !changed {
             return;
@@ -684,6 +1438,7 @@ impl GhosttyView {
                 terminal.set_focus(self.surface_focused.get());
                 let terminal = Arc::new(terminal);
                 self.terminal = Some(terminal.clone());
+                self.last_forwarded_modifiers.set(Modifiers::default());
                 self.restored_screen_text = None;
                 self.host_view = Some(host_view);
                 self.document_view = Some(document_view);
@@ -921,6 +1676,7 @@ impl GhosttyView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let bounds = crate::terminal_geometry::snap_terminal_bounds(bounds, window.scale_factor());
         let showed_layout_fallback = self.show_layout_fallback();
         self.ensure_initialized(bounds, window, cx);
         self.update_frame(bounds, window);
@@ -1047,6 +1803,7 @@ impl GhosttyView {
 
     #[cfg(target_os = "macos")]
     fn update_frame(&mut self, bounds: Bounds<Pixels>, window: &Window) {
+        let bounds = crate::terminal_geometry::snap_terminal_bounds(bounds, window.scale_factor());
         // `last_bounds` is Con's layout cache, not Ghostty's protocol state.
         // Pane-local surfaces can be hidden, focused, and resized without
         // repainting every sibling; always verify the embedded surface still
@@ -1061,6 +1818,7 @@ impl GhosttyView {
         }
         let started = perf_trace_enabled().then(Instant::now);
         self.last_bounds = Some(bounds);
+        window.request_native_surface_presentation_sync();
         self.sync_native_backing_background();
 
         // Keep libghostty's framebuffer/PTY metadata ahead of every AppKit
@@ -1218,6 +1976,7 @@ impl GhosttyView {
     }
 
     fn on_layout(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = crate::terminal_geometry::snap_terminal_bounds(bounds, window.scale_factor());
         let showed_layout_fallback = self.show_layout_fallback();
         #[cfg(target_os = "macos")]
         {
@@ -1285,9 +2044,37 @@ impl GhosttyView {
     /// Show or hide the native NSView. Used to manage z-order when
     /// GPUI overlays (settings, command palette) need to appear on top.
     #[cfg(target_os = "macos")]
+    /// The workspace pushes the in-memory experimental flag here so the
+    /// right-click menu never reads persisted config on the UI thread.
+    pub fn set_handoff_menu_entry_enabled(&self, enabled: bool) {
+        self.handoff_menu_entry_enabled.set(enabled);
+    }
+
     pub fn set_visible(&self, visible: bool) {
         self.native_view_visible.set(visible);
+        if !visible {
+            self.set_mouse_hidden_by_typing(false);
+            self.pending_mouse_visible.set(None);
+        }
         self.apply_native_visibility();
+        if let Some(nsview) = self.nsview {
+            unsafe {
+                con_ghostty_surface_sync_occlusion(nsview as *mut c_void);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_mouse_hidden_by_typing(&self, hidden: bool) {
+        if claim_mouse_visibility(self.native_transition_underlay_owner_id, hidden) {
+            // Same transient mechanism as Ghostty's native macOS app. Never
+            // use NSCursor hide/unhide: those mutate a process-global counter.
+            // Reapply every hide request: AppKit may have auto-shown the cursor
+            // between coalesced show/hide actions in the same tick.
+            unsafe {
+                let _: () = msg_send![class!(NSCursor), setHiddenUntilMouseMoves:if hidden { YES } else { NO }];
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -1323,13 +2110,39 @@ impl GhosttyView {
         let Some(host_view) = self.host_view else {
             return;
         };
+        let Some(appearance) = self.app.native_appearance() else {
+            return;
+        };
+        let radius = if appearance.background_opacity < 1.0 {
+            i32::from(appearance.background_blur.max(0))
+        } else {
+            0
+        };
+
+        // The same window-wide API used by Ghostty's embedded implementation.
+        // Apply zero explicitly when disabling blur or becoming opaque; its
+        // convenience function returns early in the latter case. Never pass
+        // Liquid Glass's negative material sentinels as a numeric radius.
+        unsafe extern "C" {
+            fn CGSDefaultConnectionForThread() -> *mut c_void;
+            fn CGSSetWindowBackgroundBlurRadius(
+                connection: *mut c_void,
+                window: usize,
+                radius: i32,
+            ) -> i32;
+        }
 
         unsafe {
             let nswindow: id = msg_send![host_view, window];
             if nswindow.is_null() {
                 return;
             }
-            ffi::ghostty_set_window_background_blur(self.app.raw(), nswindow as *mut c_void);
+            let number: usize = msg_send![nswindow, windowNumber];
+            let result =
+                CGSSetWindowBackgroundBlurRadius(CGSDefaultConnectionForThread(), number, radius);
+            if result != 0 {
+                log::warn!("Could not apply native window blur: {result}");
+            }
         }
     }
 
@@ -1349,15 +2162,113 @@ impl GhosttyView {
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn refresh_mouse_modifiers(&self, modifiers: &Modifiers) {
-        let (Some(terminal), Some(position)) = (self.terminal.as_ref(), self.last_mouse_position)
-        else {
-            return;
-        };
-
+    fn begin_mouse_sequence(
+        &mut self,
+        button: MouseButton,
+        position: Point<Pixels>,
+        mods: i32,
+    ) -> Option<bool> {
+        self.last_mouse_position = Some(position);
+        self.finish_mouse_sequence(button, position, None);
+        let terminal = self.terminal.as_ref()?;
         let (x, y) = self.view_local_pos(position);
-        terminal.send_mouse_pos(x, y, gpui_mods_to_ghostty(modifiers));
+        terminal.send_mouse_pos(x, y, mods);
+        let consumed = terminal.send_mouse_button(true, button, mods);
+        match button {
+            MouseButton::Left => self.left_mouse_sequence.begin(mods),
+            MouseButton::Right => self.right_mouse_sequence.begin(mods),
+            MouseButton::Middle => {}
+        }
+        Some(consumed)
+    }
+
+    fn finish_mouse_sequence(
+        &mut self,
+        button: MouseButton,
+        position: Point<Pixels>,
+        mods: Option<i32>,
+    ) -> bool {
+        let press_modifiers = match button {
+            MouseButton::Left => self.left_mouse_sequence.finish(),
+            MouseButton::Right => self.right_mouse_sequence.finish(),
+            MouseButton::Middle => None,
+        };
+        let Some(press_modifiers) = press_modifiers else {
+            return false;
+        };
+        let mods = mods.unwrap_or(press_modifiers);
+
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+        let (x, y) = self.view_local_pos(position);
+        terminal.send_mouse_pos(x, y, mods);
+        terminal.send_mouse_button(false, button, mods);
+        true
+    }
+
+    /// Left-button release plus copy-on-select: Ghostty's own copy-on-select
+    /// is disabled in con-ghostty's runtime config (see `to_config_string`),
+    /// so the selection is copied here on the same path as Cmd+C. Like
+    /// Ghostty, only a left release copies; a plain left press clears the
+    /// selection, so clicking to focus never republishes stale text.
+    fn release_left_mouse_sequence(
+        &mut self,
+        position: Point<Pixels>,
+        mods: Option<i32>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.finish_mouse_sequence(MouseButton::Left, position, mods) {
+            return false;
+        }
+        self.tui_copy_gesture
+            .observe_move(f32::from(position.x), f32::from(position.y));
+        let selection = self.terminal.as_ref().and_then(|t| t.selection_text());
+        self.tui_copy_gesture.finish(selection.is_some());
+        if let Some(selection) = selection {
+            cx.write_to_clipboard(ClipboardItem::new_string(selection));
+        }
+        true
+    }
+
+    fn finish_active_mouse_sequences(&mut self) {
+        if let Some(position) = self.last_mouse_position {
+            self.finish_mouse_sequence(MouseButton::Left, position, None);
+            self.finish_mouse_sequence(MouseButton::Right, position, None);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn sync_modifiers(&self, modifiers: &Modifiers, for_left_click: bool) -> Modifiers {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return *modifiers;
+        };
+        let mouse_captured = modifiers.platform && terminal.mouse_captured();
+        let effective = mouse_link_modifiers(*modifiers, mouse_captured);
+        let previous = self.last_forwarded_modifiers.replace(effective);
+        let changed = changed_modifier_key(previous, effective);
+        // A regular key may have restored the physical modifier state since the
+        // last mouse event. Refresh the link before the click even if our
+        // last forwarded mouse modifiers are unchanged.
+        let Some((keycode, pressed)) =
+            changed.or_else(|| (for_left_click && mouse_captured).then_some((0x38, true)))
+        else {
+            return effective;
+        };
+        terminal.send_key(ffi::ghostty_input_key_s {
+            action: if pressed {
+                ffi::ghostty_input_action_e::GHOSTTY_ACTION_PRESS
+            } else {
+                ffi::ghostty_input_action_e::GHOSTTY_ACTION_RELEASE
+            },
+            mods: gpui_mods_to_ghostty(&effective),
+            consumed_mods: 0,
+            keycode,
+            text: std::ptr::null(),
+            unshifted_codepoint: 0,
+            composing: false,
+        });
+        effective
     }
 
     /// Handle key input by forwarding to ghostty's key processing pipeline.
@@ -1367,7 +2278,7 @@ impl GhosttyView {
     /// correctly. Falls back to `ghostty_surface_text` for composed/IME text
     /// when no keycode mapping exists.
     fn handle_key_down(
-        &self,
+        &mut self,
         event: &KeyDownEvent,
         window: &Window,
         cx: &mut Context<Self>,
@@ -1379,13 +2290,53 @@ impl GhosttyView {
 
         let keystroke = &event.keystroke;
 
+        let command_copy = keystroke.modifiers.platform
+            && !keystroke.modifiers.shift
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.control
+            && keystroke.key == "c";
+        if !command_copy {
+            self.tui_copy_gesture.cancel();
+        }
+
+        // GPUI 0.3.7 reconstructs key_char from the virtual keycode. Remote
+        // clients can instead attach Unicode to a placeholder key (e.g. A).
+        // Treat a conflicting native payload as committed text, with no fake
+        // physical key identity, and consume it once to prevent insertText
+        // from delivering the same text again.
+        if self.ime_marked_text.is_none()
+            && let Some(text) = self.native_key_text_override(event)
+        {
+            if should_send_ime_insert_as_key_event(&text) {
+                send_ime_insert_as_key_events(terminal, &text);
+            } else {
+                terminal.send_text_as_key_event(&text);
+            }
+            return true;
+        }
+
         if keystroke.modifiers.platform {
             match keystroke.key.as_str() {
                 "c" => {
-                    if terminal.has_selection() {
-                        if let Some(selection) = terminal.selection_text() {
-                            cx.write_to_clipboard(ClipboardItem::new_string(selection));
+                    let has_selection = terminal.has_selection();
+                    let selection = has_selection.then(|| terminal.selection_text()).flatten();
+                    if has_selection {
+                        if let Some(text) =
+                            copyable_terminal_text(true, selection, self.hovered_osc8_url.as_ref())
+                        {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
                         }
+                        self.tui_copy_gesture.cancel();
+                    } else if command_copy
+                        && self
+                            .tui_copy_gesture
+                            .take_pending(terminal.mouse_captured())
+                    {
+                        Self::send_tui_copy_key(terminal);
+                    } else if let Some(text) =
+                        copyable_terminal_text(false, None, self.hovered_osc8_url.as_ref())
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
                     return true;
                 }
@@ -1403,6 +2354,10 @@ impl GhosttyView {
             event,
             window,
             &crate::TogglePaneZoom,
+        ) || crate::terminal_shortcuts::key_down_starts_action_binding(
+            event,
+            window,
+            &crate::FindInTerminal,
         ) || crate::terminal_shortcuts::key_down_starts_action_binding(
             event,
             window,
@@ -1429,6 +2384,13 @@ impl GhosttyView {
                 "d" => return false,
                 // Agent & input
                 "l" | "i" => return false,
+                // Terminal find
+                "f" if !keystroke.modifiers.shift
+                    && !keystroke.modifiers.alt
+                    && !keystroke.modifiers.control =>
+                {
+                    return false;
+                }
                 // Edit menu (handled by OS)
                 "c" | "v" | "x" | "z" | "a" => return false,
                 // Command palette (cmd-shift-p)
@@ -1448,16 +2410,17 @@ impl GhosttyView {
 
         // Try to map GPUI key name to macOS virtual keycode.
         if let Some((keycode, unshifted_codepoint)) = gpui_key_to_keycode(key_name) {
-            // Build the text field: the character this key produces (if printable).
-            // For non-printable keys (arrows, F-keys), text is null.
-            let text_string = keystroke.key_char.as_deref().or_else(|| {
+            // Only key_char represents actual text translation. The key-name
+            // fallback must not consume Shift.
+            let translated_text = keystroke.key_char.as_deref();
+            let text_string = translated_text.or({
                 if key_name.len() == 1 {
                     Some(key_name)
                 } else {
                     None
                 }
             });
-            let cstr = text_string.and_then(|s| std::ffi::CString::new(s).ok());
+            let cstr = text_string.and_then(|text| std::ffi::CString::new(text).ok());
             let text_ptr = cstr
                 .as_ref()
                 .map(|c| c.as_ptr())
@@ -1466,7 +2429,7 @@ impl GhosttyView {
             let key_event = ffi::ghostty_input_key_s {
                 action: ffi::ghostty_input_action_e::GHOSTTY_ACTION_PRESS,
                 mods,
-                consumed_mods: 0,
+                consumed_mods: gpui_consumed_mods_to_ghostty(&keystroke.modifiers, translated_text),
                 keycode,
                 text: text_ptr,
                 unshifted_codepoint,
@@ -1479,11 +2442,11 @@ impl GhosttyView {
 
         // No keycode mapping — fall back to text input.
         // This handles unusual keys and compose sequences.
-        if let Some(ref key_char) = keystroke.key_char {
-            if !key_char.is_empty() {
-                terminal.send_text(key_char);
-                return true;
-            }
+        if let Some(ref key_char) = keystroke.key_char
+            && !key_char.is_empty()
+        {
+            terminal.send_text(key_char);
+            return true;
         }
         if key_name.len() == 1 {
             terminal.send_text(key_name);
@@ -1491,6 +2454,42 @@ impl GhosttyView {
         }
         false
     }
+
+    fn native_key_text_override(&self, event: &KeyDownEvent) -> Option<String> {
+        if event.prefer_character_input || event.keystroke.modifiers != Modifiers::default() {
+            return None;
+        }
+        let view = self.nsview?;
+        // The native NSString is owned by the current AppKit event. Copy its
+        // UTF-8 before returning; no pointer escapes this synchronous callback.
+        let text = unsafe {
+            let mut len = 0;
+            let ptr = con_ghostty_surface_current_key_text(view as *mut c_void, &mut len);
+            if ptr.is_null() {
+                return None;
+            }
+            std::str::from_utf8(std::slice::from_raw_parts(ptr.cast(), len)).ok()?
+        };
+        native_text_overrides_key_event(event, text).then(|| text.to_owned())
+    }
+}
+
+fn native_text_overrides_key_event(event: &KeyDownEvent, text: &str) -> bool {
+    !event.prefer_character_input
+        && event.keystroke.modifiers == Modifiers::default()
+        && event
+            .keystroke
+            .key_char
+            .as_deref()
+            .is_some_and(|translated| {
+                !translated.is_empty()
+                    && translated.chars().all(|ch| !ch.is_control())
+                    && translated != text
+            })
+        && !text.is_empty()
+        && text
+            .chars()
+            .all(|ch| !ch.is_control() && !('\u{f700}'..='\u{f8ff}').contains(&ch))
 }
 
 struct GhosttyInputHandler {
@@ -1539,20 +2538,22 @@ impl InputHandler for GhosttyInputHandler {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if text.is_empty() {
-            return;
-        }
         let _ = self.view.update(cx, |view, cx| {
             let had_marked_text = view.ime_marked_text.take().is_some();
             if let Some(terminal) = &view.terminal {
-                if !had_marked_text && should_send_ime_insert_as_key_event(text) {
-                    send_ime_insert_as_key_events(terminal, text);
-                } else {
-                    // Use key event path (not ghostty_surface_text) to avoid
-                    // bracketed-paste wrapping and post-paste selection highlight.
-                    terminal.send_text_as_key_event(text);
+                if had_marked_text {
+                    terminal.set_preedit(None);
                 }
-                terminal.refresh();
+                if !text.is_empty() {
+                    if !had_marked_text && should_send_ime_insert_as_key_event(text) {
+                        send_ime_insert_as_key_events(terminal, text);
+                    } else {
+                        // Use key event path (not ghostty_surface_text) to avoid
+                        // bracketed-paste wrapping and post-paste selection highlight.
+                        terminal.send_text_as_key_event(text);
+                    }
+                    terminal.refresh();
+                }
             }
             cx.notify();
         });
@@ -1574,7 +2575,7 @@ impl InputHandler for GhosttyInputHandler {
                 Some(new_text.to_string())
             };
             if let Some(terminal) = &view.terminal {
-                terminal.refresh();
+                terminal.set_preedit(view.ime_marked_text.as_deref());
             }
             cx.notify();
         });
@@ -1585,7 +2586,7 @@ impl InputHandler for GhosttyInputHandler {
         let _ = self.view.update(cx, |view, cx| {
             view.ime_marked_text = None;
             if let Some(terminal) = &view.terminal {
-                terminal.refresh();
+                terminal.set_preedit(None);
             }
             cx.notify();
         });
@@ -1660,6 +2661,56 @@ fn gpui_mods_to_ghostty(mods: &Modifiers) -> i32 {
         m |= ffi::GHOSTTY_MODS_SUPER;
     }
     m
+}
+
+#[cfg(target_os = "macos")]
+fn mouse_link_modifiers(mut physical: Modifiers, mouse_captured: bool) -> Modifiers {
+    if mouse_captured && physical.platform {
+        // Ghostty uses Shift to release a TUI's mouse capture and drops Shift
+        // when matching Command-held links. Keep the ordinary click path intact.
+        physical.shift = true;
+    }
+    physical
+}
+
+#[cfg(target_os = "macos")]
+fn changed_modifier_key(previous: Modifiers, current: Modifiers) -> Option<(u32, bool)> {
+    [
+        (previous.platform, current.platform, 0x37),
+        (previous.shift, current.shift, 0x38),
+        (previous.control, current.control, 0x3B),
+        (previous.alt, current.alt, 0x3A),
+    ]
+    .into_iter()
+    .find_map(|(was_pressed, is_pressed, keycode)| {
+        (was_pressed != is_pressed).then_some((keycode, is_pressed))
+    })
+}
+
+/// Return the Shift modifier safely inferred as consumed by text translation.
+///
+/// GPUI keeps the produced text in `Keystroke::key_char`, but does not expose
+/// AppKit's translation modifiers separately. A printable `key_char` plus an
+/// active Shift is enough to recover the casing modifier used by text
+/// translation. Option is intentionally left effective because Ghostty's
+/// `macos-option-as-alt` setting controls whether it participates in text
+/// translation, and GPUI does not expose that surface-adjusted modifier state.
+/// Control characters stay on the key-event path, where modifiers such as
+/// Shift must remain effective (for example, Shift+Enter in the Kitty keyboard
+/// protocol).
+fn gpui_consumed_mods_to_ghostty(mods: &Modifiers, text: Option<&str>) -> i32 {
+    let Some(text) = text else {
+        return 0;
+    };
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return 0;
+    }
+
+    if mods.shift {
+        ffi::GHOSTTY_MODS_SHIFT
+    } else {
+        0
+    }
 }
 
 fn gpui_scroll_mods_to_ghostty(delta: &ScrollDelta) -> i32 {
@@ -1762,6 +2813,7 @@ fn gpui_key_to_keycode(key: &str) -> Option<(u32, u32)> {
 
 impl Drop for GhosttyView {
     fn drop(&mut self) {
+        self.finish_active_mouse_sequences();
         #[cfg(target_os = "macos")]
         {
             // The AppKit backing observer stores Ghostty's raw surface pointer.
@@ -1780,81 +2832,46 @@ impl Focusable for GhosttyView {
 }
 
 impl Render for GhosttyView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "macos")]
+        {
+            // Broadcast focus is not keyboard focus. Only the actual focused,
+            // visible terminal under the pointer may hide the system cursor.
+            let eligible = self.native_view_visible.get()
+                && !self.awaiting_first_layout_visibility
+                && !self.process_exit_emitted
+                && self.focus_handle.is_focused(window)
+                && window.is_window_active()
+                && window.is_window_hovered()
+                && self
+                    .last_bounds
+                    .is_some_and(|bounds| bounds.contains(&window.mouse_position()));
+            if let Some(visible) = self.pending_mouse_visible.take() {
+                self.set_mouse_hidden_by_typing(eligible && !visible);
+            } else if !eligible {
+                self.set_mouse_hidden_by_typing(false);
+            }
+        }
+        if self.pending_terminal_find.is_some() {
+            let entity = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let _ = entity.update(cx, |this, cx| this.flush_pending_terminal_find(window, cx));
+            });
+        }
+        if std::mem::take(&mut self.restore_terminal_focus) {
+            let focus = self.focus_handle.clone();
+            window.defer(cx, move |window, cx| window.focus(&focus, cx));
+        }
+
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
         let context_focus = focus.clone();
         let menu_focus = focus.clone();
+        let right_click_consumed = self.right_click_consumed.clone();
+        let handoff_menu_entry_enabled = self.handoff_menu_entry_enabled.get();
         let ui_font = cx.theme().font_family.clone();
-        let mono_font = cx.theme().mono_font_family.clone();
-        let mono_font_size = cx.theme().mono_font_size;
         let entity = cx.entity().downgrade();
-        let show_layout_fallback = self.show_layout_fallback();
-
-        // Preedit overlay: render IME composition text at the cursor position.
-        let preedit_overlay: Option<gpui::AnyElement> = self
-            .ime_marked_text
-            .as_deref()
-            .filter(|t| !t.is_empty())
-            .and_then(|preedit_text| {
-                let terminal = self.terminal.as_ref()?;
-                let bounds = self.last_bounds?;
-                let ime = terminal.ime_point();
-                let fg = self
-                    .app
-                    .foreground_rgb()
-                    .map(|rgb| {
-                        Rgba {
-                            r: rgb[0] as f32 / 255.0,
-                            g: rgb[1] as f32 / 255.0,
-                            b: rgb[2] as f32 / 255.0,
-                            a: 1.0,
-                        }
-                        .into()
-                    })
-                    .unwrap_or(cx.theme().foreground);
-                let bg = self
-                    .app
-                    .background_rgb()
-                    .map(|rgb| {
-                        // Force opaque so the overlay covers ghostty's real cursor.
-                        Rgba {
-                            r: rgb[0] as f32 / 255.0,
-                            g: rgb[1] as f32 / 255.0,
-                            b: rgb[2] as f32 / 255.0,
-                            a: 1.0,
-                        }
-                        .into()
-                    })
-                    .unwrap_or(cx.theme().background);
-                let left = px(ime.x as f32)
-                    .min(bounds.size.width - px(1.0))
-                    .max(px(0.0));
-                // ime_point y is the bottom of the cursor cell (candidate anchor).
-                // Subtract cell height to align the overlay with the cursor row.
-                let cell_height = if ime.height > 0.0 {
-                    ime.height as f32
-                } else {
-                    f32::from(mono_font_size)
-                };
-                let top = px(ime.y as f32 - cell_height)
-                    .min(bounds.size.height - mono_font_size)
-                    .max(px(0.0));
-                let text = preedit_text.to_string();
-                Some(
-                    div()
-                        .absolute()
-                        .left(left)
-                        .top(top)
-                        .bg(bg)
-                        .text_color(fg)
-                        .font_family(mono_font.clone())
-                        .text_size(mono_font_size)
-                        .underline()
-                        .child(text)
-                        .into_any_element(),
-                )
-            });
+        let terminal_find = self.terminal_find.clone();
 
         let layout_fallback_bg = self
             .app
@@ -1875,14 +2892,26 @@ impl Render for GhosttyView {
             .size_full()
             .font_family(ui_font)
             .map(|div| {
-                if show_layout_fallback {
-                    div.bg(layout_fallback_bg)
-                } else {
+                #[cfg(target_os = "macos")]
+                {
+                    div.cursor(self.mouse_cursor)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
                     div
                 }
             })
             .key_context("GhosttyTerminal")
             .track_focus(&focus)
+            .on_action(cx.listener(|this, _: &crate::FindInTerminal, window, cx| {
+                if !this.focus_handle.contains_focused(window, cx) {
+                    return;
+                }
+                this.ensure_initialized_for_control(window, cx);
+                this.show_terminal_find(String::new(), window, cx);
+                window.prevent_default();
+                cx.stop_propagation();
+            }))
             // Consume Tab/Shift-Tab so Root's focus cycling doesn't intercept them.
             // The actual Tab key is forwarded to ghostty via on_key_down below.
             .on_action(cx.listener(|this, _: &ConsumeTab, window, _cx| {
@@ -1896,7 +2925,7 @@ impl Render for GhosttyView {
                         mods: 0,
                         consumed_mods: 0,
                         keycode: 0x30, // Tab
-                        text: b"\t\0".as_ptr() as *const _,
+                        text: c"\t".as_ptr() as *const _,
                         unshifted_codepoint: '\t' as u32,
                         composing: false,
                     };
@@ -1925,11 +2954,24 @@ impl Render for GhosttyView {
                 let Some(terminal) = &this.terminal else {
                     return;
                 };
-                if !terminal.has_selection() {
-                    return;
-                }
-                if let Some(selection) = terminal.selection_text() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(selection));
+                let has_selection = terminal.has_selection();
+                let selection = has_selection.then(|| terminal.selection_text()).flatten();
+                if has_selection {
+                    this.tui_copy_gesture.cancel();
+                    if let Some(text) =
+                        copyable_terminal_text(true, selection, this.hovered_osc8_url.as_ref())
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                } else if this
+                    .tui_copy_gesture
+                    .take_pending(terminal.mouse_captured())
+                {
+                    Self::send_tui_copy_key(terminal);
+                } else if let Some(text) =
+                    copyable_terminal_text(false, None, this.hovered_osc8_url.as_ref())
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }))
             .on_action(cx.listener(|this, _: &crate::Paste, _window, cx| {
@@ -1945,31 +2987,46 @@ impl Render for GhosttyView {
                 };
                 window.focus(&this.focus_handle, cx);
                 this.restored_screen_text = None;
-                if this.send_terminal_paste_payload(payload) {
+                if this.handle_terminal_paste_payload(payload) {
                     cx.emit(GhosttyFocusChanged);
                     cx.notify();
                 }
             }))
             .on_mouse_down(
                 gpui::MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    window.focus(&context_focus, cx);
-                    this.last_mouse_position = Some(event.position);
-                    cx.emit(GhosttyFocusChanged);
-                    cx.notify();
+                cx.listener({
+                    let right_click_consumed = right_click_consumed.clone();
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        window.focus(&context_focus, cx);
+                        this.tui_copy_gesture.cancel();
+                        // Reset first so a click without a terminal can't
+                        // carry a stale consumed state into the menu gate.
+                        right_click_consumed.set(false);
+                        let mods = gpui_mods_to_ghostty(&event.modifiers);
+                        if let Some(consumed) =
+                            this.begin_mouse_sequence(MouseButton::Right, event.position, mods)
+                        {
+                            right_click_consumed.set(consumed);
+                        }
+                        cx.emit(GhosttyFocusChanged);
+                        cx.notify();
+                    }
                 }),
             )
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     window.focus(&focus, cx);
-                    this.last_mouse_position = Some(event.position);
-                    if let Some(ref terminal) = this.terminal {
-                        let (x, y) = this.view_local_pos(event.position);
-                        let mods = gpui_mods_to_ghostty(&event.modifiers);
-                        terminal.send_mouse_pos(x, y, mods);
-                        terminal.send_mouse_button(true, MouseButton::Left, mods);
-                    }
+                    let effective = this.sync_modifiers(&event.modifiers, true);
+                    let mods = gpui_mods_to_ghostty(&effective);
+                    let mouse_reported = this
+                        .begin_mouse_sequence(MouseButton::Left, event.position, mods)
+                        .unwrap_or(false);
+                    this.tui_copy_gesture.begin(
+                        f32::from(event.position.x),
+                        f32::from(event.position.y),
+                        mouse_reported,
+                    );
                     cx.emit(GhosttyFocusChanged);
                     cx.notify();
                 }),
@@ -1977,42 +3034,105 @@ impl Render for GhosttyView {
             .on_mouse_up(
                 gpui::MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.scrollbar_drag = None;
                     this.last_mouse_position = Some(event.position);
-                    if let Some(ref terminal) = this.terminal {
-                        let (x, y) = this.view_local_pos(event.position);
-                        let mods = gpui_mods_to_ghostty(&event.modifiers);
-                        terminal.send_mouse_pos(x, y, mods);
-                        terminal.send_mouse_button(false, MouseButton::Left, mods);
-                    }
-                    let changed = this.drain_surface_state(true, cx);
-                    if changed {
+                    let effective = this.sync_modifiers(&event.modifiers, false);
+                    let mods = gpui_mods_to_ghostty(&effective);
+                    if this.release_left_mouse_sequence(event.position, Some(mods), cx)
+                        && this.drain_surface_state(true, cx)
+                    {
                         cx.notify();
                     }
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, _cx| {
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.scrollbar_drag = None;
+                    if !this.left_mouse_sequence.is_active() {
+                        return;
+                    }
+                    this.last_mouse_position = Some(event.position);
+                    let effective = this.sync_modifiers(&event.modifiers, false);
+                    let mods = gpui_mods_to_ghostty(&effective);
+                    if this.release_left_mouse_sequence(event.position, Some(mods), cx)
+                        && this.drain_surface_state(true, cx)
+                    {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    if !this.right_mouse_sequence.is_active() {
+                        return;
+                    }
+                    this.last_mouse_position = Some(event.position);
+                    let mods = gpui_mods_to_ghostty(&event.modifiers);
+                    this.finish_mouse_sequence(MouseButton::Right, event.position, Some(mods));
+                }),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    if !this.right_mouse_sequence.is_active() {
+                        return;
+                    }
+                    this.last_mouse_position = Some(event.position);
+                    let mods = gpui_mods_to_ghostty(&event.modifiers);
+                    this.finish_mouse_sequence(MouseButton::Right, event.position, Some(mods));
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if event.pressed_button == Some(gpui::MouseButton::Left)
+                    && this.scrollbar_drag.is_some()
+                {
+                    this.drag_scrollbar(event.position);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if event.pressed_button == Some(gpui::MouseButton::Left) {
+                    this.tui_copy_gesture
+                        .observe_move(f32::from(event.position.x), f32::from(event.position.y));
+                }
                 this.last_mouse_position = Some(event.position);
+                let effective = this.sync_modifiers(&event.modifiers, false);
+                let mods = gpui_mods_to_ghostty(&effective);
+                if event.pressed_button.is_none() {
+                    let released_left =
+                        this.release_left_mouse_sequence(event.position, Some(mods), cx);
+                    this.finish_mouse_sequence(MouseButton::Right, event.position, Some(mods));
+                    if released_left && this.drain_surface_state(true, cx) {
+                        cx.notify();
+                    }
+                }
                 if let Some(ref terminal) = this.terminal {
                     let (x, y) = this.view_local_pos(event.position);
-                    terminal.send_mouse_pos(x, y, gpui_mods_to_ghostty(&event.modifiers));
+                    terminal.send_mouse_pos(x, y, mods);
                 }
             }))
             .on_modifiers_changed(cx.listener(
-                |this, event: &ModifiersChangedEvent, _window, _cx| {
-                    this.refresh_mouse_modifiers(&event.modifiers);
+                |this, event: &ModifiersChangedEvent, _window, cx| {
+                    this.sync_modifiers(&event.modifiers, false);
+                    if this.drain_surface_state(false, cx) {
+                        cx.notify();
+                    }
                 },
             ))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, _cx| {
+                this.tui_copy_gesture.cancel();
                 this.last_mouse_position = Some(event.position);
                 if let Some(ref terminal) = this.terminal {
                     let delta = match event.delta {
                         ScrollDelta::Lines(d) => (f64::from(d.x), f64::from(d.y)),
                         ScrollDelta::Pixels(d) => {
-                            // Match Ghostty's AppKit host: precise trackpad
-                            // deltas are sent as-is with a subjective 2x
-                            // multiplier and the ScrollMods precision bit.
-                            // Ghostty core then accumulates sub-row remainders.
-                            (f64::from(d.x) * 2.0, f64::from(d.y) * 2.0)
+                            // Preserve precise trackpad deltas. Ghostty owns
+                            // the precision/discrete multiplier and its
+                            // sub-row remainder, so the host must not apply a
+                            // second, device-independent scale factor here.
+                            (f64::from(d.x), f64::from(d.y))
                         }
                     };
                     terminal.send_mouse_scroll(
@@ -2023,6 +3143,11 @@ impl Render for GhosttyView {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" && this.dismiss_blocked_osc8_url(window, cx) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
                 if !this.focus_handle.is_focused(window) {
                     return;
                 }
@@ -2045,19 +3170,23 @@ impl Render for GhosttyView {
                 cx.notify();
             }))
             .child(
-                canvas(
+                terminal_surface_canvas(
+                    layout_fallback_bg,
                     {
                         let entity = entity.clone();
                         move |bounds, window, cx| {
-                            let _ = entity.update(cx, |view: &mut GhosttyView, _cx| {
-                                view.on_layout(bounds, window, _cx);
-                            });
+                            entity
+                                .update(cx, |view: &mut GhosttyView, cx| {
+                                    view.on_layout(bounds, window, cx);
+                                    view.show_layout_fallback()
+                                })
+                                .unwrap_or(false)
                         }
                     },
                     {
                         let focus = input_focus.clone();
                         let entity = entity.clone();
-                        move |_bounds, _state, window, cx| {
+                        move |_bounds, window, cx| {
                             window.handle_input(
                                 &focus,
                                 GhosttyInputHandler {
@@ -2070,10 +3199,20 @@ impl Render for GhosttyView {
                 )
                 .size_full(),
             )
-            .children(preedit_overlay)
+            .children(self.render_terminal_scrollbar(cx))
+            .children(self.render_osc8_link_preview(cx))
+            .children(self.render_blocked_osc8_url(cx))
+            .children(terminal_find)
             .context_menu(move |menu, window, cx| {
+                // An empty PopupMenu renders nothing (ContextMenu checks
+                // `is_empty`), so suppress con's menu when the terminal app
+                // consumed the right-click via mouse reporting.
+                if right_click_consumed.get() {
+                    return menu;
+                }
                 crate::terminal_context_menu::terminal_context_menu(
                     menu.action_context(menu_focus.clone()),
+                    handoff_menu_entry_enabled,
                     window,
                     cx,
                 )
@@ -2081,9 +3220,546 @@ impl Render for GhosttyView {
     }
 }
 
+/// Ghostty's C mouse-shape values are checked in con-ghostty/src/ffi_abi.c.
+/// Shapes without a native GPUI equivalent fall back to the arrow, rather
+/// than leaving a stale link/resize cursor behind.
+#[cfg(target_os = "macos")]
+fn ghostty_mouse_cursor(shape: i32) -> CursorStyle {
+    match shape {
+        1 => CursorStyle::ContextualMenu,
+        3 => CursorStyle::PointingHand,
+        6 | 7 => CursorStyle::Crosshair, // cell / crosshair
+        8 => CursorStyle::IBeam,
+        9 => CursorStyle::IBeamCursorForVerticalLayout,
+        10 => CursorStyle::DragLink,
+        11 => CursorStyle::DragCopy,
+        13 | 14 => CursorStyle::OperationNotAllowed,
+        15 => CursorStyle::OpenHand,
+        16 => CursorStyle::ClosedHand,
+        18 => CursorStyle::ResizeColumn,
+        19 => CursorStyle::ResizeRow,
+        20 => CursorStyle::ResizeUp,
+        21 => CursorStyle::ResizeRight,
+        22 => CursorStyle::ResizeDown,
+        23 => CursorStyle::ResizeLeft,
+        24 | 27 | 30 => CursorStyle::ResizeUpRightDownLeft,
+        25 | 26 | 31 => CursorStyle::ResizeUpLeftDownRight,
+        28 => CursorStyle::ResizeLeftRight,
+        29 => CursorStyle::ResizeUpDown,
+        _ => CursorStyle::Arrow,
+    }
+}
+
+/// Whether this surface should apply its visibility request to AppKit.
+#[cfg(target_os = "macos")]
+fn claim_mouse_visibility(surface_id: u64, hidden: bool) -> bool {
+    HIDDEN_MOUSE_OWNER.with(|owner| {
+        if hidden {
+            owner.set(Some(surface_id));
+            true
+        } else if owner.get() == Some(surface_id) {
+            owner.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_send_ime_insert_as_key_event;
+    use super::{
+        Osc8UrlDecision, TuiCopyGesture, gpui_consumed_mods_to_ghostty,
+        native_text_overrides_key_event, osc8_link_preview_card,
+        should_send_ime_insert_as_key_event,
+    };
+    use con_ghostty::ffi;
+    use gpui::{
+        KeyDownEvent, Keystroke, Modifiers, Pixels, Render, SharedString, TextRun, Window, div,
+        font, prelude::*, px,
+    };
+    use gpui_component::Theme;
+
+    struct TerminalCanvasTestView {
+        pending: std::rc::Rc<std::cell::Cell<bool>>,
+        complete_in_layout: bool,
+        fallback_color: gpui::Hsla,
+        input_paints: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    struct TabHandoffTestView;
+
+    impl Render for TabHandoffTestView {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let outgoing = std::rc::Rc::new(std::cell::Cell::new(true));
+            let incoming = std::rc::Rc::new(std::cell::Cell::new(false));
+            let incoming_layout = incoming.clone();
+            let outgoing_paint = outgoing.clone();
+            div()
+                .size_full()
+                .child(
+                    super::terminal_surface_canvas(
+                        gpui::hsla(0.1, 0.2, 0.3, 0.85),
+                        move |_, _, _| {
+                            incoming_layout.set(true);
+                            false
+                        },
+                        move |_, _, _| {
+                            assert!(incoming.get(), "incoming layout must precede paint");
+                            assert!(!outgoing_paint.get(), "outgoing must retire before paint");
+                        },
+                    )
+                    .size_full(),
+                )
+                .on_children_prepainted(move |_, _, _| outgoing.set(false))
+        }
+    }
+
+    #[gpui::test]
+    fn tab_handoff_boundary_runs_after_incoming_layout_and_before_paint(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_, cx) = cx.add_window_view(|_, _| TabHandoffTestView);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(window.painted_quads().is_empty());
+        });
+    }
+
+    impl Render for TerminalCanvasTestView {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let pending = self.pending.clone();
+            let complete = self.complete_in_layout;
+            let input_paints = self.input_paints.clone();
+            super::terminal_surface_canvas(
+                self.fallback_color,
+                move |_, _, _| {
+                    if complete {
+                        pending.set(false);
+                    }
+                    pending.get()
+                },
+                move |_, _, _| input_paints.set(input_paints.get() + 1),
+            )
+            .size_full()
+        }
+    }
+
+    #[gpui::test]
+    fn terminal_canvas_does_not_cover_a_surface_revealed_in_the_same_frame(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let pending = std::rc::Rc::new(std::cell::Cell::new(true));
+        let input_paints = std::rc::Rc::new(std::cell::Cell::new(0));
+        let fallback_color = gpui::hsla(0.1, 0.2, 0.3, 0.85);
+        let (_view, cx) = cx.add_window_view({
+            let pending = pending.clone();
+            let input_paints = input_paints.clone();
+            move |_, _| TerminalCanvasTestView {
+                pending,
+                complete_in_layout: true,
+                fallback_color,
+                input_paints,
+            }
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(
+                !window
+                    .painted_quads()
+                    .iter()
+                    .any(|quad| { quad.background == gpui::Background::from(fallback_color) })
+            );
+        });
+        assert!(!pending.get());
+        assert!(input_paints.get() > 0);
+    }
+
+    #[gpui::test]
+    fn terminal_canvas_retains_fallback_until_initialization_succeeds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fallback_color = gpui::hsla(0.1, 0.2, 0.3, 0.65);
+        let (view, cx) = cx.add_window_view(move |_, _| TerminalCanvasTestView {
+            pending: std::rc::Rc::new(std::cell::Cell::new(true)),
+            complete_in_layout: false,
+            fallback_color,
+            input_paints: std::rc::Rc::new(std::cell::Cell::new(0)),
+        });
+        for alpha in [0.65, 1.0] {
+            view.update(cx, |view, cx| {
+                view.fallback_color.a = alpha;
+                cx.notify();
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+                let fallback = window
+                    .painted_quads()
+                    .into_iter()
+                    .filter(|quad| {
+                        quad.background
+                            == gpui::Background::from(gpui::Hsla {
+                                a: alpha,
+                                ..fallback_color
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(fallback.len(), 1);
+                assert!(fallback[0].bounds.size.width.0 > 0.0);
+                assert!(fallback[0].bounds.size.height.0 > 0.0);
+            });
+        }
+        view.update(cx, |view, cx| {
+            view.complete_in_layout = true;
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(window.painted_quads().is_empty());
+        });
+    }
+
+    #[test]
+    fn terminal_copy_prefers_selection_then_full_osc8_target() {
+        let link = Osc8UrlDecision::Allow("https://example.com/".to_string() + &"x".repeat(512));
+        assert_eq!(
+            super::copyable_terminal_text(true, Some("selected".into()), Some(&link)),
+            Some("selected".into())
+        );
+        assert_eq!(super::copyable_terminal_text(true, None, Some(&link)), None);
+        assert_eq!(
+            super::copyable_terminal_text(false, None, Some(&link)),
+            Some("https://example.com/".to_string() + &"x".repeat(512))
+        );
+        assert_eq!(super::copyable_terminal_text(false, None, None), None);
+        let blocked = crate::terminal_url::evaluate_osc8_url("file:///tmp/private");
+        assert_eq!(
+            super::copyable_terminal_text(false, None, Some(&blocked)),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn modifier_changes_use_native_key_events_for_link_refresh() {
+        let plain = Modifiers::default();
+        let command = Modifiers {
+            platform: true,
+            ..plain
+        };
+        assert_eq!(
+            super::changed_modifier_key(plain, command),
+            Some((0x37, true))
+        );
+        assert_eq!(
+            super::changed_modifier_key(command, plain),
+            Some((0x37, false))
+        );
+        assert_eq!(super::changed_modifier_key(command, command), None);
+        let shift = Modifiers {
+            shift: true,
+            ..plain
+        };
+        assert_eq!(
+            super::changed_modifier_key(plain, shift),
+            Some((0x38, true))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn command_link_gesture_releases_tui_mouse_capture_only() {
+        let plain = Modifiers::default();
+        let command = Modifiers {
+            platform: true,
+            ..plain
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..plain
+        };
+        assert_eq!(super::mouse_link_modifiers(plain, true), plain);
+        assert_eq!(super::mouse_link_modifiers(shift, true), shift);
+        assert_eq!(super::mouse_link_modifiers(command, false), command);
+        let captured_command = super::mouse_link_modifiers(command, true);
+        assert!(captured_command.platform && captured_command.shift);
+        assert_eq!(
+            super::gpui_mods_to_ghostty(&captured_command),
+            con_ghostty::ffi::GHOSTTY_MODS_SUPER | con_ghostty::ffi::GHOSTTY_MODS_SHIFT
+        );
+        assert_eq!(
+            super::changed_modifier_key(command, captured_command),
+            Some((0x38, true))
+        );
+        assert_eq!(
+            super::changed_modifier_key(captured_command, command),
+            Some((0x38, false))
+        );
+    }
+
+    #[test]
+    fn reported_tui_drag_allows_one_copy_without_affecting_shell_selection() {
+        let mut gesture = TuiCopyGesture::default();
+
+        gesture.begin(10.0, 10.0, false);
+        gesture.observe_move(40.0, 10.0);
+        gesture.finish(false);
+        assert!(
+            !gesture.take_pending(false),
+            "ordinary shell drag stays in Con"
+        );
+
+        gesture.begin(10.0, 10.0, true);
+        gesture.observe_move(40.0, 10.0);
+        gesture.finish(true);
+        assert!(
+            !gesture.take_pending(true),
+            "Ghostty-owned selection stays in Con"
+        );
+
+        gesture.begin(10.0, 10.0, true);
+        gesture.observe_move(40.0, 10.0);
+        gesture.finish(false);
+        assert!(
+            gesture.take_pending(true),
+            "TUI-owned drag forwards its copy key"
+        );
+        assert!(
+            !gesture.take_pending(true),
+            "the copy key is forwarded only once"
+        );
+    }
+
+    #[test]
+    fn tui_copy_requires_a_drag_and_clears_after_other_input() {
+        let mut gesture = TuiCopyGesture::default();
+        gesture.begin(10.0, 10.0, true);
+        gesture.observe_move(12.0, 11.0);
+        gesture.finish(false);
+        assert!(!gesture.take_pending(true), "a click must not arm Ctrl+C");
+
+        gesture.begin(10.0, 10.0, true);
+        gesture.observe_move(20.0, 10.0);
+        gesture.finish(false);
+        gesture.cancel();
+        assert!(
+            !gesture.take_pending(true),
+            "later input must not copy a stale drag"
+        );
+    }
+
+    #[test]
+    fn tui_copy_does_not_forward_after_mouse_capture_ends() {
+        let mut gesture = TuiCopyGesture::default();
+        gesture.begin(10.0, 10.0, true);
+        gesture.observe_move(20.0, 10.0);
+        gesture.finish(false);
+        assert!(
+            !gesture.take_pending(false),
+            "an exited TUI must not receive a synthetic Ctrl+C"
+        );
+        assert!(!gesture.take_pending(true), "the stale gesture is consumed");
+    }
+
+    #[test]
+    fn tui_copy_is_cancelled_when_terminal_loses_focus() {
+        let mut gesture = TuiCopyGesture::default();
+        gesture.begin(10.0, 10.0, true);
+        gesture.observe_move(20.0, 10.0);
+        gesture.finish(false);
+        gesture.cancel();
+        assert!(
+            !gesture.take_pending(true),
+            "a completed drag must not survive a tab switch"
+        );
+
+        gesture.begin(10.0, 10.0, true);
+        gesture.observe_move(20.0, 10.0);
+        gesture.cancel();
+        gesture.finish(false);
+        assert!(
+            !gesture.take_pending(true),
+            "an active drag must not re-arm after focus loss"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pointer_visibility_only_restores_its_owner_and_reapplies_typing() {
+        use super::claim_mouse_visibility as claim;
+        assert!(!claim(41, false));
+        assert!(claim(41, true));
+        // AppKit may have revealed the pointer on movement while show/hide
+        // actions coalesce. Another typing request must still reach AppKit.
+        assert!(claim(41, true));
+        assert!(claim(73, true));
+        assert!(!claim(41, false), "old pane must not unhide the new pane");
+        assert!(claim(73, false));
+        assert!(!claim(73, false), "repeated cleanup must be inert");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pointer_shapes_distinguish_links_text_and_resize_axes() {
+        use gpui::CursorStyle::*;
+        for (shape, expected) in [
+            (0, Arrow),
+            (3, PointingHand),
+            (8, IBeam),
+            (9, IBeamCursorForVerticalLayout),
+            (15, OpenHand),
+            (16, ClosedHand),
+            (20, ResizeUp),
+            (21, ResizeRight),
+            (22, ResizeDown),
+            (23, ResizeLeft),
+            (24, ResizeUpRightDownLeft),
+            (25, ResizeUpLeftDownRight),
+            (26, ResizeUpLeftDownRight),
+            (27, ResizeUpRightDownLeft),
+            (28, ResizeLeftRight),
+            (29, ResizeUpDown),
+            (30, ResizeUpRightDownLeft),
+            (31, ResizeUpLeftDownRight),
+            (5, Arrow),
+            (-1, Arrow),
+            (34, Arrow),
+        ] {
+            assert_eq!(
+                super::ghostty_mouse_cursor(shape),
+                expected,
+                "shape {shape}"
+            );
+        }
+    }
+
+    /// Renders the hover card inside a flex row, like the real overlay does.
+    /// (A block parent would stretch the card to the parent width and hide
+    /// content-sizing bugs.) Records the shaped width of the target text with
+    /// the same font and size the card uses so tests can check the contract
+    /// "the target element is at least as wide as its text".
+    struct Osc8LinkPreviewLayoutTestView {
+        display: SharedString,
+        max_width: Pixels,
+        shaped_target_width: Option<Pixels>,
+    }
+
+    impl Render for Osc8LinkPreviewLayoutTestView {
+        fn render(
+            &mut self,
+            window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let theme = Theme::default();
+            self.shaped_target_width = Some(
+                window
+                    .text_system()
+                    .shape_line(
+                        self.display.clone(),
+                        px(11.0),
+                        &[TextRun {
+                            len: self.display.len(),
+                            font: font(theme.mono_font_family.clone()),
+                            color: theme.foreground,
+                            ..TextRun::default()
+                        }],
+                        None,
+                    )
+                    .width(),
+            );
+            let decision = Osc8UrlDecision::Allow(self.display.to_string());
+            div().w(px(1_000.0)).flex().child(osc8_link_preview_card(
+                &decision,
+                &theme,
+                self.max_width,
+            ))
+        }
+    }
+
+    #[gpui::test]
+    fn osc8_link_preview_keeps_target_visible_without_filling_the_pane(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_window, _cx| Osc8LinkPreviewLayoutTestView {
+            display: "https://example.com/osc8".into(),
+            max_width: px(720.0),
+            shaped_target_width: None,
+        });
+        let card = cx
+            .debug_bounds("osc8-link-preview-card")
+            .expect("preview card bounds");
+        let target = cx
+            .debug_bounds("osc8-link-preview-target")
+            .expect("preview target bounds");
+        let status = cx
+            .debug_bounds("osc8-link-preview-status")
+            .expect("preview status bounds");
+        let shaped = view
+            .read_with(cx, |view, _| view.shaped_target_width)
+            .expect("target text was shaped during render");
+
+        // `should_truncate_line` ellipsizes as soon as the element is narrower
+        // than the text, so this is the "no ellipsis for a short link" contract.
+        // Note: the test text system uses fixed integer glyph advances, so this
+        // cannot reproduce the real-font sub-pixel case; the runtime check for
+        // that lives in the commit message of the fix.
+        assert!(
+            target.size.width >= shaped,
+            "preview target narrower than its text (would ellipsize): target={target:?} shaped={shaped:?}"
+        );
+        assert!(
+            card.size.width < px(400.0),
+            "short preview filled most of the pane: {card:?}"
+        );
+        let gap: f32 = (status.left() - target.right()).into();
+        assert!(
+            gap <= 8.0,
+            "preview target and status are separated by an empty gap: target={target:?} status={status:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn osc8_link_preview_caps_long_targets_without_clipping_status(cx: &mut gpui::TestAppContext) {
+        let (_view, cx) = cx.add_window_view(|_window, _cx| Osc8LinkPreviewLayoutTestView {
+            display: format!("https://example.com/{}", "a".repeat(300)).into(),
+            max_width: px(320.0),
+            shaped_target_width: None,
+        });
+        let card = cx
+            .debug_bounds("osc8-link-preview-card")
+            .expect("preview card bounds");
+        let target = cx
+            .debug_bounds("osc8-link-preview-target")
+            .expect("preview target bounds");
+        let status = cx
+            .debug_bounds("osc8-link-preview-status")
+            .expect("preview status bounds");
+
+        assert!(
+            card.size.width <= px(320.0),
+            "long preview exceeded its width cap: {card:?}"
+        );
+        assert!(
+            card.size.width > px(300.0),
+            "long preview did not use the available width: {card:?}"
+        );
+        assert!(
+            target.size.width > px(200.0),
+            "long target did not retain useful preview space: {target:?}"
+        );
+        assert!(
+            status.right() <= card.right(),
+            "preview status was clipped by the width cap: card={card:?} status={status:?}"
+        );
+    }
 
     #[test]
     fn direct_ascii_ime_commits_use_key_event_path() {
@@ -2092,5 +3768,70 @@ mod tests {
         assert!(!should_send_ime_insert_as_key_event(""));
         assert!(!should_send_ime_insert_as_key_event("hello\n"));
         assert!(!should_send_ime_insert_as_key_event("你好"));
+    }
+
+    #[test]
+    fn native_text_preserves_remote_unicode_without_replacing_real_key_events() {
+        let mut event = KeyDownEvent {
+            keystroke: Keystroke {
+                key: "a".into(),
+                key_char: Some("a".into()),
+                modifiers: Modifiers::default(),
+            },
+            is_held: false,
+            prefer_character_input: false,
+        };
+        for text in ["b", "u", "1", "B", "你好", "😀", "abc"] {
+            assert!(native_text_overrides_key_event(&event, text), "{text:?}");
+        }
+        for text in ["a", "", "\n", "\t", "\u{f700}"] {
+            assert!(!native_text_overrides_key_event(&event, text), "{text:?}");
+        }
+        for modifiers in [
+            Modifiers::control(),
+            Modifiers::command(),
+            Modifiers::alt(),
+            Modifiers::shift(),
+            Modifiers::function(),
+        ] {
+            event.keystroke.modifiers = modifiers;
+            assert!(!native_text_overrides_key_event(&event, "b"));
+        }
+        event.keystroke.modifiers = Modifiers::default();
+        event.prefer_character_input = true;
+        assert!(!native_text_overrides_key_event(&event, "b"));
+        event.prefer_character_input = false;
+        event.keystroke.key_char = None;
+        assert!(!native_text_overrides_key_event(&event, "b"));
+        event.keystroke.key_char = Some("\n".into());
+        assert!(!native_text_overrides_key_event(&event, "b"));
+    }
+
+    #[test]
+    fn printable_text_translation_consumes_shift_only() {
+        let modifiers = Modifiers {
+            control: true,
+            alt: true,
+            shift: true,
+            platform: true,
+            function: true,
+        };
+
+        assert_eq!(
+            gpui_consumed_mods_to_ghostty(&Modifiers::shift(), Some("P")),
+            ffi::GHOSTTY_MODS_SHIFT
+        );
+        assert_eq!(
+            gpui_consumed_mods_to_ghostty(&modifiers, Some("P")),
+            ffi::GHOSTTY_MODS_SHIFT
+        );
+        assert_eq!(
+            gpui_consumed_mods_to_ghostty(&Modifiers::alt(), Some("å")),
+            0
+        );
+        assert_eq!(gpui_consumed_mods_to_ghostty(&modifiers, Some("\n")), 0);
+        assert_eq!(gpui_consumed_mods_to_ghostty(&modifiers, Some("\t")), 0);
+        assert_eq!(gpui_consumed_mods_to_ghostty(&modifiers, Some("")), 0);
+        assert_eq!(gpui_consumed_mods_to_ghostty(&modifiers, None), 0);
     }
 }

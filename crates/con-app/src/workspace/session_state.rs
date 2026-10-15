@@ -131,8 +131,19 @@ impl ConWorkspace {
     }
 
     pub(super) fn save_session(&self, cx: &App) {
+        let started = std::time::Instant::now();
         let session = self.snapshot_session(cx);
         let history = self.snapshot_global_history();
+        let elapsed = started.elapsed();
+        if elapsed > std::time::Duration::from_millis(50) {
+            log::warn!(
+                target: "con::perf",
+                "session snapshot blocked UI for {:.1}ms (tabs={}, terminal_text={})",
+                elapsed.as_secs_f64() * 1000.0,
+                self.tabs.len(),
+                self.config.appearance.restore_terminal_text,
+            );
+        }
         if let Err(err) = self
             .session_save_tx
             .send(SessionSaveRequest::Save(session, history))
@@ -253,6 +264,7 @@ impl ConWorkspace {
         for provider in [
             ProviderKind::Anthropic,
             ProviderKind::OpenAI,
+            ProviderKind::CodexLocal,
             ProviderKind::ChatGPT,
             ProviderKind::GitHubCopilot,
             ProviderKind::OpenAICompatible,
@@ -320,12 +332,9 @@ impl ConWorkspace {
     }
 
     pub(super) fn provider_models_for_config(&self, config: &AgentConfig) -> Vec<String> {
-        self.model_registry.models_for_base_url(
+        self.model_registry.models_for_config(
             &config.provider,
-            config
-                .providers
-                .get(&config.provider)
-                .and_then(|pc| pc.base_url.as_deref()),
+            &config.providers.get_or_default(&config.provider),
         )
     }
 

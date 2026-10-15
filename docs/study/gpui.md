@@ -10,7 +10,7 @@ con currently builds against the upstream GPUI crates from the Zed repository, n
 - **Text**: Core Text (macOS), cosmic-text (Linux), DirectWrite (Windows)
 - **Layout**: taffy (flexbox/CSS Grid)
 - **IME**: Full InputHandler trait — macOS AppKit, Linux X11 xim, Windows WM_IME
-- **Source**: upstream `zed-industries/zed` git dependency (crate name: `gpui`)
+- **Source**: `gpui-pre` crates.io snapshots of `zed-industries/zed` (package `gpui-pre`, imported as `gpui`)
 
 ## Programming Model
 
@@ -81,4 +81,58 @@ Read these upstream or read-only reference sources when you need framework detai
 
 ## Dependency
 
-In our workspace manifest, GPUI resolves from the upstream Zed git source rather than a local path dependency.
+In our workspace manifest, GPUI resolves from exact-pinned `gpui-pre` crates.io snapshots of Zed rather than a local path dependency.
+
+## Migration contracts
+
+The `gpui-pre = 0.3.7` baseline corresponds to Zed revision
+`1a28cff4b409169bac058bca40dfbfeb7621d19b`. Its paired component release is
+`gpui-component = 0.7.0` from [GPUI Kit](https://github.com/longbridge/gpui-kit).
+Review the pinned sources before applying examples from either repository's
+default branch; upgrading a snapshot does not require adopting every wrapper.
+
+- **Window hosting:** call `gpui_component::init` before creating windows and
+  keep one `Root` per window. Root now hosts dialog, sheet and notification
+  layers automatically; use `WindowExt` for operations, not manual layer
+  mounting. Existing `Root::new` window construction remains supported.
+- **Theme publication:** resolve a complete `ThemeConfig`, including Con's
+  font and transparent scrollbar-track overrides, then apply it inside
+  `Theme::update`. This publishes styled tokens, Base projection and window
+  refresh together. Do not restore the old `global_mut` / `sync_base` chain;
+  refreshing the same theme name and mode must still apply a new native palette.
+- **Composers:** use `TextareaState::submit_on_enter(true)` and the modifiers
+  delivered by `InputEvent::PressEnter`. Do not observe global keystrokes to
+  reconstruct those modifiers or remove an inserted newline with `set_value`.
+  In this release, submit mode propagates the `input::Enter` action; the
+  composer's parent consumes it so native text fallback cannot insert another
+  newline. Shift+Enter still inserts a newline. Historical message editing has
+  a different secondary-Enter contract and is intentionally separate.
+- **Buttons:** use `Button` for standard controls and `ButtonCustomVariant`
+  for Con's fills. Do not add a second `.hover(...)` style to a Button; its
+  implementation already installs one. Keep explicit SVG colors and restore
+  composer focus after mode switching or submission.
+- **Command palette:** retain Con's palette while the component's `Command`
+  treats the first Escape with a nonempty query as clear-search. Con requires
+  immediate dismissal, category/action-id search, and one dispatch even during
+  the closing animation. Test those contracts before replacing the owner.
+- **Message scrolling:** `ListState`, `FollowMode::Tail`, and targeted
+  `remeasure_items` are current GPUI APIs, not legacy substitutes. Con retains
+  its existing overscan, row geometry, and follow-output state. `MessageScroller`
+  owns additional state and uses different overscan/row spacing; replacing it
+  needs scrolling/resize measurements and anchor tests, not an assumed speedup.
+- **Rendering/cache:** keep `Render`/`RenderOnce` ownership and definite-size
+  cached views. A cache must not hide transition frames or child invalidation.
+  Asset loading and theme mutation must follow the pinned asset ownership and
+  base-theme synchronization contracts; APIs seen only on upstream main are
+  not migration requirements for this baseline.
+- **Entity-owned work:** start editor event pumps in initialization, retain
+  their `Task` handles, and publish changed state with `cx.notify()` from the
+  update callback. Do not drain external event queues or start lifetime tasks
+  from `render`; processing must not depend on whether a view has painted.
+  See the pinned [task guide](https://github.com/longbridge/gpui-kit/blob/v0.7.0/website/docs/task.md)
+  and [event guide](https://github.com/longbridge/gpui-kit/blob/v0.7.0/website/docs/event.md).
+
+Verify actual keystrokes, completion at a selection, retained input focus,
+palette dismissal, and cached widths with `cargo test -p con --bin con`.
+Inspect a real native window for visual controls. macOS tests do not verify
+Windows/Linux rendering or IME integration on those platforms.

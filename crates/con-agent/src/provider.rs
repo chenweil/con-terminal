@@ -128,9 +128,14 @@ fn is_local_openai_compatible_base_url(base_url: &str) -> bool {
 /// Supported LLM providers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ProviderKind {
+    #[default]
     Anthropic,
     OpenAI,
+    /// Local Codex app-server; authentication and endpoint stay owned by Codex.
+    #[serde(rename = "codex-local")]
+    CodexLocal,
     #[serde(rename = "chatgpt")]
     ChatGPT,
     #[serde(rename = "github-copilot", alias = "githubcopilot")]
@@ -161,17 +166,12 @@ pub enum ProviderKind {
     XAI,
 }
 
-impl Default for ProviderKind {
-    fn default() -> Self {
-        Self::Anthropic
-    }
-}
-
 impl std::fmt::Display for ProviderKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Anthropic => write!(f, "anthropic"),
             Self::OpenAI => write!(f, "openai"),
+            Self::CodexLocal => write!(f, "codex-local"),
             Self::ChatGPT => write!(f, "chatgpt"),
             Self::GitHubCopilot => write!(f, "github-copilot"),
             Self::OpenAICompatible => write!(f, "openai-compatible"),
@@ -199,6 +199,7 @@ fn display_provider_model(kind: &ProviderKind, model: &str) -> String {
     let provider = match kind {
         ProviderKind::ChatGPT => "ChatGPT",
         ProviderKind::OpenAI => "OpenAI",
+        ProviderKind::CodexLocal => "Codex Local",
         ProviderKind::GitHubCopilot => "GitHub Copilot",
         ProviderKind::OpenAICompatible => "OpenAI-compatible",
         ProviderKind::MiniMax => "MiniMax",
@@ -219,7 +220,11 @@ fn display_provider_model(kind: &ProviderKind, model: &str) -> String {
         ProviderKind::XAI => "xAI",
         ProviderKind::Anthropic => "Anthropic",
     };
-    format!("{provider} · {model}")
+    if model.is_empty() {
+        format!("{provider} · configured default")
+    } else {
+        format!("{provider} · {model}")
+    }
 }
 
 fn truncate_utf8_for_log(text: &str, max_bytes: usize) -> String {
@@ -239,8 +244,9 @@ fn truncate_utf8_for_log(text: &str, max_bytes: usize) -> String {
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ThinkParseMode {
+    #[default]
     Normal,
     InThink,
 }
@@ -255,12 +261,6 @@ struct ThinkParseOutput {
 struct ThinkTagStreamParser {
     pending: String,
     mode: ThinkParseMode,
-}
-
-impl Default for ThinkParseMode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 impl ThinkTagStreamParser {
@@ -358,6 +358,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rig_budget_preserves_the_previous_model_call_ceiling() {
+        assert_eq!(rig_model_call_budget(0), 2);
+        assert_eq!(rig_model_call_budget(1), 3);
+        assert_eq!(rig_model_call_budget(30), 32);
+        assert_eq!(rig_model_call_budget(usize::MAX), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn unified_final_response_backfills_missing_text_deltas() {
+        let final_item = MultiTurnStreamItem::<()>::final_response(
+            rig::OneOrMany::one(rig::message::AssistantContent::text("final answer")),
+            rig::completion::Usage::new(),
+        );
+        let stream: StreamingResult<()> = Box::pin(futures::stream::iter([Ok(final_item)]));
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+
+        let response = consume_stream(stream, &event_tx, &AtomicBool::new(false))
+            .await
+            .unwrap();
+
+        assert_eq!(response, "final answer");
+    }
+
+    #[tokio::test]
+    async fn unified_final_response_does_not_duplicate_live_text() {
+        let text_item = MultiTurnStreamItem::StreamAssistantItem(
+            StreamedAssistantContent::<()>::Text(rig::message::Text::new("live answer")),
+        );
+        let final_item = MultiTurnStreamItem::<()>::final_response(
+            rig::OneOrMany::one(rig::message::AssistantContent::text("live answer")),
+            rig::completion::Usage::new(),
+        );
+        let stream: StreamingResult<()> =
+            Box::pin(futures::stream::iter([Ok(text_item), Ok(final_item)]));
+        let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+
+        let response = consume_stream(stream, &event_tx, &AtomicBool::new(false))
+            .await
+            .unwrap();
+
+        assert_eq!(response, "live answer");
+    }
+
+    #[test]
     fn codex_chatgpt_auth_converter_flattens_codex_token_shape() {
         let auth = serde_json::from_value::<CodexAuthFile>(serde_json::json!({
             "auth_mode": "chatgpt",
@@ -378,6 +422,183 @@ mod tests {
                 id_token: Some("id".into()),
                 account_id: Some("account".into()),
             })
+        );
+    }
+
+    #[test]
+    fn chatgpt_oauth_cache_accepts_unexpired_access_token() {
+        let record = RigChatGptAuthTokenView {
+            access_token: Some("access".into()),
+            refresh_token: None,
+            expires_at: Some(1_061),
+        };
+
+        assert!(chatgpt_oauth_record_ready_at(record, 1_000));
+    }
+
+    #[test]
+    fn chatgpt_oauth_cache_accepts_refreshable_record() {
+        let record = RigChatGptAuthTokenView {
+            access_token: None,
+            refresh_token: Some("refresh".into()),
+            expires_at: None,
+        };
+
+        assert!(chatgpt_oauth_record_ready_at(record, 1_000));
+    }
+
+    #[test]
+    fn chatgpt_oauth_cache_rejects_access_token_without_valid_expiry() {
+        let missing_expiry = RigChatGptAuthTokenView {
+            access_token: Some("access".into()),
+            refresh_token: None,
+            expires_at: None,
+        };
+        let inside_expiry_skew = RigChatGptAuthTokenView {
+            access_token: Some("access".into()),
+            refresh_token: None,
+            expires_at: Some(1_060),
+        };
+
+        assert!(!chatgpt_oauth_record_ready_at(missing_expiry, 1_000));
+        assert!(!chatgpt_oauth_record_ready_at(inside_expiry_skew, 1_000));
+    }
+
+    #[test]
+    fn chatgpt_oauth_cache_rejects_empty_credentials() {
+        let record = RigChatGptAuthTokenView {
+            access_token: Some("  ".into()),
+            refresh_token: Some(String::new()),
+            expires_at: Some(i64::MAX),
+        };
+
+        assert!(!chatgpt_oauth_record_ready_at(record, 1_000));
+    }
+
+    #[test]
+    fn preferred_default_keeps_explicitly_selected_provider() {
+        let config = AgentConfig {
+            provider: ProviderKind::OpenAI,
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            preferred_default_provider_for_state(&config, true, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn preferred_default_keeps_explicit_anthropic_without_credentials() {
+        let config = AgentConfig::default();
+
+        assert_eq!(
+            preferred_default_provider_for_state(&config, true, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn preferred_default_uses_chatgpt_for_implicit_unconfigured_anthropic() {
+        let config = AgentConfig::default();
+
+        assert_eq!(
+            preferred_default_provider_for_state(&config, false, false, true),
+            Some(ProviderKind::ChatGPT)
+        );
+        assert_eq!(
+            preferred_default_provider_for_state(&config, false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn preferred_default_recomputes_automatic_chatgpt_selection() {
+        let config = AgentConfig {
+            provider: ProviderKind::ChatGPT,
+            ..AgentConfig::default()
+        };
+
+        assert_eq!(
+            preferred_default_provider_for_state(&config, false, true, true),
+            Some(ProviderKind::Anthropic)
+        );
+        assert_eq!(
+            preferred_default_provider_for_state(&config, false, false, false),
+            Some(ProviderKind::Anthropic)
+        );
+    }
+
+    #[test]
+    fn preferred_default_keeps_anthropic_when_inline_key_configured() {
+        // Anthropic with a usable inline key is a real setup — don't redirect to
+        // ChatGPT even if a ChatGPT cache happens to exist.
+        let mut config = AgentConfig {
+            provider: ProviderKind::Anthropic,
+            ..AgentConfig::default()
+        };
+        config.providers.set(
+            &ProviderKind::Anthropic,
+            ProviderConfig {
+                reasoning_effort: None,
+                model: None,
+                api_key: Some("sk-ant-test".into()),
+                api_key_env: None,
+                base_url: None,
+                max_tokens: None,
+            },
+        );
+        assert!(anthropic_credentials_available(&config));
+        assert_eq!(
+            preferred_default_provider_for_state(&config, false, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn preferred_default_keeps_anthropic_when_legacy_api_key_env_contains_key() {
+        let mut config = AgentConfig {
+            provider: ProviderKind::Anthropic,
+            ..AgentConfig::default()
+        };
+        config.providers.set(
+            &ProviderKind::Anthropic,
+            ProviderConfig {
+                reasoning_effort: None,
+                model: None,
+                api_key: None,
+                api_key_env: Some("sk-ant-legacy-direct-key".into()),
+                base_url: None,
+                max_tokens: None,
+            },
+        );
+        assert!(anthropic_credentials_available(&config));
+        assert_eq!(
+            preferred_default_provider_for_state(&config, false, true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn preferred_default_keeps_automatic_chatgpt_with_key_override() {
+        let mut config = AgentConfig {
+            provider: ProviderKind::ChatGPT,
+            ..AgentConfig::default()
+        };
+        config.providers.set(
+            &ProviderKind::ChatGPT,
+            ProviderConfig {
+                api_key: Some("chatgpt-access-token".into()),
+                ..ProviderConfig::default()
+            },
+        );
+
+        assert!(provider_credentials_available(
+            &config,
+            &ProviderKind::ChatGPT
+        ));
+        assert_eq!(
+            preferred_default_provider_for_state(&config, false, false, true),
+            None
         );
     }
 
@@ -478,18 +699,14 @@ mod tests {
         std::fs::create_dir_all(&root).expect("temp root should be created");
         let source = root.join("codex-auth.json");
         let target = root.join("con").join("auth.json");
-        std::fs::create_dir_all(target.parent().expect("target should have a parent"))
-            .expect("target parent should be created");
-        std::fs::write(&target, r#"{"access_token":"stale"}"#)
-            .expect("target auth should be written");
 
         std::fs::write(
             &source,
             serde_json::to_vec(&serde_json::json!({
                 "auth_mode": "chatgpt",
                 "tokens": {
-                    "access_token": "fresh",
-                    "refresh_token": "refresh"
+                    "access_token": "codex-v1",
+                    "refresh_token": "refresh-v1"
                 }
             }))
             .expect("source json should serialize"),
@@ -498,13 +715,143 @@ mod tests {
 
         assert!(
             sync_codex_chatgpt_auth_from_file(&source, &target)
-                .expect("codex auth sync should succeed")
+                .expect("initial codex auth sync should succeed")
+        );
+
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "codex-v2",
+                    "refresh_token": "refresh-v2"
+                }
+            }))
+            .expect("updated source json should serialize"),
+        )
+        .expect("source auth should be updated");
+
+        assert!(
+            sync_codex_chatgpt_auth_from_file(&source, &target)
+                .expect("managed codex auth should update")
         );
         let imported = std::fs::read_to_string(&target).expect("target auth should exist");
         let imported: serde_json::Value =
             serde_json::from_str(&imported).expect("target auth should be valid json");
-        assert_eq!(imported["access_token"], "fresh");
-        assert_eq!(imported["refresh_token"], "refresh");
+        assert_eq!(imported["access_token"], "codex-v2");
+        assert_eq!(imported["refresh_token"], "refresh-v2");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_chatgpt_auth_sync_preserves_preexisting_unmanaged_auth() {
+        let root = std::env::temp_dir().join(format!(
+            "con-agent-codex-auth-unmanaged-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let source = root.join("codex-auth.json");
+        let target = root.join("con").join("auth.json");
+        std::fs::create_dir_all(target.parent().expect("target should have a parent"))
+            .expect("target parent should be created");
+        std::fs::write(&target, r#"{"access_token":"manual"}"#)
+            .expect("manual auth should be written");
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "codex",
+                    "refresh_token": "refresh"
+                }
+            }))
+            .expect("source json should serialize"),
+        )
+        .expect("source auth should be written");
+
+        assert!(
+            !sync_codex_chatgpt_auth_from_file(&source, &target)
+                .expect("unmanaged auth should be preserved")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target auth should still exist"),
+            r#"{"access_token":"manual"}"#
+        );
+        assert!(!codex_auth_sync_state_file(&target).exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_chatgpt_auth_sync_retires_ownership_after_local_auth_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "con-agent-codex-auth-local-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root should be created");
+        let source = root.join("codex-auth.json");
+        let target = root.join("con").join("auth.json");
+
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "codex-v1",
+                    "refresh_token": "refresh-v1"
+                }
+            }))
+            .expect("source json should serialize"),
+        )
+        .expect("source auth should be written");
+
+        assert!(
+            sync_codex_chatgpt_auth_from_file(&source, &target)
+                .expect("initial codex auth sync should succeed")
+        );
+
+        std::fs::write(&target, r#"{"access_token":"manual"}"#)
+            .expect("manual auth should be written");
+        assert!(
+            !sync_codex_chatgpt_auth_from_file(&source, &target)
+                .expect("same codex source should remain seen")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target auth should still exist"),
+            r#"{"access_token":"manual"}"#
+        );
+        assert!(!codex_auth_sync_state_file(&target).exists());
+
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "codex-v2",
+                    "refresh_token": "refresh-v2"
+                }
+            }))
+            .expect("source json should serialize"),
+        )
+        .expect("source auth should be updated");
+
+        assert!(
+            !sync_codex_chatgpt_auth_from_file(&source, &target)
+                .expect("updated codex auth should not replace local auth")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target auth should still exist"),
+            r#"{"access_token":"manual"}"#
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -518,6 +865,7 @@ mod tests {
         config.providers.set(
             &ProviderKind::MiniMaxAnthropic,
             ProviderConfig {
+                reasoning_effort: None,
                 model: Some("MiniMax-M2.7".into()),
                 api_key: None,
                 api_key_env: None,
@@ -528,6 +876,7 @@ mod tests {
         config.providers.set(
             &ProviderKind::ZAIAnthropic,
             ProviderConfig {
+                reasoning_effort: None,
                 model: Some("glm-4.6".into()),
                 api_key: None,
                 api_key_env: None,
@@ -751,6 +1100,7 @@ impl ProviderKind {
             Self::GitHubCopilot => "GITHUB_COPILOT_API_KEY",
             Self::OpenAICompatible => "OPENAI_API_KEY",
             Self::OpenAI => "OPENAI_API_KEY",
+            Self::CodexLocal => "", // Codex owns authentication; never resolve a Con key.
             Self::MiniMax | Self::MiniMaxAnthropic => "MINIMAX_API_KEY",
             Self::Moonshot | Self::MoonshotAnthropic => "MOONSHOT_API_KEY",
             Self::ZAI | Self::ZAIAnthropic => "ZAI_API_KEY",
@@ -770,10 +1120,11 @@ impl ProviderKind {
     pub fn default_model(&self) -> &str {
         match self {
             Self::Anthropic => "claude-sonnet-4-6",
-            Self::ChatGPT => "gpt-5.3-codex",
+            Self::ChatGPT => crate::chatgpt_subscription::DEFAULT_MODEL,
             Self::GitHubCopilot => "gpt-4o",
             Self::OpenAICompatible => "gpt-4o",
             Self::OpenAI => "gpt-4o",
+            Self::CodexLocal => "", // Omission preserves Codex's configured default model.
             Self::MiniMax => "MiniMax-M2",
             Self::MiniMaxAnthropic => "MiniMax-M2",
             Self::Moonshot => "kimi-k2.5",
@@ -835,7 +1186,11 @@ struct RigChatGptAuthRecord {
 #[derive(Debug, Deserialize)]
 struct RigChatGptAuthTokenView {
     access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_at: Option<i64>,
 }
+
+const CHATGPT_TOKEN_EXPIRY_SKEW_SECONDS: i64 = 60;
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct CodexAuthSyncState {
@@ -862,17 +1217,34 @@ fn codex_auth_file() -> Option<PathBuf> {
 }
 
 pub fn read_chatgpt_oauth_access_token(auth_file: &std::path::Path) -> Result<Option<String>> {
+    Ok(read_chatgpt_oauth_record(auth_file)?
+        .and_then(|record| non_empty_token(record.access_token)))
+}
+
+fn read_chatgpt_oauth_record(
+    auth_file: &std::path::Path,
+) -> Result<Option<RigChatGptAuthTokenView>> {
     match std::fs::read_to_string(auth_file) {
-        Ok(raw) => {
-            let record: RigChatGptAuthTokenView = serde_json::from_str(&raw)?;
-            Ok(record
-                .access_token
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty()))
-        }
+        Ok(raw) => Ok(Some(serde_json::from_str(&raw)?)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+fn non_empty_token(token: Option<String>) -> Option<String> {
+    token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn chatgpt_oauth_record_ready_at(record: RigChatGptAuthTokenView, now: i64) -> bool {
+    let access_token_ready = non_empty_token(record.access_token).is_some()
+        && record.expires_at.is_some_and(|expires_at| {
+            now < expires_at.saturating_sub(CHATGPT_TOKEN_EXPIRY_SKEW_SECONDS)
+        });
+    let refresh_token_ready = non_empty_token(record.refresh_token).is_some();
+
+    access_token_ready || refresh_token_ready
 }
 
 pub fn read_synced_chatgpt_oauth_access_token(
@@ -900,30 +1272,35 @@ fn sync_codex_chatgpt_auth_from_file(
         return Ok(false);
     };
 
-    if let Some(parent) = target_auth_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     let bytes = serde_json::to_vec_pretty(&record)?;
     let source_fingerprint = stable_fingerprint(&bytes);
     let sync_state_file = codex_auth_sync_state_file(target_auth_file);
-    if target_auth_file.is_file()
-        && read_codex_auth_sync_state(&sync_state_file)?
-            .as_ref()
-            .is_some_and(|state| state.source_fingerprint == source_fingerprint)
-    {
+    let target_bytes = target_auth_file
+        .is_file()
+        .then(|| std::fs::read(target_auth_file))
+        .transpose()?;
+
+    // An identical cache is safe to adopt as Codex-managed, including caches
+    // imported by an older Con build before the provenance sidecar existed.
+    if target_bytes.as_deref() == Some(bytes.as_slice()) {
+        write_codex_auth_sync_state(&sync_state_file, &source_fingerprint)?;
         return Ok(false);
     }
 
-    if target_auth_file
-        .is_file()
-        .then(|| std::fs::read(target_auth_file))
-        .transpose()?
-        .as_deref()
-        == Some(bytes.as_slice())
-    {
-        write_codex_auth_sync_state(&sync_state_file, &source_fingerprint)?;
-        return Ok(false);
+    if let Some(target_bytes) = target_bytes.as_deref() {
+        let Some(sync_state) = read_codex_auth_sync_state(&sync_state_file)? else {
+            // A pre-existing cache without provenance belongs to the user (or
+            // another auth flow), not to the automatic Codex import path.
+            return Ok(false);
+        };
+
+        if stable_fingerprint(target_bytes) != sync_state.source_fingerprint {
+            // The cache changed after Con imported it. Rig may have refreshed
+            // it, or the user may have signed into another account. Either way,
+            // retire our ownership marker rather than overwrite local auth.
+            clear_auth_record_if_present(&sync_state_file)?;
+            return Ok(false);
+        }
     }
 
     write_auth_record(target_auth_file, &bytes)?;
@@ -936,7 +1313,7 @@ fn sync_codex_chatgpt_auth_from_file(
     Ok(true)
 }
 
-fn stable_fingerprint(bytes: &[u8]) -> String {
+pub(crate) fn stable_fingerprint(bytes: &[u8]) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -973,7 +1350,7 @@ fn clear_codex_auth_sync_state(target_auth_file: &std::path::Path) -> Result<boo
     clear_auth_record_if_present(&codex_auth_sync_state_file(target_auth_file))
 }
 
-fn write_auth_record(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_auth_record(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     if let Some(parent) = path.parent() {
@@ -1017,11 +1394,149 @@ fn write_auth_record(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sync_codex_chatgpt_auth(target_auth_file: &std::path::Path) -> Result<bool> {
+pub(crate) fn sync_codex_chatgpt_auth(target_auth_file: &std::path::Path) -> Result<bool> {
     let Some(source_auth_file) = codex_auth_file() else {
         return Ok(false);
     };
     sync_codex_chatgpt_auth_from_file(&source_auth_file, target_auth_file)
+}
+
+/// Best-effort, zero-touch sync of the ChatGPT Subscription OAuth cache from
+/// Codex's `~/.codex/auth.json` into Con's token directory.
+///
+/// Call this once at startup so a user who is already signed in to Codex is
+/// picked up automatically — no manual device login and no need to ever open
+/// the Providers settings. UI sign-in indicators key off provider-specific
+/// cache files (for ChatGPT, `auth.json`), so writing the cache before the first
+/// render is what makes the experience feel seamless. Existing local auth is
+/// never replaced unless its provenance marker proves that Con previously
+/// imported it from Codex and it has not changed since.
+///
+/// Returns `Ok(true)` when fresh credentials were written, `Ok(false)` when
+/// there was nothing to do (no Codex auth, not a ChatGPT OAuth login, or the
+/// cache is current or independently owned).
+pub fn ensure_chatgpt_oauth_synced_from_codex() -> Result<bool> {
+    let Some(dir) = oauth_token_dir(&ProviderKind::ChatGPT) else {
+        return Ok(false);
+    };
+    sync_codex_chatgpt_auth(&dir.join("auth.json"))
+}
+
+fn anthropic_credentials_available(config: &AgentConfig) -> bool {
+    provider_credentials_available(config, &ProviderKind::Anthropic)
+}
+
+/// Whether a provider has a usable API credential through the same paths used
+/// by live requests: inline config, a referenced env var, a legacy direct key
+/// in `api_key_env`, or the provider's default environment variable.
+fn provider_credentials_available(config: &AgentConfig, kind: &ProviderKind) -> bool {
+    if configured_api_key_value(config, kind).is_some() {
+        return true;
+    }
+    std::env::var(kind.default_api_key_env()).is_ok_and(|value| !value.trim().is_empty())
+}
+
+fn configured_api_key_value(config: &AgentConfig, kind: &ProviderKind) -> Option<String> {
+    configured_provider_api_key_value(config.providers.get(kind))
+}
+
+pub(crate) fn configured_provider_api_key_value(pc: Option<&ProviderConfig>) -> Option<String> {
+    if let Some(key) = pc
+        .and_then(|p| p.api_key.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(key.to_string());
+    }
+
+    if let Some(key_or_env) = pc
+        .and_then(|p| p.api_key_env.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        if provider_api_key_env_name_like(key_or_env) {
+            if let Ok(val) = std::env::var(key_or_env) {
+                let val = val.trim().to_string();
+                if !val.is_empty() {
+                    return Some(val);
+                }
+            }
+        } else {
+            return Some(key_or_env.to_string());
+        }
+    }
+
+    None
+}
+
+fn provider_api_key_env_name_like(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+}
+
+/// Whether Rig can use the ChatGPT Subscription OAuth cache without prompting.
+///
+/// This mirrors Rig's native authenticator: it can proceed with either an
+/// unexpired access token (including Rig's 60-second expiry skew) or a refresh
+/// token. An access token without expiry metadata is not enough for zero-touch
+/// startup because Rig treats it as expired and opens device authorization.
+fn chatgpt_oauth_cache_ready() -> bool {
+    let Some(auth_file) = oauth_token_dir(&ProviderKind::ChatGPT).map(|dir| dir.join("auth.json"))
+    else {
+        return false;
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+
+    read_chatgpt_oauth_record(&auth_file)
+        .ok()
+        .flatten()
+        .is_some_and(|record| chatgpt_oauth_record_ready_at(record, now))
+}
+
+/// Choose the effective default provider for a freshly loaded config.
+///
+/// Zero-touch sign-in: the hard-coded default provider is Anthropic, but when
+/// the user has *not* configured any Anthropic credentials and a ChatGPT
+/// credential is ready (an API-key override or a Subscription OAuth cache,
+/// typically synced from Codex), prefer ChatGPT so the first run — and every
+/// new window — works without manually switching providers.
+///
+/// Deliberately conservative: explicit choices are always preserved. An
+/// automatic choice is recomputed from current credential readiness, preferring
+/// configured Anthropic and otherwise using ChatGPT only while one of its
+/// credential paths is usable. Returns the provider to switch to, or `None`
+/// when it is unchanged.
+pub fn preferred_default_provider(config: &AgentConfig) -> Option<ProviderKind> {
+    preferred_default_provider_for_state(
+        config,
+        config.provider_is_explicit,
+        anthropic_credentials_available(config),
+        provider_credentials_available(config, &ProviderKind::ChatGPT)
+            || chatgpt_oauth_cache_ready(),
+    )
+}
+
+fn preferred_default_provider_for_state(
+    config: &AgentConfig,
+    provider_is_explicit: bool,
+    anthropic_credentials_ready: bool,
+    chatgpt_credentials_ready: bool,
+) -> Option<ProviderKind> {
+    if provider_is_explicit {
+        return None;
+    }
+
+    let provider = if anthropic_credentials_ready || !chatgpt_credentials_ready {
+        ProviderKind::Anthropic
+    } else {
+        ProviderKind::ChatGPT
+    };
+    (config.provider != provider).then_some(provider)
 }
 
 fn mark_codex_chatgpt_auth_source_seen(target_auth_file: &std::path::Path) -> Result<bool> {
@@ -1117,7 +1632,7 @@ where
 // ── Per-provider config ─────────────────────────────────────────────
 
 /// Settings specific to a single provider — model, credentials, endpoint.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
     pub model: Option<String>,
@@ -1129,6 +1644,8 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     /// Max output tokens (provider-specific limits apply).
     pub max_tokens: Option<u64>,
+    /// ChatGPT Subscription reasoning effort; omitted uses the provider default.
+    pub reasoning_effort: Option<crate::chatgpt_subscription::ReasoningEffort>,
 }
 
 /// Map of per-provider configurations.
@@ -1140,6 +1657,8 @@ pub struct ProviderMap {
     pub anthropic: Option<ProviderConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<ProviderConfig>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "codex-local")]
+    pub codex_local: Option<ProviderConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chatgpt: Option<ProviderConfig>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "github-copilot")]
@@ -1189,6 +1708,7 @@ impl ProviderMap {
         match kind {
             ProviderKind::Anthropic => self.anthropic.as_ref(),
             ProviderKind::OpenAI => self.openai.as_ref(),
+            ProviderKind::CodexLocal => self.codex_local.as_ref(),
             ProviderKind::ChatGPT => self.chatgpt.as_ref(),
             ProviderKind::GitHubCopilot => self.github_copilot.as_ref(),
             ProviderKind::OpenAICompatible => self.openaicompatible.as_ref(),
@@ -1219,6 +1739,7 @@ impl ProviderMap {
         let slot = match kind {
             ProviderKind::Anthropic => &mut self.anthropic,
             ProviderKind::OpenAI => &mut self.openai,
+            ProviderKind::CodexLocal => &mut self.codex_local,
             ProviderKind::ChatGPT => &mut self.chatgpt,
             ProviderKind::GitHubCopilot => &mut self.github_copilot,
             ProviderKind::OpenAICompatible => &mut self.openaicompatible,
@@ -1257,16 +1778,12 @@ pub struct SuggestionModelConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum AgentPurpose {
+    #[default]
     Build,
     Explain,
     Operate,
-}
-
-impl Default for AgentPurpose {
-    fn default() -> Self {
-        Self::Build
-    }
 }
 
 impl AgentPurpose {
@@ -1306,33 +1823,32 @@ pub struct ProviderProtocolPreferences {
     pub zai: Option<ProviderTransport>,
 }
 
-/// Agent configuration from config.toml
+/// Agent configuration from Con's Ghostty-style configuration file.
 ///
-/// ```toml
-/// [agent]
-/// provider = "anthropic"
-/// max_turns = 10
-/// temperature = 0.7
-///
-/// [agent.providers.anthropic]
-/// model = "claude-sonnet-4-6"
-/// api_key = "sk-ant-..."
-/// max_tokens = 8192
-///
-/// [agent.providers.groq]
-/// model = "llama-3.3-70b-versatile"
-/// api_key_env = "GROQ_API_KEY"
-/// max_tokens = 16384
-///
-/// [agent.suggestion_model]
-/// provider = "groq"
-/// model = "llama-3.1-8b-instant"
+/// ```text
+/// con.agent.provider = anthropic
+/// con.agent.max_turns = 10
+/// con.agent.temperature = 0.7
+/// con.agent.providers.anthropic.model = claude-sonnet-4-6
+/// con.agent.providers.anthropic.api_key = sk-ant-...
+/// con.agent.providers.anthropic.max_tokens = 8192
+/// con.agent.providers.groq.model = llama-3.3-70b-versatile
+/// con.agent.providers.groq.api_key_env = GROQ_API_KEY
+/// con.agent.providers.groq.max_tokens = 16384
+/// con.agent.suggestion_model.provider = groq
+/// con.agent.suggestion_model.model = llama-3.1-8b-instant
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
     /// Active provider selection.
     pub provider: ProviderKind,
+    /// Whether the active provider was explicitly selected by the user.
+    ///
+    /// Older Con versions always serialized `provider`, including its default,
+    /// so presence alone cannot distinguish a choice from generated config.
+    #[serde(default)]
+    pub provider_is_explicit: bool,
     /// High-level operating stance for the built-in agent.
     pub purpose: AgentPurpose,
     /// Per-provider settings (model, key, endpoint, max_tokens).
@@ -1364,6 +1880,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             provider: ProviderKind::default(),
+            provider_is_explicit: false,
             purpose: AgentPurpose::default(),
             providers: ProviderMap::default(),
             provider_protocols: ProviderProtocolPreferences::default(),
@@ -1393,6 +1910,11 @@ impl Default for SuggestionModelConfig {
 }
 
 impl AgentConfig {
+    pub fn select_provider(&mut self, provider: ProviderKind) {
+        self.provider = provider;
+        self.provider_is_explicit = true;
+    }
+
     pub fn provider_transport_for(&self, provider: &ProviderKind) -> Option<ProviderTransport> {
         match provider {
             ProviderKind::MiniMax | ProviderKind::MiniMaxAnthropic => {
@@ -1443,6 +1965,7 @@ impl AgentConfig {
                     api_key_env: self.api_key_env.take(),
                     base_url: self.base_url.take(),
                     max_tokens: self.max_tokens.take(),
+                    reasoning_effort: None,
                 },
             );
         }
@@ -1549,6 +2072,7 @@ impl AgentConfig {
 
         AgentConfig {
             provider: suggestion_provider,
+            provider_is_explicit: false,
             purpose: self.purpose,
             providers,
             provider_protocols: ProviderProtocolPreferences::default(),
@@ -1581,6 +2105,16 @@ pub enum AgentEvent {
         tool_name: String,
         args: String,
     },
+    /// A dangerous tool is actually blocked waiting for a decision.
+    ToolApprovalNeeded {
+        call_id: String,
+        tool_name: String,
+        args: String,
+    },
+    /// The approval wait ended by decision, timeout, cancellation, or disconnect.
+    ToolApprovalEnded {
+        call_id: String,
+    },
     ToolCallComplete {
         call_id: String,
         tool_name: String,
@@ -1588,6 +2122,60 @@ pub enum AgentEvent {
     },
     Done(Message),
     Error(String),
+}
+
+/// One Rig tool registry for both HTTP providers and local Codex dynamic tools.
+pub(crate) fn build_tool_server(
+    root: PathBuf,
+    terminal_exec_tx: Sender<TerminalExecRequest>,
+    pane_tx: Sender<PaneRequest>,
+    cancelled: Arc<AtomicBool>,
+) -> rig::tool::server::ToolServerHandle {
+    rig::tool::server::ToolServer::new()
+        .tool(TerminalExecTool::new(terminal_exec_tx.clone()))
+        .tool(ShellExecTool)
+        .tool(FileReadTool::new(root.clone()))
+        .tool(FileWriteTool::new(root.clone()))
+        .tool(EditFileTool::new(root.clone()))
+        .tool(ListFilesTool::new(root.clone()))
+        .tool(SearchTool::new(root))
+        .tool(ListPanesTool::new(pane_tx.clone()))
+        .tool(ListTabWorkspacesTool::new(pane_tx.clone()))
+        .tool(TmuxInspectTool::new(pane_tx.clone()))
+        .tool(TmuxListTool::new(pane_tx.clone()))
+        .tool(TmuxCaptureTool::new(pane_tx.clone()))
+        .tool(TmuxFindTargetsTool::new(pane_tx.clone()))
+        .tool(ResolveWorkTargetTool::new(pane_tx.clone()))
+        .tool(EnsureLocalCodingWorkspaceTool::new(pane_tx.clone()))
+        .tool(AgentCliTurnTool::new(pane_tx.clone()))
+        .tool(EnsureLocalAgentTargetTool::new(pane_tx.clone()))
+        .tool(EnsureLocalShellTargetTool::new(pane_tx.clone()))
+        .tool(EnsureRemoteShellTargetTool::new(pane_tx.clone()))
+        .tool(EnsureRemoteTmuxShellTargetTool::new(
+            pane_tx.clone(),
+            terminal_exec_tx.clone(),
+        ))
+        .tool(EnsureRemoteTmuxWorkspaceTool::new(
+            pane_tx.clone(),
+            terminal_exec_tx.clone(),
+        ))
+        .tool(RemoteExecTool::new(
+            pane_tx.clone(),
+            terminal_exec_tx.clone(),
+        ))
+        .tool(TmuxEnsureShellTargetTool::new(pane_tx.clone()))
+        .tool(TmuxShellTurnTool::new(pane_tx.clone()))
+        .tool(TmuxSendKeysTool::new(pane_tx.clone()))
+        .tool(TmuxRunCommandTool::new(pane_tx.clone()))
+        .tool(TmuxEnsureAgentTargetTool::new(pane_tx.clone()))
+        .tool(ProbeShellContextTool::new(pane_tx.clone()))
+        .tool(ReadPaneTool::new(pane_tx.clone()))
+        .tool(SendKeysTool::new(pane_tx.clone()))
+        .tool(SearchPanesTool::new(pane_tx.clone()))
+        .tool(CreatePaneTool::new(pane_tx.clone()))
+        .tool(WaitForTool::new(pane_tx, cancelled))
+        .tool(BatchExecTool::new(terminal_exec_tx))
+        .run()
 }
 
 // ── Agent builder macro ─────────────────────────────────────────────
@@ -1602,54 +2190,17 @@ macro_rules! build_and_stream {
     ($client:expr, $cfg:expr, $kind:expr, $system_prompt:expr, $prompt:expr,
      $history:expr, $hook:expr, $terminal_exec_tx:expr, $pane_tx:expr,
      $event_tx:expr, $cancelled:expr, $workspace_root:expr) => {{
-        let root: std::path::PathBuf = $workspace_root;
+        let tools = build_tool_server(
+            $workspace_root,
+            $terminal_exec_tx,
+            $pane_tx,
+            $cancelled.clone(),
+        );
         let mut builder = $client
             .agent($cfg.effective_model(&$kind))
             .preamble($system_prompt)
-            .tool(TerminalExecTool::new($terminal_exec_tx.clone()))
-            .tool(ShellExecTool)
-            .tool(FileReadTool::new(root.clone()))
-            .tool(FileWriteTool::new(root.clone()))
-            .tool(EditFileTool::new(root.clone()))
-            .tool(ListFilesTool::new(root.clone()))
-            .tool(SearchTool::new(root))
-            .tool(ListPanesTool::new($pane_tx.clone()))
-            .tool(ListTabWorkspacesTool::new($pane_tx.clone()))
-            .tool(TmuxInspectTool::new($pane_tx.clone()))
-            .tool(TmuxListTool::new($pane_tx.clone()))
-            .tool(TmuxCaptureTool::new($pane_tx.clone()))
-            .tool(TmuxFindTargetsTool::new($pane_tx.clone()))
-            .tool(ResolveWorkTargetTool::new($pane_tx.clone()))
-            .tool(EnsureLocalCodingWorkspaceTool::new($pane_tx.clone()))
-            .tool(AgentCliTurnTool::new($pane_tx.clone()))
-            .tool(EnsureLocalAgentTargetTool::new($pane_tx.clone()))
-            .tool(EnsureLocalShellTargetTool::new($pane_tx.clone()))
-            .tool(EnsureRemoteShellTargetTool::new($pane_tx.clone()))
-            .tool(EnsureRemoteTmuxShellTargetTool::new(
-                $pane_tx.clone(),
-                $terminal_exec_tx.clone(),
-            ))
-            .tool(EnsureRemoteTmuxWorkspaceTool::new(
-                $pane_tx.clone(),
-                $terminal_exec_tx.clone(),
-            ))
-            .tool(RemoteExecTool::new(
-                $pane_tx.clone(),
-                $terminal_exec_tx.clone(),
-            ))
-            .tool(TmuxEnsureShellTargetTool::new($pane_tx.clone()))
-            .tool(TmuxShellTurnTool::new($pane_tx.clone()))
-            .tool(TmuxSendKeysTool::new($pane_tx.clone()))
-            .tool(TmuxRunCommandTool::new($pane_tx.clone()))
-            .tool(TmuxEnsureAgentTargetTool::new($pane_tx.clone()))
-            .tool(ProbeShellContextTool::new($pane_tx.clone()))
-            .tool(ReadPaneTool::new($pane_tx.clone()))
-            .tool(SendKeysTool::new($pane_tx.clone()))
-            .tool(SearchPanesTool::new($pane_tx.clone()))
-            .tool(CreatePaneTool::new($pane_tx.clone()))
-            .tool(WaitForTool::new($pane_tx, $cancelled.clone()))
-            .tool(BatchExecTool::new($terminal_exec_tx))
-            .default_max_turns($cfg.max_turns);
+            .tool_server_handle(tools)
+            .default_max_turns(rig_model_call_budget($cfg.max_turns));
 
         if let Some(max_tokens) = $cfg.effective_max_tokens(&$kind) {
             builder = builder.max_tokens(max_tokens);
@@ -1657,6 +2208,16 @@ macro_rules! build_and_stream {
         if let Some(temp) = $cfg.temperature {
             builder = builder.temperature(temp);
         }
+        if *$kind == ProviderKind::ChatGPT {
+            let config = $cfg.providers.get_or_default($kind);
+            if let Some(params) = crate::chatgpt_subscription::request_parameters(
+                &config,
+                $cfg.effective_model($kind),
+            )? {
+                builder = builder.additional_params(params);
+            }
+        }
+        builder = builder.add_hook($hook);
 
         let agent = builder.build();
 
@@ -1677,14 +2238,16 @@ macro_rules! build_and_stream {
             }
         }
 
-        let stream = agent
-            .stream_prompt($prompt)
-            .with_hook($hook)
-            .with_history($history)
-            .await;
+        let stream = agent.stream_prompt($prompt).history($history).await;
 
         consume_stream(stream, $event_tx, $cancelled).await
     }};
+}
+
+/// Rig 0.36 allowed two model calls beyond an explicit `max_turns` value. Rig
+/// 0.40 makes the model-call budget exact, so retain Con's shipped ceiling.
+fn rig_model_call_budget(tool_turns: usize) -> usize {
+    tool_turns.saturating_add(2)
 }
 
 // ── Provider ────────────────────────────────────────────────────────
@@ -1702,6 +2265,7 @@ impl AgentProvider {
         &self.config
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
         conversation: &Conversation,
@@ -1740,15 +2304,20 @@ impl AgentProvider {
         );
 
         // Warn if a custom base_url is set but the model is the provider default —
-        // the user probably forgot to set [agent.providers.<name>].model and is
+        // the user probably forgot to set the provider's model and is
         // sending the default model name to a third-party API.
         if base_url.is_some() && model == kind.default_model() {
+            let config_provider = serde_json::to_value(kind)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| kind.to_string());
             log::warn!(
                 "[agent] Custom base_url is set for {:?} but model is the default '{}'. \
-                 Set [agent.providers.{:?}].model in config.toml to override.",
+                 Set con.agent.providers.{}.model in {} to override.",
                 kind,
                 model,
-                kind,
+                config_provider,
+                con_paths::CONFIG_FILE_NAME,
             );
         }
 
@@ -1782,7 +2351,7 @@ impl AgentProvider {
             .as_ref()
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_dir())
-            .or_else(|| dirs::home_dir())
+            .or_else(dirs::home_dir)
             .unwrap_or_else(std::env::temp_dir);
 
         macro_rules! stream_with {
@@ -1807,6 +2376,26 @@ impl AgentProvider {
         let response = match *kind {
             ProviderKind::Anthropic => stream_with!(self.build_anthropic_client()?),
             ProviderKind::OpenAI => stream_with!(self.build_openai_client()?),
+            ProviderKind::CodexLocal => {
+                let tools = build_tool_server(
+                    workspace_root.clone(),
+                    terminal_exec_tx,
+                    pane_tx,
+                    cancelled.clone(),
+                );
+                crate::codex_local::send(
+                    &self.config,
+                    &system_prompt,
+                    chat_history,
+                    &last_user_msg,
+                    &workspace_root,
+                    tools,
+                    hook,
+                    &event_tx,
+                    &cancelled,
+                )
+                .await?
+            }
             ProviderKind::ChatGPT => stream_with!(self.build_chatgpt_client()?),
             ProviderKind::GitHubCopilot => stream_with!(self.build_github_copilot_client()?),
             ProviderKind::OpenAICompatible => {
@@ -1832,7 +2421,12 @@ impl AgentProvider {
             ProviderKind::XAI => stream_with!(self.build_xai_client()?),
         };
 
-        let model_name = self.config.effective_model(kind).to_string();
+        let configured_model = self.config.effective_model(kind);
+        let model_name = if *kind == ProviderKind::CodexLocal && configured_model.is_empty() {
+            "Codex configured default".to_string()
+        } else {
+            configured_model.to_string()
+        };
         let message = Message::assistant(&response).with_model(model_name);
         let _ = event_tx.send(AgentEvent::Done(message.clone()));
 
@@ -1900,27 +2494,9 @@ impl AgentProvider {
     }
 
     fn build_chatgpt_client(&self) -> Result<chatgpt::Client> {
-        let mut builder = chatgpt::Client::builder();
-        if let Some(url) = self.config.effective_base_url(&ProviderKind::ChatGPT) {
-            builder = builder.base_url(url);
-        }
-        let builder =
-            if let Some(api_key) = self.resolve_optional_api_key(&ProviderKind::ChatGPT)? {
-                builder.api_key(api_key)
-            } else {
-                let mut builder = builder.oauth();
-                if let Some(dir) = oauth_token_dir(&ProviderKind::ChatGPT) {
-                    let auth_file = dir.join("auth.json");
-                    if let Err(err) = sync_codex_chatgpt_auth(&auth_file) {
-                        log::warn!("[provider] Failed to sync Codex ChatGPT auth cache: {err}");
-                    }
-                    builder = builder.token_dir(dir);
-                }
-                builder
-            };
-        builder
-            .build()
-            .map_err(|e| anyhow::anyhow!("ChatGPT client error: {e}"))
+        crate::chatgpt_subscription::client(
+            &self.config.providers.get_or_default(&ProviderKind::ChatGPT),
+        )
     }
 
     fn build_github_copilot_client(&self) -> Result<copilot::Client> {
@@ -2174,19 +2750,27 @@ impl AgentProvider {
                 if let Some(temp) = self.config.temperature {
                     builder = builder.temperature(temp);
                 }
+                if *kind == ProviderKind::ChatGPT {
+                    let config = self.config.providers.get_or_default(kind);
+                    if let Some(params) = crate::chatgpt_subscription::request_parameters(
+                        &config,
+                        self.config.effective_model(kind),
+                    )? {
+                        builder = builder.additional_params(params);
+                    }
+                }
                 let agent = builder.build();
                 drive_streaming_completion(&agent, prompt).await
             }};
         }
 
-        async fn drive_streaming_completion<M, P>(
-            agent: &rig::agent::Agent<M, P>,
+        async fn drive_streaming_completion<M>(
+            agent: &rig::agent::Agent<M>,
             prompt: &str,
         ) -> Result<String>
         where
             M: rig::completion::CompletionModel + 'static,
             M::StreamingResponse: rig::completion::GetTokenUsage,
-            P: rig::agent::PromptHook<M> + 'static,
         {
             let mut stream = agent.stream_prompt(prompt.to_owned()).await;
             // Most models emit answers to `content`; some reasoning
@@ -2214,7 +2798,7 @@ impl AgentProvider {
                         _ => {}
                     },
                     Ok(MultiTurnStreamItem::FinalResponse(fin)) => {
-                        let resp = fin.response();
+                        let resp = fin.output.as_str();
                         if !resp.is_empty() {
                             final_response_text = Some(resp.to_string());
                         }
@@ -2251,6 +2835,9 @@ impl AgentProvider {
         match *kind {
             ProviderKind::Anthropic => do_complete!(self.build_anthropic_client()?),
             ProviderKind::OpenAI => do_complete!(self.build_openai_client()?),
+            ProviderKind::CodexLocal => {
+                crate::codex_local::complete(&self.config, prompt, preamble).await
+            }
             ProviderKind::ChatGPT => do_complete!(self.build_chatgpt_client()?),
             ProviderKind::GitHubCopilot => do_complete!(self.build_github_copilot_client()?),
             ProviderKind::OpenAICompatible => {
@@ -2316,44 +2903,11 @@ impl AgentProvider {
             && self
                 .config
                 .effective_base_url(kind)
-                .as_deref()
                 .is_some_and(is_local_openai_compatible_base_url)
     }
 
     fn resolve_configured_api_key(&self, kind: &ProviderKind) -> Result<Option<String>> {
-        let pc = self.config.providers.get(kind);
-
-        // 1. Direct api_key from provider config
-        if let Some(key) = pc
-            .and_then(|p| p.api_key.as_ref())
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            return Ok(Some(key.to_string()));
-        }
-
-        // 2. api_key_env — could be env var name or direct key (legacy compat)
-        if let Some(key_or_env) = pc
-            .and_then(|p| p.api_key_env.as_ref())
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            let is_env_var_name = key_or_env
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit());
-            if is_env_var_name {
-                if let Ok(val) = std::env::var(key_or_env) {
-                    let val = val.trim().to_string();
-                    if !val.is_empty() {
-                        return Ok(Some(val));
-                    }
-                }
-            } else {
-                return Ok(Some(key_or_env.to_string()));
-            }
-        }
-
-        Ok(None)
+        Ok(configured_api_key_value(&self.config, kind))
     }
 }
 
@@ -2461,17 +3015,17 @@ async fn consume_stream<R: Send + 'static>(
                 log::info!(
                     "[agent] Stream: final response ({} chars accumulated, {} chars in FinalResponse)",
                     response_text.len(),
-                    final_resp.response().len(),
+                    final_resp.output.len(),
                 );
                 // Use FinalResponse text if we somehow missed streaming deltas.
                 // FinalResponse contains the last turn's text; response_text has
                 // all turns. Prefer response_text when available.
-                if response_text.is_empty() && !final_resp.response().is_empty() {
+                if response_text.is_empty() && !final_resp.output.is_empty() {
                     let _ = apply_stream_text_chunk(
                         &mut think_parser,
                         &mut response_text,
                         event_tx,
-                        final_resp.response(),
+                        &final_resp.output,
                         !had_reasoning_deltas,
                     );
                 }

@@ -5,6 +5,7 @@
 //! across platforms.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -14,6 +15,11 @@ use super::render::{RendererConfig, ThemeColors};
 use crate::stub::{
     CommandFinishedSignal, CommandRecord, GhosttyConfigPatch, GhosttyScrollbar,
     GhosttySplitDirection, GhosttySurfaceEvent, MouseButton, SurfaceSize, TerminalColors,
+};
+use crate::vt::{VtKeyEvent, VtKeyOutcome};
+use crate::{
+    ClipboardWritePolicy, DesktopNotificationPolicy, clipboard_write_policy,
+    desktop_notification_policy,
 };
 
 fn theme_from_colors(colors: &TerminalColors) -> ThemeColors {
@@ -27,13 +33,19 @@ fn clamp_opacity(v: f32) -> f32 {
 /// One per GPUI window. Holds shared, app-wide terminal config.
 pub struct WindowsGhosttyApp {
     config: Mutex<RendererConfig>,
+    clipboard_write_enabled: AtomicBool,
+    clipboard_write_policy: Arc<ClipboardWritePolicy>,
+    desktop_notification_policy: Arc<DesktopNotificationPolicy>,
+    shell: Option<String>,
 }
 
 impl WindowsGhosttyApp {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         colors: Option<&TerminalColors>,
+        shell: Option<&str>,
         font_family: Option<&str>,
+        font_fallback: Option<&[String]>,
         font_size: Option<f32>,
         background_opacity: Option<f32>,
         _background_blur: Option<bool>,
@@ -43,29 +55,31 @@ impl WindowsGhosttyApp {
         _background_image_position: Option<&str>,
         _background_image_fit: Option<&str>,
         _background_image_repeat: Option<bool>,
+        clipboard_write_enabled: bool,
     ) -> Result<Self, String> {
         let mut config = RendererConfig::default();
         if let Some(family) = font_family {
             config.font_family = family.to_string();
+        }
+        if let Some(fallback) = font_fallback {
+            config.font_fallback = fallback.to_vec();
         }
         if let Some(size) = font_size {
             config.font_size_px = size;
         }
         if let Some(colors) = colors {
             let theme = theme_from_colors(colors);
-            config.clear_color = [
-                colors.background[0] as f32 / 255.0,
-                colors.background[1] as f32 / 255.0,
-                colors.background[2] as f32 / 255.0,
-                1.0,
-            ];
-            config.theme = Some(theme);
+            config.apply_theme(&theme);
         }
         if let Some(op) = background_opacity {
             config.background_opacity = clamp_opacity(op);
         }
         Ok(Self {
             config: Mutex::new(config),
+            clipboard_write_enabled: AtomicBool::new(clipboard_write_enabled),
+            clipboard_write_policy: clipboard_write_policy(clipboard_write_enabled),
+            desktop_notification_policy: desktop_notification_policy(),
+            shell: shell.map(ToOwned::to_owned),
         })
     }
 
@@ -74,6 +88,10 @@ impl WindowsGhosttyApp {
     /// Stub for parity with the macOS `GhosttyApp::wake_generation`.
     pub fn wake_generation(&self) -> u64 {
         0
+    }
+
+    pub fn desktop_notification_policy(&self) -> Arc<DesktopNotificationPolicy> {
+        self.desktop_notification_policy.clone()
     }
 
     pub fn update_colors(&self, _colors: &TerminalColors) -> Result<(), String> {
@@ -85,6 +103,7 @@ impl WindowsGhosttyApp {
         &self,
         colors: &TerminalColors,
         font_family: &str,
+        font_fallback: &[String],
         font_size: f32,
         background_opacity: f32,
         _background_blur: bool,
@@ -98,14 +117,9 @@ impl WindowsGhosttyApp {
         let theme = theme_from_colors(colors);
         let mut config = self.config.lock();
         config.font_family = font_family.to_string();
+        config.font_fallback = font_fallback.to_vec();
         config.font_size_px = font_size;
-        config.clear_color = [
-            colors.background[0] as f32 / 255.0,
-            colors.background[1] as f32 / 255.0,
-            colors.background[2] as f32 / 255.0,
-            1.0,
-        ];
-        config.theme = Some(theme);
+        config.apply_theme(&theme);
         config.background_opacity = clamp_opacity(background_opacity);
         Ok(())
     }
@@ -116,10 +130,32 @@ impl WindowsGhosttyApp {
 
     pub fn set_color_scheme(&self, _dark: bool) {}
 
+    pub fn set_clipboard_write_enabled(&self, enabled: bool) -> Result<(), String> {
+        if !enabled {
+            self.clipboard_write_policy.set_enabled(false);
+        }
+        self.clipboard_write_enabled
+            .store(enabled, Ordering::Release);
+        if enabled {
+            self.clipboard_write_policy.set_enabled(true);
+        }
+        Ok(())
+    }
+
+    pub fn clipboard_write_enabled(&self) -> bool {
+        self.clipboard_write_enabled.load(Ordering::Acquire)
+    }
+
     /// Snapshot the current renderer config — used by `WindowsTerminalView`
     /// when constructing a new `RenderSession`.
     pub fn renderer_config(&self) -> RendererConfig {
         self.config.lock().clone()
+    }
+
+    /// Command used for new ConPTY sessions. An unset value preserves the
+    /// platform auto-detection performed by `default_shell_command`.
+    pub fn shell_command(&self) -> String {
+        super::conpty::shell_command(self.shell.as_deref())
     }
 }
 
@@ -133,6 +169,9 @@ pub struct WindowsGhosttyTerminal {
 }
 
 impl WindowsGhosttyTerminal {
+    pub const SUPPORTS_FOREGROUND_PROCESS_GROUP_ID: bool = false;
+    pub const SUPPORTS_TTY_NAME: bool = false;
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(None)),
@@ -174,12 +213,35 @@ impl WindowsGhosttyTerminal {
     }
 
     pub fn set_content_scale(&self, _scale: f64) {}
-    pub fn set_focus(&self, _focused: bool) {}
-    pub fn set_occlusion(&self, _occluded: bool) {}
+    pub fn set_focus(&self, focused: bool) {
+        if let Some(session) = self.inner.lock().as_ref()
+            && let Err(err) = session.vt().set_focus(focused)
+        {
+            log::warn!("failed to report terminal focus: {err}");
+        }
+    }
+    pub fn set_visible(&self, _visible: bool) {}
     pub fn set_color_scheme(&self, _dark: bool) {}
     pub fn perform_binding_action(&self, _action: &str) -> Result<bool, String> {
         Ok(false)
     }
+
+    pub(crate) fn search_screen(&self) -> Option<Arc<crate::vt::VtScreen>> {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|session| session.vt().clone())
+    }
+
+    pub fn render_hold_deadline(&self) -> Option<std::time::Instant> {
+        self.search_screen()?.render_hold_deadline()
+    }
+
+    pub fn expire_render_hold(&self, deadline: std::time::Instant) -> bool {
+        self.search_screen()
+            .is_some_and(|screen| screen.expire_render_hold(deadline))
+    }
+
     pub fn clear_screen_and_scrollback(&self) -> Result<(), String> {
         if let Some(session) = self.inner.lock().as_ref() {
             session.clear_screen_and_scrollback();
@@ -195,8 +257,9 @@ impl WindowsGhosttyTerminal {
     pub fn update_appearance(
         &self,
         colors: &TerminalColors,
-        _font_family: &str,
-        _font_size: f32,
+        font_family: &str,
+        font_fallback: &[String],
+        font_size: f32,
         background_opacity: f32,
         _background_blur: bool,
         _cursor_style: &str,
@@ -208,23 +271,55 @@ impl WindowsGhosttyTerminal {
     ) -> Result<(), String> {
         if let Some(session) = self.inner.lock().as_ref() {
             let theme = theme_from_colors(colors);
+            // Theme and opacity are independent of font resource creation;
+            // keep them live even if DirectWrite rejects a font update.
             session.set_appearance(Some(&theme), clamp_opacity(background_opacity));
+            session
+                .set_font(font_family, font_fallback, font_size)
+                .map_err(|err| err.to_string())?;
         }
         Ok(())
     }
 
     pub fn write_to_pty(&self, data: &[u8]) {
         if let Some(session) = self.inner.lock().as_ref() {
-            if let Ok(s) = std::str::from_utf8(data) {
-                session.write_input(s);
+            if let Ok(s) = std::str::from_utf8(data)
+                && let Err(err) = session.write_input(s)
+            {
+                log::debug!("windows terminal input write failed: {err:#}");
             }
         }
     }
 
     pub fn send_text(&self, text: &str) {
-        if let Some(session) = self.inner.lock().as_ref() {
-            session.write_input(text);
+        if let Some(session) = self.inner.lock().as_ref()
+            && let Err(err) = session.send_text(text)
+        {
+            log::debug!("windows terminal text write failed: {err:#}");
         }
+    }
+
+    pub fn send_key(&self, event: &VtKeyEvent<'_>) -> Result<VtKeyOutcome, String> {
+        let guard = self.inner.lock();
+        let Some(session) = guard.as_ref() else {
+            return Ok(VtKeyOutcome::default());
+        };
+        session.send_key(event).map_err(|err| err.to_string())
+    }
+
+    pub fn paste_text(
+        &self,
+        text: &str,
+        source: crate::vt::VtPasteSource,
+        confirm_unsafe_paste: bool,
+    ) -> Result<crate::vt::VtPasteResult, String> {
+        let guard = self.inner.lock();
+        let Some(session) = guard.as_ref() else {
+            return Ok(crate::vt::VtPasteResult::Empty);
+        };
+        session
+            .paste_text(text, source, confirm_unsafe_paste)
+            .map_err(|err| err.to_string())
     }
 
     pub fn send_mouse_button(&self, _pressed: bool, _button: MouseButton, _mods: i32) -> bool {
@@ -237,7 +332,42 @@ impl WindowsGhosttyTerminal {
     }
 
     pub fn title(&self) -> Option<String> {
-        None
+        self.inner.lock().as_ref().and_then(RenderSession::title)
+    }
+    pub fn take_bell(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(RenderSession::take_bell)
+    }
+    pub fn progress(&self) -> Option<crate::TerminalProgress> {
+        self.inner.lock().as_ref().and_then(RenderSession::progress)
+    }
+
+    pub fn take_program_events(&self) -> Vec<crate::ProgramStatusEvent> {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(RenderSession::take_program_events)
+            .unwrap_or_default()
+    }
+    pub fn set_clipboard_write_enabled(&self, enabled: bool) -> Result<(), String> {
+        if let Some(session) = self.inner.lock().as_ref() {
+            session.set_clipboard_write_enabled(enabled)?;
+        }
+        Ok(())
+    }
+    pub fn take_clipboard_write(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(RenderSession::take_clipboard_write)
+    }
+    pub fn take_desktop_notification(&self) -> Option<crate::DesktopNotification> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(RenderSession::take_desktop_notification)
     }
     pub fn current_dir(&self) -> Option<String> {
         self.inner
@@ -245,11 +375,30 @@ impl WindowsGhosttyTerminal {
             .as_ref()
             .and_then(RenderSession::current_dir)
     }
+    pub fn foreground_process_group_id(&self) -> Option<u64> {
+        None
+    }
+    pub fn root_identity(&self) -> Option<crate::process::ProcessIdentity> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(RenderSession::root_identity)
+    }
+    pub fn tty_name(&self) -> Option<String> {
+        None
+    }
     pub fn is_alive(&self) -> bool {
         match self.inner.lock().as_ref() {
             Some(session) => session.is_alive(),
             None => true,
         }
+    }
+    pub fn prompt_state(&self) -> crate::TerminalPromptState {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|session| session.vt().prompt_state())
+            .unwrap_or_default()
     }
     pub fn is_busy(&self) -> bool {
         false
@@ -281,6 +430,12 @@ impl WindowsGhosttyTerminal {
     }
     pub fn selection_text(&self) -> Option<String> {
         self.inner.lock().as_ref().and_then(|s| s.selection_text())
+    }
+    pub fn take_selection_text(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(|s| s.take_selection_text())
     }
     pub fn clear_selection(&self) {
         if let Some(session) = self.inner.lock().as_ref() {

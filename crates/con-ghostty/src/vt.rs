@@ -1,42 +1,56 @@
 //! Shared `libghostty-vt` FFI bindings + render-state snapshot.
 //!
 //! Rewritten to match the **actual** upstream API at GHOSTTY_REV
-//! `ca7516bea60190ee2e9a4f9182b61d318d107c6e` — `include/ghostty/vt/*.h`.
+//! `5f5b988c5236facfe8d2439203d9ee9d5b636cf8` — `include/ghostty/vt/*.h`.
 //! Key lifecycle:
 //!
-//! 1. `terminal = ghostty_terminal_new(NULL_alloc, opts)`
+//! 1. `terminal = ghostty_terminal_new(NULL_alloc, cols, rows)`
 //! 2. `state    = ghostty_render_state_new(NULL_alloc)`
 //! 3. `iter     = ghostty_render_state_row_iterator_new(NULL_alloc)`
 //! 4. `cells    = ghostty_render_state_row_cells_new(NULL_alloc)`
 //!
 //! Per-frame:
-//!   - `ghostty_render_state_update(state, terminal)` to refresh
-//!   - `ghostty_render_state_get(state, DATA_ROW_ITERATOR, &iter)` to bind iterator
-//!   - while `row_iterator_next(iter)` is true:
-//!       - `row_get(iter, DIRTY, &dirty)`, skip if false
-//!       - `row_get(iter, CELLS, &cells)` to bind cells iterator to the current row
+//!   - `ghostty_render_state_begin_update(state, terminal)` under the parser lock
+//!   - release the parser lock, then call `ghostty_render_state_end_update(state)`
+//!   - `ghostty_render_state_get_multi(...)` to read state metadata and bind the iterator
+//!   - while `row_iterator_next_dirty(iter, &row)` is true:
+//!       - `row_get(iter, CELLS, &cells)` to bind the dirty row
 //!       - while `row_cells_next(cells)` is true:
-//!           - `row_cells_get(cells, RAW|STYLE|BG|FG, &out)`
+//!           - `row_cells_get_multi(cells, RAW|STYLE|FG|BG, ...)`
+//!   - `acknowledge_snapshot(generation)` cleans damage after renderer acceptance
 //!
 //! All `_next` functions return `bool`. The `_get` family uses an enum
 //! key and writes to a typed `void*` out; key→type contract is per
 //! upstream header comments.
 //!
-//! libghostty-vt is NOT thread-safe; we serialize via a Mutex. The
-//! renderer reads a cloned `ScreenSnapshot` so the parser lock is
-//! released between feeds and frames.
+//! libghostty-vt terminal and render state access are serialized by
+//! separate mutexes. The parser lock is held only through the begin
+//! phase and terminal-owned metadata capture; render extraction and
+//! snapshot cloning proceed without blocking parser feeds.
 
 #![allow(non_camel_case_types, dead_code)]
 
-use std::os::raw::{c_int, c_void};
+use std::collections::HashMap;
+use std::io::Cursor as IoCursor;
+use std::os::raw::{c_char, c_int, c_void};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+pub use crate::cursor::{Cursor, CursorStyle};
+use crate::program_events::{self, ProgramStatusEvent};
 use crate::stub::GhosttyScrollbar;
+use crate::{
+    CLIPBOARD_WRITE_LIMIT_BYTES, ClipboardWritePolicy, DesktopNotification,
+    DesktopNotificationPolicy, TERMINAL_PROGRESS_TIMEOUT, TerminalProgress,
+};
 
+use image::{ImageFormat, ImageReader, Limits};
 use parking_lot::Mutex;
+
+mod search;
+pub use search::SearchProgress;
 
 fn perf_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -58,8 +72,61 @@ pub type GhosttyTerminal = *mut c_void;
 pub type GhosttyRenderState = *mut c_void;
 pub type GhosttyRowIterator = *mut c_void;
 pub type GhosttyRowCells = *mut c_void;
+pub type GhosttyKeyEncoder = *mut c_void;
+pub type GhosttyKeyEvent = *mut c_void;
+pub type GhosttyMouseEncoder = *mut c_void;
+pub type GhosttyMouseEvent = *mut c_void;
+pub type GhosttySelectionGesture = *mut c_void;
+pub type GhosttySelectionGestureEvent = *mut c_void;
+pub type GhosttyKittyGraphics = *mut c_void;
+pub type GhosttyKittyGraphicsImage = *mut c_void;
+pub type GhosttyKittyGraphicsPlacementIterator = *mut c_void;
 pub type GhosttyAllocator = c_void;
 pub type GhosttyResult = c_int;
+
+const GHOSTTY_SUCCESS: GhosttyResult = 0;
+const GHOSTTY_INVALID_VALUE: GhosttyResult = -2;
+const GHOSTTY_OUT_OF_SPACE: GhosttyResult = -3;
+const GHOSTTY_NO_VALUE: GhosttyResult = -4;
+const GHOSTTY_IO_ERROR: GhosttyResult = -5;
+const GHOSTTY_REJECTED: GhosttyResult = -7;
+
+// Match libghostty's conservative embedded-library default. Keeping this
+// explicit makes the PNG decoder's output cap and the terminal's retained
+// image cap one contract instead of allowing a compressed payload to allocate
+// far more memory than the terminal can retain.
+const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 10_000_000;
+const KITTY_PNG_MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const KITTY_PNG_MAX_DIMENSION: u32 = 10_000;
+const KITTY_PNG_DECODER_MAX_ALLOC_BYTES: u64 = 32 * 1024 * 1024;
+const TERMINAL_PASTE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+// libghostty may split one paste into framing and content callbacks. Collect
+// those callbacks before handing them to the bounded host queue so a queue
+// rejection cannot leave a partial bracketed paste in the child process.
+// Protocol framing should be tiny; the second input-sized allowance keeps a
+// malformed upstream expansion bounded without constraining valid text.
+const TERMINAL_PASTE_OUTPUT_LIMIT_BYTES: usize = TERMINAL_PASTE_LIMIT_BYTES * 2;
+// A single tiny image can have an effectively unbounded number of explicit
+// placements upstream. Bound each render snapshot so hostile terminal output
+// cannot force either renderer to allocate and lay out millions of quads in
+// one frame. This is intentionally far above a dense visible terminal grid.
+const KITTY_PLACEMENT_SNAPSHOT_LIMIT: usize = 4_096;
+// Rejected and virtual placements do not consume the render budget, but their
+// iterator entries still cost FFI calls. Keep a separate traversal ceiling so
+// invalid entries cannot turn one snapshot into unbounded parser work.
+const KITTY_PLACEMENT_SCAN_LIMIT: usize = KITTY_PLACEMENT_SNAPSHOT_LIMIT * 4;
+
+const GHOSTTY_MODS_SHIFT: u16 = 1 << 0;
+const GHOSTTY_MODS_CTRL: u16 = 1 << 1;
+const GHOSTTY_MODS_ALT: u16 = 1 << 2;
+const GHOSTTY_MODS_SUPER: u16 = 1 << 3;
+const GHOSTTY_KITTY_KEY_REPORT_EVENTS: u8 = 1 << 1;
+const TEXT_PLAIN_MIME: &[u8] = b"text/plain";
+const METADATA_DIRTY_TITLE: u8 = 1 << 0;
+const METADATA_DIRTY_PWD: u8 = 1 << 1;
+const UNKNOWN_SEQUENCE_LOG_TARGET: &str = "con_ghostty::vt::unknown_sequence";
+const UNKNOWN_SEQUENCE_MAX_BYTES: usize = 256;
+const UNKNOWN_SEQUENCE_LOG_LIMIT: u8 = 16;
 
 // ── Enums (keys) ───────────────────────────────────────────────────────
 //
@@ -78,9 +145,17 @@ pub enum GhosttyTerminalData {
     CursorPendingWrap = 5,
     ActiveScreen = 6,
     CursorVisible = 7,
+    KittyKeyboardFlags = 8,
     Scrollbar = 9,
     Title = 12,
     Pwd = 13,
+    KittyImageStorageLimit = 26,
+    KittyGraphics = 30,
+    Selection = 31,
+    ScrollbackMaxLines = 35,
+    Mode = 37,
+    CursorAtPrompt = 39,
+    ClipboardWriteMaxBytes = 40,
 }
 
 /// `GhosttyTerminalScrollbar` — current viewport position in the full
@@ -147,6 +222,289 @@ pub enum GhosttyTerminalOption {
     ColorCursor = 13,
     /// `GhosttyColorRgb[256]*` — full 256-entry palette.
     ColorPalette = 14,
+    KittyImageStorageLimit = 15,
+    Selection = 21,
+    PwdChanged = 25,
+    ClipboardWrite = 26,
+    ScrollbackMaxLines = 28,
+    DesktopNotification = 29,
+    ProgressReport = 30,
+    Mode = 34,
+    UnknownSequence = 35,
+    UnknownMaxBytes = 36,
+    ClipboardRead = 38,
+    ClipboardWriteMaxBytes = 39,
+    ResizePullScrollback = 40,
+    RenderHold = 41,
+    SemanticPrompt = 42,
+    Reset = 43,
+    ProgramStatus = 46,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttyFormatterFormat {
+    Plain = 0,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttyPointTag {
+    Viewport = 1,
+    Screen = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union GhosttyPointValue {
+    coordinate: GhosttyPointCoordinate,
+    _padding: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GhosttyPoint {
+    tag: GhosttyPointTag,
+    value: GhosttyPointValue,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct GhosttyPointCoordinate {
+    x: u16,
+    y: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GhosttyGridRef {
+    size: usize,
+    node: *mut c_void,
+    x: u16,
+    y: u16,
+}
+
+impl Default for GhosttyGridRef {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            node: std::ptr::null_mut(),
+            x: 0,
+            y: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GhosttySelection {
+    size: usize,
+    start: GhosttyGridRef,
+    end: GhosttyGridRef,
+    rectangle: bool,
+}
+
+impl Default for GhosttySelection {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            start: GhosttyGridRef::default(),
+            end: GhosttyGridRef::default(),
+            rectangle: false,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GhosttyTerminalSelectionFormatOptions {
+    size: usize,
+    emit: GhosttyFormatterFormat,
+    unwrap: bool,
+    trim: bool,
+    selection: *const GhosttySelection,
+}
+
+impl Default for GhosttyTerminalSelectionFormatOptions {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            emit: GhosttyFormatterFormat::Plain,
+            unwrap: true,
+            trim: true,
+            selection: std::ptr::null(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttySelectionGestureData {
+    ClickCount = 0,
+    Autoscroll = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttySelectionGestureEventType {
+    Press = 0,
+    Release = 1,
+    Drag = 2,
+    AutoscrollTick = 3,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttySelectionGestureEventOption {
+    Ref = 0,
+    Position = 1,
+    RepeatDistance = 2,
+    TimeNs = 3,
+    RepeatIntervalNs = 4,
+    Geometry = 8,
+    Viewport = 9,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GhosttySurfacePosition {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GhosttySelectionGestureGeometry {
+    columns: u32,
+    cell_width: u32,
+    padding_left: u32,
+    screen_height: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttySelectionGestureAutoscroll {
+    None = 0,
+    Up = 1,
+    Down = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttyMouseAction {
+    Press = 0,
+    Release = 1,
+    Motion = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttyMouseButton {
+    Left = 1,
+    Right = 2,
+    Middle = 3,
+    Four = 4,
+    Five = 5,
+    Six = 6,
+    Seven = 7,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttyMouseEncoderOption {
+    Size = 2,
+    AnyButtonPressed = 3,
+    TrackLastCell = 4,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GhosttyMousePosition {
+    x: f32,
+    y: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GhosttyMouseEncoderSize {
+    size: usize,
+    screen_width: u32,
+    screen_height: u32,
+    cell_width: u32,
+    cell_height: u32,
+    padding_top: u32,
+    padding_bottom: u32,
+    padding_right: u32,
+    padding_left: u32,
+}
+
+impl GhosttyMouseEncoderSize {
+    fn new(screen_width: u32, screen_height: u32, cell_width: u32, cell_height: u32) -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            screen_width: screen_width.max(1),
+            screen_height: screen_height.max(1),
+            cell_width: cell_width.max(1),
+            cell_height: cell_height.max(1),
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        }
+    }
+}
+
+/// `GHOSTTY_SYS_OPT_*` keys for process-global optional services.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+enum GhosttySysOption {
+    DecodePng = 1,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+enum GhosttyKittyGraphicsData {
+    PlacementIterator = 1,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+enum GhosttyKittyGraphicsPlacementData {
+    ImageId = 1,
+    PlacementId = 2,
+    IsVirtual = 3,
+    XOffset = 4,
+    YOffset = 5,
+    Z = 12,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+enum GhosttyKittyGraphicsImageData {
+    Width = 3,
+    Height = 4,
+    Format = 5,
+    Compression = 6,
+    DataPtr = 7,
+    DataLen = 8,
+    Generation = 9,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttyKittyImageFormat {
+    Rgb = 0,
+    Rgba = 1,
+    Png = 2,
+    GrayAlpha = 3,
+    Gray = 4,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhosttyKittyImageCompression {
+    None = 0,
+    ZlibDeflate = 1,
 }
 
 /// `GHOSTTY_RENDER_STATE_DATA_*` keys for `ghostty_render_state_get`.
@@ -172,6 +530,8 @@ pub enum GhosttyRenderStateData {
     CursorViewportX = 15,
     CursorViewportY = 16,
     CursorViewportWideTail = 17,
+    Cursor = 18,
+    Colors = 19,
 }
 
 #[repr(C)]
@@ -191,6 +551,8 @@ pub enum GhosttyRenderStateRowData {
     Dirty = 1,
     Raw = 2,
     Cells = 3,
+    Selection = 4,
+    CellsRaw = 5,
 }
 
 /// `GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_*` keys.
@@ -204,6 +566,9 @@ pub enum GhosttyRenderStateRowCellsData {
     GraphemesBuf = 4,
     BgColor = 5,
     FgColor = 6,
+    Selected = 7,
+    HasStyling = 8,
+    GraphemesUtf8 = 9,
 }
 
 /// `GHOSTTY_CELL_DATA_*` keys for `ghostty_cell_get`. Integer values
@@ -236,6 +601,16 @@ pub type GhosttyCell = u64;
 /// (1 = ANSI, 0 = DEC private). Constructed via [`ghostty_mode`].
 pub type GhosttyMode = u16;
 
+/// Frozen-layout payload used with terminal mode get/set operations.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyTerminalModeConfig {
+    pub mode: GhosttyMode,
+    pub value: bool,
+}
+
+const _: [(); 4] = [(); std::mem::size_of::<GhosttyTerminalModeConfig>()];
+
 /// Pack a mode value + ANSI flag into a [`GhosttyMode`]. Mirrors the
 /// inline `ghostty_mode_new` helper the C header ships.
 #[inline]
@@ -248,6 +623,7 @@ pub const fn ghostty_mode(value: u16, ansi: bool) -> GhosttyMode {
 pub const MODE_NORMAL_MOUSE: GhosttyMode = ghostty_mode(1000, false);
 pub const MODE_BUTTON_MOUSE: GhosttyMode = ghostty_mode(1002, false);
 pub const MODE_ANY_MOUSE: GhosttyMode = ghostty_mode(1003, false);
+const MODE_FOCUS_EVENT: GhosttyMode = ghostty_mode(1004, false);
 pub const MODE_X10_MOUSE: GhosttyMode = ghostty_mode(9, false);
 pub const MODE_SGR_MOUSE: GhosttyMode = ghostty_mode(1006, false);
 pub const MODE_ALT_SCROLL: GhosttyMode = ghostty_mode(1007, false);
@@ -269,14 +645,6 @@ const GHOSTTY_DA_FEATURE_RECTANGULAR_EDITING: u16 = 28;
 const GHOSTTY_DA_FEATURE_CLIPBOARD: u16 = 52;
 const GHOSTTY_DA_DEVICE_TYPE_VT220: u16 = 1;
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct GhosttyTerminalOptions {
-    pub cols: u16,
-    pub rows: u16,
-    pub max_scrollback: usize,
-}
-
 /// `GhosttyColorRgb` — R,G,B bytes per upstream `color.h`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -287,18 +655,319 @@ pub struct GhosttyColorRgb {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyRenderStateCursor {
+    pub size: usize,
+    pub viewport_has_value: bool,
+    pub viewport_x: u16,
+    pub viewport_y: u16,
+    pub wide_tail: bool,
+    pub visible: bool,
+    pub blinking: bool,
+    pub password_input: bool,
+    pub visual_style: c_int,
+}
+
+impl Default for GhosttyRenderStateCursor {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            viewport_has_value: false,
+            viewport_x: 0,
+            viewport_y: 0,
+            wide_tail: false,
+            visible: false,
+            blinking: false,
+            password_input: false,
+            visual_style: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyRenderStateRowSelection {
+    pub size: usize,
+    pub start_x: u16,
+    pub end_x: u16,
+}
+
+impl Default for GhosttyRenderStateRowSelection {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            start_x: 0,
+            end_x: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyRenderStateColors {
+    pub size: usize,
+    pub background: GhosttyColorRgb,
+    pub foreground: GhosttyColorRgb,
+    pub cursor: GhosttyColorRgb,
+    pub cursor_has_value: bool,
+    pub palette: [GhosttyColorRgb; 256],
+}
+
+impl Default for GhosttyRenderStateColors {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            background: GhosttyColorRgb::default(),
+            foreground: GhosttyColorRgb::default(),
+            cursor: GhosttyColorRgb::default(),
+            cursor_has_value: false,
+            palette: [GhosttyColorRgb::default(); 256],
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GhosttyString {
     pub ptr: *const u8,
     pub len: usize,
 }
 
-fn ghostty_string_from_bytes(bytes: &[u8]) -> GhosttyString {
-    GhosttyString {
-        ptr: bytes.as_ptr(),
-        len: bytes.len(),
-    }
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyTerminalDesktopNotification {
+    pub size: usize,
+    pub title: GhosttyString,
+    pub body: GhosttyString,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyTerminalProgressReport {
+    pub size: usize,
+    pub state: i32,
+    pub progress: i8,
+}
+
+/// OSC 7501 report. Strings are borrowed for the callback only.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyTerminalProgramStatus {
+    pub size: usize,
+    pub state: i32,
+    pub kind: i32,
+    pub progress: i8,
+    pub id: GhosttyString,
+    pub app: GhosttyString,
+    pub title: GhosttyString,
+    pub message: GhosttyString,
+}
+
+/// OSC 133 event. Only `kind == 1` (prompt start) affects program status.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyTerminalSemanticPrompt {
+    pub size: usize,
+    pub kind: i32,
+    pub prompt_kind: i32,
+    pub has_exit_code: bool,
+    pub exit_code: i32,
+    pub command: GhosttyString,
+    pub error: GhosttyString,
+}
+
+const _: [(); 88] = [(); std::mem::size_of::<GhosttyTerminalProgramStatus>()];
+const _: [(); 56] = [(); std::mem::size_of::<GhosttyTerminalSemanticPrompt>()];
+
+const GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_APC: i32 = 0;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyTerminalUnknownStringSequence {
+    pub truncated: bool,
+    pub content: GhosttyString,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union GhosttyTerminalUnknownSequenceValue {
+    pub apc: GhosttyTerminalUnknownStringSequence,
+    pub _padding: [u64; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyTerminalUnknownSequence {
+    pub tag: i32,
+    pub value: GhosttyTerminalUnknownSequenceValue,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyWriter {
+    pub write: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool>,
+    pub userdata: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyMimeReader {
+    pub read: Option<unsafe extern "C" fn(*mut c_void, GhosttyString, GhosttyWriter) -> bool>,
+    pub userdata: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttyClipboardLocation {
+    Standard = 0,
+    Selection = 1,
+    Primary = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttyPasteSource {
+    Clipboard = 0,
+    Text = 1,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyPaste {
+    pub size: usize,
+    pub location: GhosttyClipboardLocation,
+    pub source: GhosttyPasteSource,
+    pub mimes: *const GhosttyString,
+    pub mimes_len: usize,
+    pub reader: GhosttyMimeReader,
+    pub allow_unsafe: bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyClipboardContent {
+    pub mime: GhosttyString,
+    pub data: GhosttyString,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttyClipboardWriteResult {
+    Success = 0,
+    Denied = 1,
+    Unsupported = 2,
+    Busy = 3,
+    InvalidData = 4,
+    IoError = 5,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct GhosttyClipboardWriteReply {
+    pub size: usize,
+    pub result: GhosttyClipboardWriteResult,
+    pub remember: bool,
+}
+
+#[repr(C)]
+pub struct GhosttyClipboardWrite {
+    pub size: usize,
+    pub location: GhosttyClipboardLocation,
+    pub contents: *const GhosttyClipboardContent,
+    pub contents_len: usize,
+    pub name: GhosttyString,
+    pub granted: bool,
+    pub can_remember: bool,
+    pub ctx: *const c_void,
+    pub reply: Option<
+        unsafe extern "C" fn(*const GhosttyClipboardWrite, *const GhosttyClipboardWriteReply),
+    >,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhosttyClipboardReadResult {
+    Success = 0,
+    Denied = 1,
+    Unsupported = 2,
+    Busy = 3,
+    IoError = 4,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GhosttyClipboardReadReply {
+    pub size: usize,
+    pub result: GhosttyClipboardReadResult,
+    pub contents: *const GhosttyClipboardContent,
+    pub contents_len: usize,
+    pub available: *const GhosttyString,
+    pub available_len: usize,
+    pub remember: bool,
+}
+
+#[repr(C)]
+pub struct GhosttyClipboardRead {
+    pub size: usize,
+    pub location: GhosttyClipboardLocation,
+    pub mimes: *const GhosttyString,
+    pub mimes_len: usize,
+    pub list: bool,
+    pub name: GhosttyString,
+    pub granted: bool,
+    pub can_remember: bool,
+    pub ctx: *const c_void,
+    pub reply:
+        Option<unsafe extern "C" fn(*const GhosttyClipboardRead, *const GhosttyClipboardReadReply)>,
+}
+
+/// RGBA buffer returned by `GhosttySysDecodePngFn`. The pixel allocation is
+/// transferred to libghostty and must come from the allocator supplied to the
+/// callback, which is not necessarily Rust's global allocator on Windows.
+#[repr(C)]
+struct GhosttySysImage {
+    width: u32,
+    height: u32,
+    data: *mut u8,
+    data_len: usize,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct GhosttyKittyGraphicsPlacementRenderInfo {
+    size: usize,
+    pixel_width: u32,
+    pixel_height: u32,
+    grid_cols: u32,
+    grid_rows: u32,
+    viewport_col: i32,
+    viewport_row: i32,
+    viewport_visible: bool,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+}
+
+type GhosttySysDecodePngFn = unsafe extern "C" fn(
+    userdata: *mut c_void,
+    allocator: *const GhosttyAllocator,
+    data: *const u8,
+    data_len: usize,
+    out: *mut GhosttySysImage,
+) -> bool;
+
+const _: [(); 16] = [(); std::mem::size_of::<GhosttyWriter>()];
+const _: [(); 16] = [(); std::mem::size_of::<GhosttyMimeReader>()];
+const _: [(); 56] = [(); std::mem::size_of::<GhosttyPaste>()];
+const _: [(); 32] = [(); std::mem::size_of::<GhosttyClipboardContent>()];
+const _: [(); 16] = [(); std::mem::size_of::<GhosttyClipboardWriteReply>()];
+const _: [(); 72] = [(); std::mem::size_of::<GhosttyClipboardWrite>()];
+const _: [(); 56] = [(); std::mem::size_of::<GhosttyClipboardReadReply>()];
+const _: [(); 80] = [(); std::mem::size_of::<GhosttyClipboardRead>()];
+const _: [(); 40] = [(); std::mem::size_of::<GhosttyTerminalDesktopNotification>()];
+const _: [(); 24] = [(); std::mem::size_of::<GhosttySysImage>()];
+const _: [(); 56] = [(); std::mem::size_of::<GhosttyKittyGraphicsPlacementRenderInfo>()];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,15 +1094,33 @@ pub const ATTR_ITALIC: u8 = 1 << 1;
 pub const ATTR_UNDERLINE: u8 = 1 << 2;
 pub const ATTR_STRIKE: u8 = 1 << 3;
 pub const ATTR_INVERSE: u8 = 1 << 4;
+pub const ATTR_INVISIBLE: u8 = 1 << 5;
 
 // ── Raw FFI ────────────────────────────────────────────────────────────
 
 unsafe extern "C" {
+    // ABI manifest (`types.h`).
+    pub fn ghostty_type_json() -> *const c_char;
+
+    // Focus (`focus.h`): gained = 0, lost = 1; both encode to three bytes.
+    fn ghostty_focus_encode(
+        event: c_int,
+        buf: *mut c_char,
+        buf_len: usize,
+        out_written: *mut usize,
+    ) -> GhosttyResult;
+
+    // Allocator + process-global optional services (`allocator.h`, `sys.h`).
+    fn ghostty_alloc(allocator: *const GhosttyAllocator, len: usize) -> *mut u8;
+    fn ghostty_free(allocator: *const GhosttyAllocator, ptr: *mut u8, len: usize);
+    fn ghostty_sys_set(option: GhosttySysOption, value: *const c_void) -> GhosttyResult;
+
     // Terminal (`terminal.h`)
     pub fn ghostty_terminal_new(
         allocator: *const GhosttyAllocator,
         out_terminal: *mut GhosttyTerminal,
-        options: GhosttyTerminalOptions,
+        cols: u16,
+        rows: u16,
     ) -> GhosttyResult;
     pub fn ghostty_terminal_free(terminal: GhosttyTerminal);
     pub fn ghostty_terminal_resize(
@@ -465,13 +1152,180 @@ unsafe extern "C" {
         key: GhosttyTerminalData,
         out: *mut c_void,
     ) -> GhosttyResult;
-
-    /// Query whether a terminal mode is currently set. `out_value` is a
-    /// `bool` (1 byte). Returns `GHOSTTY_SUCCESS` on success.
-    pub fn ghostty_terminal_mode_get(
+    fn ghostty_terminal_grid_ref(
         terminal: GhosttyTerminal,
-        mode: GhosttyMode,
-        out_value: *mut bool,
+        point: GhosttyPoint,
+        out_ref: *mut GhosttyGridRef,
+    ) -> GhosttyResult;
+    fn ghostty_grid_ref_hyperlink_uri(
+        grid_ref: *const GhosttyGridRef,
+        buf: *mut u8,
+        buf_len: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+    pub fn ghostty_terminal_paste(
+        terminal: GhosttyTerminal,
+        paste: *const GhosttyPaste,
+        out_written: *mut bool,
+    ) -> GhosttyResult;
+
+    // Selection gesture (`selection.h`). Handles and reusable events live
+    // under the same mutex as the terminal because the gesture owns tracked
+    // grid references into that terminal.
+    fn ghostty_selection_gesture_new(
+        allocator: *const GhosttyAllocator,
+        out_gesture: *mut GhosttySelectionGesture,
+    ) -> GhosttyResult;
+    fn ghostty_selection_gesture_free(gesture: GhosttySelectionGesture, terminal: GhosttyTerminal);
+    fn ghostty_selection_gesture_reset(gesture: GhosttySelectionGesture, terminal: GhosttyTerminal);
+    fn ghostty_selection_gesture_get(
+        gesture: GhosttySelectionGesture,
+        terminal: GhosttyTerminal,
+        data: GhosttySelectionGestureData,
+        value: *mut c_void,
+    ) -> GhosttyResult;
+    fn ghostty_selection_gesture_event_new(
+        allocator: *const GhosttyAllocator,
+        out_event: *mut GhosttySelectionGestureEvent,
+        event_type: GhosttySelectionGestureEventType,
+    ) -> GhosttyResult;
+    fn ghostty_selection_gesture_event_free(event: GhosttySelectionGestureEvent);
+    fn ghostty_selection_gesture_event_set(
+        event: GhosttySelectionGestureEvent,
+        option: GhosttySelectionGestureEventOption,
+        value: *const c_void,
+    ) -> GhosttyResult;
+    fn ghostty_selection_gesture_event(
+        gesture: GhosttySelectionGesture,
+        terminal: GhosttyTerminal,
+        event: GhosttySelectionGestureEvent,
+        out_selection: *mut GhosttySelection,
+    ) -> GhosttyResult;
+    fn ghostty_terminal_selection_equal(
+        terminal: GhosttyTerminal,
+        a: *const GhosttySelection,
+        b: *const GhosttySelection,
+        out_equal: *mut bool,
+    ) -> GhosttyResult;
+    fn ghostty_terminal_selection_format_alloc(
+        terminal: GhosttyTerminal,
+        allocator: *const GhosttyAllocator,
+        options: GhosttyTerminalSelectionFormatOptions,
+        out_ptr: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+
+    // Key encoder (`key/{encoder,event}.h`). The encoder and reusable
+    // event live under `VtInner`'s mutex with the terminal whose mode
+    // state they snapshot.
+    pub fn ghostty_key_encoder_new(
+        allocator: *const GhosttyAllocator,
+        out_encoder: *mut GhosttyKeyEncoder,
+    ) -> GhosttyResult;
+    pub fn ghostty_key_encoder_free(encoder: GhosttyKeyEncoder);
+    pub fn ghostty_key_encoder_setopt_from_terminal(
+        encoder: GhosttyKeyEncoder,
+        terminal: GhosttyTerminal,
+    );
+    pub fn ghostty_key_encoder_encode(
+        encoder: GhosttyKeyEncoder,
+        event: GhosttyKeyEvent,
+        out_buf: *mut c_char,
+        out_buf_size: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+    pub fn ghostty_key_event_new(
+        allocator: *const GhosttyAllocator,
+        out_event: *mut GhosttyKeyEvent,
+    ) -> GhosttyResult;
+    pub fn ghostty_key_event_free(event: GhosttyKeyEvent);
+    pub fn ghostty_key_event_set_action(event: GhosttyKeyEvent, action: c_int);
+    pub fn ghostty_key_event_set_key(event: GhosttyKeyEvent, key: c_int);
+    pub fn ghostty_key_event_set_mods(event: GhosttyKeyEvent, mods: u16);
+    pub fn ghostty_key_event_set_consumed_mods(event: GhosttyKeyEvent, mods: u16);
+    pub fn ghostty_key_event_set_composing(event: GhosttyKeyEvent, composing: bool);
+    pub fn ghostty_key_event_set_utf8(event: GhosttyKeyEvent, utf8: *const c_char, len: usize);
+    pub fn ghostty_key_event_set_unshifted_codepoint(event: GhosttyKeyEvent, codepoint: u32);
+
+    // Mouse input (`mouse/{encoder,event}.h`). The encoder and reusable event
+    // share `VtInner`'s mutex with the terminal mode state they encode against.
+    fn ghostty_mouse_encoder_new(
+        allocator: *const GhosttyAllocator,
+        out_encoder: *mut GhosttyMouseEncoder,
+    ) -> GhosttyResult;
+    fn ghostty_mouse_encoder_free(encoder: GhosttyMouseEncoder);
+    fn ghostty_mouse_encoder_setopt(
+        encoder: GhosttyMouseEncoder,
+        option: GhosttyMouseEncoderOption,
+        value: *const c_void,
+    );
+    fn ghostty_mouse_encoder_setopt_from_terminal(
+        encoder: GhosttyMouseEncoder,
+        terminal: GhosttyTerminal,
+    );
+    fn ghostty_mouse_encoder_encode(
+        encoder: GhosttyMouseEncoder,
+        event: GhosttyMouseEvent,
+        out_buf: *mut c_char,
+        out_buf_size: usize,
+        out_len: *mut usize,
+    ) -> GhosttyResult;
+    fn ghostty_mouse_event_new(
+        allocator: *const GhosttyAllocator,
+        out_event: *mut GhosttyMouseEvent,
+    ) -> GhosttyResult;
+    fn ghostty_mouse_event_free(event: GhosttyMouseEvent);
+    fn ghostty_mouse_event_set_action(event: GhosttyMouseEvent, action: GhosttyMouseAction);
+    fn ghostty_mouse_event_set_button(event: GhosttyMouseEvent, button: GhosttyMouseButton);
+    fn ghostty_mouse_event_clear_button(event: GhosttyMouseEvent);
+    fn ghostty_mouse_event_set_mods(event: GhosttyMouseEvent, mods: u16);
+    fn ghostty_mouse_event_set_position(event: GhosttyMouseEvent, position: GhosttyMousePosition);
+
+    // Kitty graphics storage (`kitty_graphics.h`). Handles are borrowed from
+    // the terminal and remain valid only while its mutex is held.
+    fn ghostty_kitty_graphics_get(
+        graphics: GhosttyKittyGraphics,
+        data: GhosttyKittyGraphicsData,
+        out: *mut c_void,
+    ) -> GhosttyResult;
+    fn ghostty_kitty_graphics_image(
+        graphics: GhosttyKittyGraphics,
+        image_id: u32,
+    ) -> GhosttyKittyGraphicsImage;
+    fn ghostty_kitty_graphics_image_get(
+        image: GhosttyKittyGraphicsImage,
+        data: GhosttyKittyGraphicsImageData,
+        out: *mut c_void,
+    ) -> GhosttyResult;
+    fn ghostty_kitty_graphics_image_get_multi(
+        image: GhosttyKittyGraphicsImage,
+        count: usize,
+        keys: *const GhosttyKittyGraphicsImageData,
+        values: *mut *mut c_void,
+        out_written: *mut usize,
+    ) -> GhosttyResult;
+    fn ghostty_kitty_graphics_placement_iterator_new(
+        allocator: *const GhosttyAllocator,
+        out_iterator: *mut GhosttyKittyGraphicsPlacementIterator,
+    ) -> GhosttyResult;
+    fn ghostty_kitty_graphics_placement_iterator_free(
+        iterator: GhosttyKittyGraphicsPlacementIterator,
+    );
+    fn ghostty_kitty_graphics_placement_next(
+        iterator: GhosttyKittyGraphicsPlacementIterator,
+    ) -> bool;
+    fn ghostty_kitty_graphics_placement_get_multi(
+        iterator: GhosttyKittyGraphicsPlacementIterator,
+        count: usize,
+        keys: *const GhosttyKittyGraphicsPlacementData,
+        values: *mut *mut c_void,
+        out_written: *mut usize,
+    ) -> GhosttyResult;
+    fn ghostty_kitty_graphics_placement_render_info(
+        iterator: GhosttyKittyGraphicsPlacementIterator,
+        image: GhosttyKittyGraphicsImage,
+        terminal: GhosttyTerminal,
+        out_info: *mut GhosttyKittyGraphicsPlacementRenderInfo,
     ) -> GhosttyResult;
 
     // Render state (`render.h`)
@@ -484,10 +1338,23 @@ unsafe extern "C" {
         state: GhosttyRenderState,
         terminal: GhosttyTerminal,
     ) -> GhosttyResult;
+    pub fn ghostty_render_state_begin_update(
+        state: GhosttyRenderState,
+        terminal: GhosttyTerminal,
+    ) -> GhosttyResult;
+    pub fn ghostty_render_state_end_update(state: GhosttyRenderState) -> GhosttyResult;
+    pub fn ghostty_render_state_clean(state: GhosttyRenderState) -> GhosttyResult;
     pub fn ghostty_render_state_get(
         state: GhosttyRenderState,
         key: GhosttyRenderStateData,
         out: *mut c_void,
+    ) -> GhosttyResult;
+    pub fn ghostty_render_state_get_multi(
+        state: GhosttyRenderState,
+        count: usize,
+        keys: *const GhosttyRenderStateData,
+        values: *mut *mut c_void,
+        out_written: *mut usize,
     ) -> GhosttyResult;
 
     pub fn ghostty_render_state_row_iterator_new(
@@ -498,10 +1365,21 @@ unsafe extern "C" {
     /// Returns `bool` per upstream signature. Rust `bool` is 1 byte —
     /// matches MSVC/gcc/clang C99 `_Bool` layout.
     pub fn ghostty_render_state_row_iterator_next(iter: GhosttyRowIterator) -> bool;
+    pub fn ghostty_render_state_row_iterator_next_dirty(
+        iter: GhosttyRowIterator,
+        out_y: *mut u16,
+    ) -> bool;
     pub fn ghostty_render_state_row_get(
         iter: GhosttyRowIterator,
         key: GhosttyRenderStateRowData,
         out: *mut c_void,
+    ) -> GhosttyResult;
+    pub fn ghostty_render_state_row_get_multi(
+        iter: GhosttyRowIterator,
+        count: usize,
+        keys: *const GhosttyRenderStateRowData,
+        values: *mut *mut c_void,
+        out_written: *mut usize,
     ) -> GhosttyResult;
 
     pub fn ghostty_render_state_row_cells_new(
@@ -515,6 +1393,13 @@ unsafe extern "C" {
         key: GhosttyRenderStateRowCellsData,
         out: *mut c_void,
     ) -> GhosttyResult;
+    pub fn ghostty_render_state_row_cells_get_multi(
+        cells: GhosttyRowCells,
+        count: usize,
+        keys: *const GhosttyRenderStateRowCellsData,
+        values: *mut *mut c_void,
+        out_written: *mut usize,
+    ) -> GhosttyResult;
 
     // Cell accessor (`screen.h`). Decodes fields out of the opaque
     // `GhosttyCell` u64 we get from row_cells RAW.
@@ -523,6 +1408,102 @@ unsafe extern "C" {
         key: GhosttyCellData,
         out: *mut c_void,
     ) -> GhosttyResult;
+    pub fn ghostty_cell_get_multi(
+        cell: GhosttyCell,
+        count: usize,
+        keys: *const GhosttyCellData,
+        values: *mut *mut c_void,
+        out_written: *mut usize,
+    ) -> GhosttyResult;
+}
+
+fn decode_png_rgba(data: &[u8]) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+    if data.is_empty() || data.len() > KITTY_PNG_MAX_INPUT_BYTES {
+        anyhow::bail!("PNG input exceeds the Kitty image limit");
+    }
+
+    let mut reader = ImageReader::with_format(IoCursor::new(data), ImageFormat::Png);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(KITTY_PNG_MAX_DIMENSION);
+    limits.max_image_height = Some(KITTY_PNG_MAX_DIMENSION);
+    limits.max_alloc = Some(KITTY_PNG_DECODER_MAX_ALLOC_BYTES);
+    reader.limits(limits);
+    let decoded = reader.decode()?;
+    let width = decoded.width();
+    let height = decoded.height();
+    let rgba_len = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("PNG dimensions overflow the host address space"))?;
+    if rgba_len > KITTY_IMAGE_STORAGE_LIMIT_BYTES as usize {
+        anyhow::bail!("decoded PNG exceeds the Kitty image storage limit");
+    }
+
+    let rgba = decoded.into_rgba8().into_raw();
+    if rgba.len() != rgba_len {
+        anyhow::bail!("PNG decoder returned an inconsistent pixel buffer");
+    }
+    Ok((width, height, rgba))
+}
+
+unsafe extern "C" fn decode_png_callback(
+    _userdata: *mut c_void,
+    allocator: *const GhosttyAllocator,
+    data: *const u8,
+    data_len: usize,
+    out: *mut GhosttySysImage,
+) -> bool {
+    if data.is_null() || out.is_null() {
+        return false;
+    }
+
+    // No Rust panic may cross the C ABI boundary. Malformed or over-limit
+    // terminal input is a normal protocol rejection, so all failures collapse
+    // to false and libghostty emits the protocol-level error response.
+    let decoded = std::panic::catch_unwind(|| {
+        let bytes = unsafe { std::slice::from_raw_parts(data, data_len) };
+        decode_png_rgba(bytes)
+    });
+    let Ok(Ok((width, height, rgba))) = decoded else {
+        return false;
+    };
+
+    let allocation = unsafe { ghostty_alloc(allocator, rgba.len()) };
+    if allocation.is_null() {
+        return false;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), allocation, rgba.len()) };
+    unsafe {
+        out.write(GhosttySysImage {
+            width,
+            height,
+            data: allocation,
+            data_len: rgba.len(),
+        });
+    }
+    true
+}
+
+fn install_ghostty_sys_services() -> anyhow::Result<()> {
+    static RESULT: OnceLock<GhosttyResult> = OnceLock::new();
+    let rc = *RESULT.get_or_init(|| {
+        let decoder: GhosttySysDecodePngFn = decode_png_callback;
+        unsafe {
+            ghostty_sys_set(
+                GhosttySysOption::DecodePng,
+                decoder as *const () as *const c_void,
+            )
+        }
+    });
+    if rc != GHOSTTY_SUCCESS {
+        anyhow::bail!("ghostty_sys_set(DECODE_PNG) failed: rc={rc}");
+    }
+    Ok(())
 }
 
 // ── Theme ──────────────────────────────────────────────────────────────
@@ -618,23 +1599,139 @@ unsafe fn apply_theme_to_terminal(terminal: GhosttyTerminal, theme: &ThemeColors
 
 // ── Snapshot (renderer's view) ─────────────────────────────────────────
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CellWidth {
+    #[default]
+    Narrow,
+    Wide,
+    SpacerTail,
+    SpacerHead,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cell {
     pub codepoint: u32,
+    /// Full cluster, including the base scalar. Single-scalar cells allocate nothing.
+    pub grapheme: Option<Arc<str>>,
+    pub width: CellWidth,
     /// Foreground RGBA (0xRRGGBBAA).
     pub fg: u32,
     /// Background RGBA.
     pub bg: u32,
     pub attrs: u8,
-    pub _pad: [u8; 3],
+}
+
+impl Cell {
+    /// Text for shaping and extraction. Wide tails contribute no extra space.
+    pub fn text<'a>(&'a self, scalar: &'a mut [u8; 4]) -> &'a str {
+        if self.width == CellWidth::SpacerTail {
+            return "";
+        }
+        if let Some(text) = &self.grapheme {
+            return text;
+        }
+        if self.codepoint == 0 {
+            return if self.width == CellWidth::Wide {
+                "  "
+            } else {
+                " "
+            };
+        }
+        char::from_u32(self.codepoint)
+            .unwrap_or('\u{FFFD}')
+            .encode_utf8(scalar)
+    }
+
+    /// Hide concealed foreground content only at the paint boundary. Keep
+    /// snapshot text intact for copying, searching, and transcript extraction.
+    #[inline]
+    pub fn for_render(&self) -> Self {
+        let mut cell = self.clone();
+        if self.attrs & ATTR_INVISIBLE != 0 {
+            cell.codepoint = 0;
+            cell.grapheme = None;
+            // Like Ghostty/xterm, conceal decorations as well as the glyph.
+            // Preserve inverse and colors for backgrounds, selection, and cursors.
+            cell.attrs &= !(ATTR_UNDERLINE | ATTR_STRIKE);
+        }
+        cell
+    }
+}
+
+/// Pointer location for a selection gesture. Grid coordinates identify the
+/// viewport cell while surface coordinates preserve within-cell thresholds and
+/// allow drag autoscroll to detect positions outside the viewport.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SelectionPoint {
+    pub col: u16,
+    pub row: u16,
+    pub surface_x_px: f64,
+    pub surface_y_px: f64,
+}
+
+/// Physical geometry used by Ghostty's selection drag state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionGeometry {
+    pub columns: u32,
+    pub cell_width_px: u32,
+    pub padding_left_px: u32,
+    pub screen_height_px: u32,
+}
+
+impl SelectionGeometry {
+    fn to_ffi(self) -> anyhow::Result<GhosttySelectionGestureGeometry> {
+        if self.columns == 0 || self.cell_width_px == 0 || self.screen_height_px == 0 {
+            anyhow::bail!("selection geometry dimensions must be non-zero");
+        }
+        Ok(GhosttySelectionGestureGeometry {
+            columns: self.columns,
+            cell_width: self.cell_width_px,
+            padding_left: self.padding_left_px,
+            screen_height: self.screen_height_px,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Cursor {
-    pub col: u16,
-    pub row: u16,
-    pub visible: bool,
+pub enum SelectionAutoscroll {
+    #[default]
+    None,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SelectionAutoscrollUpdate {
+    pub direction: SelectionAutoscroll,
+    pub changed: bool,
+}
+
+#[derive(Debug)]
+pub struct KittyImage {
+    pub id: u32,
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    /// Straight-alpha RGBA8 pixels, normalized once when the upstream image
+    /// generation changes and shared by every placement and renderer frame.
+    pub rgba: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KittyPlacement {
+    pub image: Arc<KittyImage>,
+    pub placement_id: u32,
+    pub z: i32,
+    pub viewport_col: i32,
+    pub viewport_row: i32,
+    pub cell_x_offset: u32,
+    pub cell_y_offset: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -642,6 +1739,8 @@ pub struct ScreenSnapshot {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<Cell>,
+    pub selection_ranges: Vec<Option<SelectionRange>>,
+    pub kitty_placements: Arc<[KittyPlacement]>,
     pub dirty_rows: Vec<u16>,
     pub cursor: Cursor,
     pub alternate_screen: bool,
@@ -650,55 +1749,656 @@ pub struct ScreenSnapshot {
     pub generation: u64,
 }
 
+/// Inclusive visible-grid column range selected on one snapshot row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl SelectionRange {
+    pub fn contains(self, col: u16) -> bool {
+        col >= self.start && col <= self.end
+    }
+}
+
+struct SnapshotMetadata {
+    cols: u16,
+    rows: u16,
+    search_highlights: Vec<search::Highlight>,
+    kitty_placements: Arc<[KittyPlacement]>,
+    dirty_rows: Vec<u16>,
+    cursor: Cursor,
+    alternate_screen: bool,
+    scrollbar: Option<GhosttyScrollbar>,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct SnapshotEpoch {
+    fallback_cols: u16,
+    fallback_rows: u16,
+    search_highlights: Vec<search::Highlight>,
+    kitty_placements: Arc<[KittyPlacement]>,
+    alternate_screen: bool,
+    scrollbar: Option<GhosttyScrollbar>,
+    generation: u64,
+    required_full_snapshot_generation: u64,
+}
+
+impl SnapshotMetadata {
+    fn snapshot(
+        &self,
+        cells: &[Cell],
+        selection_ranges: &[Option<SelectionRange>],
+    ) -> ScreenSnapshot {
+        let mut snapshot = ScreenSnapshot {
+            cols: self.cols,
+            rows: self.rows,
+            cells: cells.to_vec(),
+            selection_ranges: selection_ranges.to_vec(),
+            kitty_placements: self.kitty_placements.clone(),
+            dirty_rows: self.dirty_rows.clone(),
+            cursor: self.cursor,
+            alternate_screen: self.alternate_screen,
+            scrollbar: self.scrollbar,
+            title: None,
+            generation: self.generation,
+        };
+        search::paint(&mut snapshot, &self.search_highlights);
+        snapshot
+    }
+}
+
 // ── Safe wrapper ───────────────────────────────────────────────────────
 
 pub struct VtScreen {
     inner: Arc<Mutex<VtInner>>,
+    render: Mutex<VtRenderState>,
+    search: Mutex<Option<search::Search>>,
 }
 
-pub type PtyWriteCallback = Arc<dyn Fn(&[u8]) + Send + Sync + 'static>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyWriteClass {
+    Regular,
+    ReservedControl,
+}
+
+pub type PtyWriteCallback =
+    Arc<dyn Fn(&[u8], PtyWriteClass) -> std::io::Result<()> + Send + Sync + 'static>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VtKeyAction {
+    Release,
+    Press,
+    Repeat,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VtKeyModifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub platform: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VtKeyEvent<'a> {
+    /// GPUI's normalized logical key name. Only unambiguous functional
+    /// names are promoted to a physical Ghostty key; printable keys stay
+    /// unidentified because GPUI doesn't expose a scan code/W3C code.
+    pub key: &'a str,
+    /// Layout-produced UTF-8 before Ctrl/Alt transformations.
+    pub text: &'a str,
+    pub unshifted_codepoint: Option<char>,
+    pub action: VtKeyAction,
+    pub modifiers: VtKeyModifiers,
+    pub consumed_modifiers: VtKeyModifiers,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VtKeyOutcome {
+    pub output_accepted: bool,
+    pub report_releases: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VtMouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VtMouseButton {
+    Left,
+    Middle,
+    Right,
+    Button4,
+    Button5,
+    Button6,
+    Button7,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VtMouseModifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+}
+
+/// Normalized mouse input in physical surface pixels. Ghostty converts this
+/// position to cells or terminal-space pixels according to the active format.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VtMouseEvent {
+    pub action: VtMouseAction,
+    pub button: Option<VtMouseButton>,
+    pub modifiers: VtMouseModifiers,
+    pub surface_x_px: f32,
+    pub surface_y_px: f32,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VtMouseOutcome {
+    /// True only when the active protocol encoded bytes and the PTY callback
+    /// accepted them. A captured terminal event may legitimately produce none.
+    pub output_written: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VtPasteResult {
+    Empty,
+    Accepted,
+    RequiresConfirmation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VtPasteSource {
+    Clipboard,
+    Text,
+}
+
+struct VtPasteReader<'a> {
+    text: &'a [u8],
+    served: bool,
+}
+
+enum PendingPasteWrite {
+    Buffer(Vec<u8>),
+    TooLarge,
+}
+
+impl PendingPasteWrite {
+    fn append(&mut self, bytes: &[u8]) {
+        let Self::Buffer(buffer) = self else {
+            return;
+        };
+        let Some(total) = buffer.len().checked_add(bytes.len()) else {
+            *self = Self::TooLarge;
+            return;
+        };
+        if total > TERMINAL_PASTE_OUTPUT_LIMIT_BYTES {
+            *self = Self::TooLarge;
+            return;
+        }
+        buffer.extend_from_slice(bytes);
+    }
+}
 
 struct VtCallbackState {
-    write_pty: PtyWriteCallback,
+    write_pty: Option<PtyWriteCallback>,
+    /// Serializes host callback entry. Encoded input acquires this while it
+    /// still owns the VT mutex, then releases the VT mutex before invoking the
+    /// host; a parser reply therefore cannot overtake that input.
+    write_order: Arc<Mutex<()>>,
     enquiry_response: Box<[u8]>,
+    /// Last clipboard text the user explicitly chose to paste. Kitty grants
+    /// are one-time capabilities, but multiple outstanding grants read this
+    /// shared current value. Unsolicited OSC reads remain denied.
+    clipboard_text: Mutex<Option<Arc<str>>>,
+    /// A terminal-generated reply or release cannot be retried through the C
+    /// callback ABI. If its reserved queue capacity is exhausted, fail the
+    /// session explicitly rather than continuing with desynchronized state.
+    write_failed: Arc<AtomicBool>,
+    clipboard_write_enabled: AtomicBool,
+    clipboard_write_policy: Arc<ClipboardWritePolicy>,
+    pending_clipboard_write: Mutex<Option<String>>,
+    /// Active only during `ghostty_terminal_paste`. The C callback cannot
+    /// return an I/O result, so buffer the complete logical paste and perform
+    /// one fallible host enqueue after libghostty returns.
+    pending_paste_write: Mutex<Option<PendingPasteWrite>>,
     rows: AtomicU16,
     cols: AtomicU16,
     cell_width: AtomicU32,
     cell_height: AtomicU32,
     dark_mode: AtomicBool,
     device_attributes: GhosttyDeviceAttributes,
+    metadata_dirty: AtomicU8,
+    bell_pending: AtomicBool,
+    desktop_notification_policy: Arc<DesktopNotificationPolicy>,
+    progress_epoch: Instant,
+    progress: AtomicU64,
+    unknown_sequence_log_count: AtomicU8,
+    capture: Mutex<RenderCapture>,
+    program_events: Arc<Mutex<program_events::ProgramStatusBuffer>>,
+}
+
+#[derive(Default)]
+struct RenderCapture {
+    deadline: Option<Instant>,
+    serial: u64,
+    generation: u64,
+    pending: Option<HeldFrame>,
+    search: Option<search::Search>,
+    kitty: KittySnapshot,
+}
+
+struct HeldFrame {
+    state: GhosttyRenderState,
+    epoch: SnapshotEpoch,
+}
+
+impl Drop for HeldFrame {
+    fn drop(&mut self) {
+        if !self.state.is_null() {
+            unsafe { ghostty_render_state_free(self.state) };
+        }
+    }
+}
+
+#[derive(Default)]
+struct KittySnapshot {
+    kitty_placement_iter: GhosttyKittyGraphicsPlacementIterator,
+    kitty_image_cache: HashMap<u32, Arc<KittyImage>>,
+    kitty_placements: Arc<[KittyPlacement]>,
+}
+
+impl Drop for KittySnapshot {
+    fn drop(&mut self) {
+        if !self.kitty_placement_iter.is_null() {
+            unsafe { ghostty_kitty_graphics_placement_iterator_free(self.kitty_placement_iter) };
+        }
+    }
+}
+
+struct MouseEncoderState {
+    encoder: GhosttyMouseEncoder,
+    event: GhosttyMouseEvent,
+    geometry: GhosttyMouseEncoderSize,
+}
+
+impl MouseEncoderState {
+    fn new(terminal: GhosttyTerminal, geometry: GhosttyMouseEncoderSize) -> anyhow::Result<Self> {
+        let mut encoder = std::ptr::null_mut();
+        let rc = unsafe { ghostty_mouse_encoder_new(std::ptr::null(), &mut encoder) };
+        if rc != GHOSTTY_SUCCESS || encoder.is_null() {
+            anyhow::bail!("ghostty_mouse_encoder_new failed: rc={rc}");
+        }
+
+        let mut event = std::ptr::null_mut();
+        let rc = unsafe { ghostty_mouse_event_new(std::ptr::null(), &mut event) };
+        if rc != GHOSTTY_SUCCESS || event.is_null() {
+            unsafe { ghostty_mouse_encoder_free(encoder) };
+            anyhow::bail!("ghostty_mouse_event_new failed: rc={rc}");
+        }
+
+        let track_last_cell = true;
+        unsafe {
+            ghostty_mouse_encoder_setopt(
+                encoder,
+                GhosttyMouseEncoderOption::Size,
+                &geometry as *const _ as *const c_void,
+            );
+            ghostty_mouse_encoder_setopt(
+                encoder,
+                GhosttyMouseEncoderOption::TrackLastCell,
+                &track_last_cell as *const _ as *const c_void,
+            );
+            ghostty_mouse_encoder_setopt_from_terminal(encoder, terminal);
+        }
+
+        Ok(Self {
+            encoder,
+            event,
+            geometry,
+        })
+    }
+
+    unsafe fn free(&mut self) {
+        if !self.event.is_null() {
+            unsafe { ghostty_mouse_event_free(self.event) };
+            self.event = std::ptr::null_mut();
+        }
+        if !self.encoder.is_null() {
+            unsafe { ghostty_mouse_encoder_free(self.encoder) };
+            self.encoder = std::ptr::null_mut();
+        }
+    }
 }
 
 struct VtInner {
     terminal: GhosttyTerminal,
-    render_state: GhosttyRenderState,
-    row_iter: GhosttyRowIterator,
-    row_cells: GhosttyRowCells,
-    callback_state: Option<Box<VtCallbackState>>,
+    focused: bool,
+    key_encoder: GhosttyKeyEncoder,
+    key_event: GhosttyKeyEvent,
+    mouse: Option<MouseEncoderState>,
+    selection_gesture: Option<SelectionGestureState>,
+    callback_state: Box<VtCallbackState>,
+    title: Option<String>,
+    title_reported: bool,
+    current_dir: Option<String>,
     cols: u16,
     rows: u16,
     generation: u64,
+    output_generation: u64,
+    required_full_snapshot_generation: u64,
+}
+
+struct SelectionGestureState {
+    gesture: GhosttySelectionGesture,
+    press: GhosttySelectionGestureEvent,
+    release: GhosttySelectionGestureEvent,
+    drag: GhosttySelectionGestureEvent,
+    autoscroll_tick: GhosttySelectionGestureEvent,
+    clock: Instant,
+}
+
+impl SelectionGestureState {
+    fn new() -> anyhow::Result<Self> {
+        let mut state = Self {
+            gesture: std::ptr::null_mut(),
+            press: std::ptr::null_mut(),
+            release: std::ptr::null_mut(),
+            drag: std::ptr::null_mut(),
+            autoscroll_tick: std::ptr::null_mut(),
+            clock: Instant::now(),
+        };
+
+        let rc = unsafe { ghostty_selection_gesture_new(std::ptr::null(), &mut state.gesture) };
+        if rc != GHOSTTY_SUCCESS || state.gesture.is_null() {
+            if !state.gesture.is_null() {
+                unsafe { state.free(std::ptr::null_mut()) };
+            }
+            anyhow::bail!("ghostty_selection_gesture_new failed: rc={rc}");
+        }
+
+        macro_rules! new_event {
+            ($field:ident, $event_type:expr, $label:literal) => {{
+                let rc = unsafe {
+                    ghostty_selection_gesture_event_new(
+                        std::ptr::null(),
+                        &mut state.$field,
+                        $event_type,
+                    )
+                };
+                if rc != GHOSTTY_SUCCESS || state.$field.is_null() {
+                    unsafe { state.free(std::ptr::null_mut()) };
+                    anyhow::bail!(
+                        "ghostty_selection_gesture_event_new({}) failed: rc={rc}",
+                        $label
+                    );
+                }
+            }};
+        }
+        new_event!(press, GhosttySelectionGestureEventType::Press, "PRESS");
+        new_event!(
+            release,
+            GhosttySelectionGestureEventType::Release,
+            "RELEASE"
+        );
+        new_event!(drag, GhosttySelectionGestureEventType::Drag, "DRAG");
+        new_event!(
+            autoscroll_tick,
+            GhosttySelectionGestureEventType::AutoscrollTick,
+            "AUTOSCROLL_TICK"
+        );
+
+        Ok(state)
+    }
+
+    unsafe fn free(&mut self, terminal: GhosttyTerminal) {
+        for event in [
+            &mut self.autoscroll_tick,
+            &mut self.drag,
+            &mut self.release,
+            &mut self.press,
+        ] {
+            if !event.is_null() {
+                unsafe { ghostty_selection_gesture_event_free(*event) };
+                *event = std::ptr::null_mut();
+            }
+        }
+        if !self.gesture.is_null() {
+            unsafe { ghostty_selection_gesture_free(self.gesture, terminal) };
+            self.gesture = std::ptr::null_mut();
+        }
+    }
+
+    fn time_ns(&self) -> u64 {
+        u64::try_from(self.clock.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+struct VtRenderState {
+    render_state: GhosttyRenderState,
+    row_iter: GhosttyRowIterator,
+    row_cells: GhosttyRowCells,
+    applied_full_snapshot_generation: u64,
     force_full_snapshot: bool,
     scratch_cols: u16,
     scratch_rows: u16,
     scratch: Vec<Cell>,
+    selection_ranges: Vec<Option<SelectionRange>>,
     last_cursor: Cursor,
-    osc_state: OscParseState,
-    osc_command: Vec<u8>,
-    osc7_buffer: Vec<u8>,
+    snapshot_metadata: Option<SnapshotMetadata>,
+    capture_serial: u64,
+}
+
+impl VtRenderState {
+    fn ensure_render_state(&mut self) -> bool {
+        if !self.render_state.is_null() {
+            return true;
+        }
+
+        let mut render_state: GhosttyRenderState = std::ptr::null_mut();
+        let rc = unsafe { ghostty_render_state_new(std::ptr::null(), &mut render_state) };
+        if rc != GHOSTTY_SUCCESS || render_state.is_null() {
+            log::warn!("ghostty_render_state_new retry rc={rc}");
+            return false;
+        }
+
+        self.render_state = render_state;
+        self.applied_full_snapshot_generation = u64::MAX;
+        self.force_full_snapshot = true;
+        self.last_cursor = Cursor::default();
+        self.snapshot_metadata = None;
+        true
+    }
+
+    fn invalidate_render_state(&mut self) {
+        if !self.render_state.is_null() {
+            unsafe { ghostty_render_state_free(self.render_state) };
+            self.render_state = std::ptr::null_mut();
+        }
+        self.applied_full_snapshot_generation = u64::MAX;
+        self.force_full_snapshot = true;
+        self.last_cursor = Cursor::default();
+        self.snapshot_metadata = None;
+    }
 }
 
 unsafe impl Send for VtInner {}
+unsafe impl Send for VtRenderState {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OscParseState {
-    Ground,
-    Esc,
-    Command,
-    Ignore,
-    IgnoreEsc,
-    Osc7,
-    Osc7Esc,
+#[repr(i32)]
+#[derive(Debug, Clone, Copy)]
+enum GhosttyKey {
+    Unidentified = 0,
+    AltLeft = 51,
+    AltRight = 52,
+    Backspace = 53,
+    CapsLock = 54,
+    ContextMenu = 55,
+    ControlLeft = 56,
+    ControlRight = 57,
+    Enter = 58,
+    MetaLeft = 59,
+    MetaRight = 60,
+    ShiftLeft = 61,
+    ShiftRight = 62,
+    Space = 63,
+    Tab = 64,
+    Delete = 68,
+    End = 69,
+    Help = 70,
+    Home = 71,
+    Insert = 72,
+    PageDown = 73,
+    PageUp = 74,
+    ArrowDown = 75,
+    ArrowLeft = 76,
+    ArrowRight = 77,
+    ArrowUp = 78,
+    Escape = 120,
+    F1 = 121,
+    F2 = 122,
+    F3 = 123,
+    F4 = 124,
+    F5 = 125,
+    F6 = 126,
+    F7 = 127,
+    F8 = 128,
+    F9 = 129,
+    F10 = 130,
+    F11 = 131,
+    F12 = 132,
+    F13 = 133,
+    F14 = 134,
+    F15 = 135,
+    F16 = 136,
+    F17 = 137,
+    F18 = 138,
+    F19 = 139,
+    F20 = 140,
+    F21 = 141,
+    F22 = 142,
+    F23 = 143,
+    F24 = 144,
+    F25 = 145,
+    PrintScreen = 148,
+    ScrollLock = 149,
+    Pause = 150,
+}
+
+fn ghostty_key_action(action: VtKeyAction) -> c_int {
+    match action {
+        VtKeyAction::Release => 0,
+        VtKeyAction::Press => 1,
+        VtKeyAction::Repeat => 2,
+    }
+}
+
+fn ghostty_modifiers(modifiers: VtKeyModifiers) -> u16 {
+    (u16::from(modifiers.shift) * GHOSTTY_MODS_SHIFT)
+        | (u16::from(modifiers.control) * GHOSTTY_MODS_CTRL)
+        | (u16::from(modifiers.alt) * GHOSTTY_MODS_ALT)
+        | (u16::from(modifiers.platform) * GHOSTTY_MODS_SUPER)
+}
+
+fn ghostty_mouse_action(action: VtMouseAction) -> GhosttyMouseAction {
+    match action {
+        VtMouseAction::Press => GhosttyMouseAction::Press,
+        VtMouseAction::Release => GhosttyMouseAction::Release,
+        VtMouseAction::Motion => GhosttyMouseAction::Motion,
+    }
+}
+
+fn ghostty_mouse_button(button: VtMouseButton) -> GhosttyMouseButton {
+    match button {
+        VtMouseButton::Left => GhosttyMouseButton::Left,
+        VtMouseButton::Middle => GhosttyMouseButton::Middle,
+        VtMouseButton::Right => GhosttyMouseButton::Right,
+        VtMouseButton::Button4 => GhosttyMouseButton::Four,
+        VtMouseButton::Button5 => GhosttyMouseButton::Five,
+        VtMouseButton::Button6 => GhosttyMouseButton::Six,
+        VtMouseButton::Button7 => GhosttyMouseButton::Seven,
+    }
+}
+
+fn ghostty_mouse_modifiers(modifiers: VtMouseModifiers) -> u16 {
+    (u16::from(modifiers.shift) * GHOSTTY_MODS_SHIFT)
+        | (u16::from(modifiers.control) * GHOSTTY_MODS_CTRL)
+        | (u16::from(modifiers.alt) * GHOSTTY_MODS_ALT)
+}
+
+/// Map only key names whose physical identity is unambiguous in GPUI's
+/// logical event model. Printable keys intentionally remain UNIDENTIFIED:
+/// treating a layout-normalized `"a"` as the physical KeyA position would
+/// corrupt Kitty alternate-key reporting on non-US layouts.
+fn ghostty_key(key: &str) -> c_int {
+    (match key {
+        "alt" | "alt-left" => GhosttyKey::AltLeft,
+        "alt-right" => GhosttyKey::AltRight,
+        "backspace" => GhosttyKey::Backspace,
+        "capslock" | "caps-lock" => GhosttyKey::CapsLock,
+        "context-menu" => GhosttyKey::ContextMenu,
+        "control" | "ctrl" | "control-left" => GhosttyKey::ControlLeft,
+        "control-right" => GhosttyKey::ControlRight,
+        "enter" | "return" => GhosttyKey::Enter,
+        "meta" | "super" | "win" | "meta-left" => GhosttyKey::MetaLeft,
+        "meta-right" => GhosttyKey::MetaRight,
+        "shift" | "shift-left" => GhosttyKey::ShiftLeft,
+        "shift-right" => GhosttyKey::ShiftRight,
+        "space" => GhosttyKey::Space,
+        "tab" => GhosttyKey::Tab,
+        "delete" => GhosttyKey::Delete,
+        "end" => GhosttyKey::End,
+        "help" => GhosttyKey::Help,
+        "home" => GhosttyKey::Home,
+        "insert" => GhosttyKey::Insert,
+        "pagedown" | "page-down" => GhosttyKey::PageDown,
+        "pageup" | "page-up" => GhosttyKey::PageUp,
+        "down" | "arrow-down" => GhosttyKey::ArrowDown,
+        "left" | "arrow-left" => GhosttyKey::ArrowLeft,
+        "right" | "arrow-right" => GhosttyKey::ArrowRight,
+        "up" | "arrow-up" => GhosttyKey::ArrowUp,
+        "escape" => GhosttyKey::Escape,
+        "f1" => GhosttyKey::F1,
+        "f2" => GhosttyKey::F2,
+        "f3" => GhosttyKey::F3,
+        "f4" => GhosttyKey::F4,
+        "f5" => GhosttyKey::F5,
+        "f6" => GhosttyKey::F6,
+        "f7" => GhosttyKey::F7,
+        "f8" => GhosttyKey::F8,
+        "f9" => GhosttyKey::F9,
+        "f10" => GhosttyKey::F10,
+        "f11" => GhosttyKey::F11,
+        "f12" => GhosttyKey::F12,
+        "f13" => GhosttyKey::F13,
+        "f14" => GhosttyKey::F14,
+        "f15" => GhosttyKey::F15,
+        "f16" => GhosttyKey::F16,
+        "f17" => GhosttyKey::F17,
+        "f18" => GhosttyKey::F18,
+        "f19" => GhosttyKey::F19,
+        "f20" => GhosttyKey::F20,
+        "f21" => GhosttyKey::F21,
+        "f22" => GhosttyKey::F22,
+        "f23" => GhosttyKey::F23,
+        "f24" => GhosttyKey::F24,
+        "f25" => GhosttyKey::F25,
+        "printscreen" | "print-screen" => GhosttyKey::PrintScreen,
+        "scrolllock" | "scroll-lock" => GhosttyKey::ScrollLock,
+        "pause" => GhosttyKey::Pause,
+        _ => GhosttyKey::Unidentified,
+    }) as c_int
+}
+
+/// Whether Con's GPUI bridge can identify this logical name as a physical
+/// functional key without guessing a keyboard layout or key location.
+pub fn is_supported_functional_key(key: &str) -> bool {
+    ghostty_key(key) != GhosttyKey::Unidentified as c_int
 }
 
 fn default_device_attributes() -> GhosttyDeviceAttributes {
@@ -721,101 +2421,6 @@ fn default_device_attributes() -> GhosttyDeviceAttributes {
         },
         tertiary: GhosttyDeviceAttributesTertiary { unit_id: 0 },
     }
-}
-
-fn ingest_osc7_cwd(inner: &mut VtInner, bytes: &[u8]) {
-    for &byte in bytes {
-        match inner.osc_state {
-            OscParseState::Ground => {
-                if byte == 0x1b {
-                    inner.osc_state = OscParseState::Esc;
-                }
-            }
-            OscParseState::Esc => {
-                if byte == b']' {
-                    inner.osc_command.clear();
-                    inner.osc_state = OscParseState::Command;
-                } else if byte != 0x1b {
-                    inner.osc_state = OscParseState::Ground;
-                }
-            }
-            OscParseState::Command => match byte {
-                b';' => {
-                    if inner.osc_command.as_slice() == b"7" {
-                        inner.osc7_buffer.clear();
-                        inner.osc_state = OscParseState::Osc7;
-                    } else {
-                        inner.osc_state = OscParseState::Ignore;
-                    }
-                }
-                0x07 => inner.osc_state = OscParseState::Ground,
-                0x1b => inner.osc_state = OscParseState::IgnoreEsc,
-                _ if inner.osc_command.len() < 16 => inner.osc_command.push(byte),
-                _ => inner.osc_state = OscParseState::Ignore,
-            },
-            OscParseState::Ignore => match byte {
-                0x07 => inner.osc_state = OscParseState::Ground,
-                0x1b => inner.osc_state = OscParseState::IgnoreEsc,
-                _ => {}
-            },
-            OscParseState::IgnoreEsc => {
-                inner.osc_state = OscParseState::Ground;
-                if byte == 0x1b {
-                    inner.osc_state = OscParseState::Esc;
-                } else if byte != b'\\' {
-                    // The ESC did not terminate the OSC. Resume ignoring
-                    // until the real BEL/ST terminator.
-                    inner.osc_state = OscParseState::Ignore;
-                }
-            }
-            OscParseState::Osc7 => match byte {
-                0x07 => finish_osc7_cwd(inner),
-                0x1b => inner.osc_state = OscParseState::Osc7Esc,
-                _ if inner.osc7_buffer.len() < 4096 => inner.osc7_buffer.push(byte),
-                _ => {
-                    inner.osc7_buffer.clear();
-                    inner.osc_state = OscParseState::Ignore;
-                }
-            },
-            OscParseState::Osc7Esc => {
-                if byte == b'\\' {
-                    finish_osc7_cwd(inner);
-                } else {
-                    if inner.osc7_buffer.len() + 2 <= 4096 {
-                        inner.osc7_buffer.push(0x1b);
-                        inner.osc7_buffer.push(byte);
-                        inner.osc_state = OscParseState::Osc7;
-                    } else {
-                        inner.osc7_buffer.clear();
-                        inner.osc_state = OscParseState::Ignore;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn finish_osc7_cwd(inner: &mut VtInner) {
-    if let Ok(url) = std::str::from_utf8(&inner.osc7_buffer)
-        && let Some(cwd) = parse_osc7_cwd(url)
-    {
-        let pwd = ghostty_string_from_bytes(cwd.as_bytes());
-        // SAFETY: `ghostty_terminal_set(PWD)` copies the string during
-        // the call; `cwd` stays alive until the call returns.
-        let rc = unsafe {
-            ghostty_terminal_set(
-                inner.terminal,
-                GhosttyTerminalOption::Pwd,
-                &pwd as *const _ as *const c_void,
-            )
-        };
-        if rc != 0 {
-            log::warn!("ghostty_terminal_set(Pwd) failed: rc={rc}");
-        }
-    }
-
-    inner.osc7_buffer.clear();
-    inner.osc_state = OscParseState::Ground;
 }
 
 fn parse_osc7_cwd(url: &str) -> Option<String> {
@@ -909,40 +2514,118 @@ impl VtScreen {
         theme: Option<&ThemeColors>,
         write_pty: Option<PtyWriteCallback>,
     ) -> anyhow::Result<Self> {
+        install_ghostty_sys_services()?;
+
         let mut terminal: GhosttyTerminal = std::ptr::null_mut();
-        let options = GhosttyTerminalOptions {
-            cols,
-            rows,
-            max_scrollback: 10_000,
-        };
         // SAFETY: out param; allocator NULL = upstream default.
-        let rc = unsafe { ghostty_terminal_new(std::ptr::null(), &mut terminal, options) };
+        let rc = unsafe { ghostty_terminal_new(std::ptr::null(), &mut terminal, cols, rows) };
         if rc != 0 || terminal.is_null() {
             anyhow::bail!("ghostty_terminal_new failed: rc={rc}");
         }
 
-        let mut callback_state = write_pty.map(|write_pty| {
-            Box::new(VtCallbackState {
-                write_pty,
-                enquiry_response: b"con".to_vec().into_boxed_slice(),
-                rows: AtomicU16::new(rows),
-                cols: AtomicU16::new(cols),
-                cell_width: AtomicU32::new(1),
-                cell_height: AtomicU32::new(1),
-                dark_mode: AtomicBool::new(false),
-                device_attributes: default_device_attributes(),
-            })
-        });
-        if let Some(state) = callback_state.as_mut() {
-            let userdata = state.as_mut() as *mut VtCallbackState as *mut c_void;
+        #[cfg(target_os = "windows")]
+        {
+            // ConPTY owns an active screen but cannot pull our scrollback.
+            // Keep resize/reflow aligned with it; Unix PTYs retain the default.
+            let pull_scrollback = false;
+            // SAFETY: terminal is live and the option synchronously copies a bool.
             let rc = unsafe {
-                ghostty_terminal_set(terminal, GhosttyTerminalOption::Userdata, userdata)
+                ghostty_terminal_set(
+                    terminal,
+                    GhosttyTerminalOption::ResizePullScrollback,
+                    &pull_scrollback as *const bool as *const c_void,
+                )
             };
             if rc != 0 {
                 unsafe { ghostty_terminal_free(terminal) };
-                anyhow::bail!("ghostty_terminal_set(USERDATA) failed: rc={rc}");
+                anyhow::bail!("ghostty_terminal_set(RESIZE_PULL_SCROLLBACK) failed: rc={rc}");
             }
+        }
 
+        let max_scrollback_lines = 10_000_usize;
+        let rc = unsafe {
+            ghostty_terminal_set(
+                terminal,
+                GhosttyTerminalOption::ScrollbackMaxLines,
+                &max_scrollback_lines as *const _ as *const c_void,
+            )
+        };
+        if rc != 0 {
+            unsafe { ghostty_terminal_free(terminal) };
+            anyhow::bail!("ghostty_terminal_set(SCROLLBACK_MAX_LINES) failed: rc={rc}");
+        }
+
+        let rc = unsafe {
+            ghostty_terminal_set(
+                terminal,
+                GhosttyTerminalOption::KittyImageStorageLimit,
+                &KITTY_IMAGE_STORAGE_LIMIT_BYTES as *const _ as *const c_void,
+            )
+        };
+        if rc != 0 {
+            unsafe { ghostty_terminal_free(terminal) };
+            anyhow::bail!("ghostty_terminal_set(KITTY_IMAGE_STORAGE_LIMIT) failed: rc={rc}");
+        }
+
+        let clipboard_write_max_bytes = 0_usize;
+        let rc = unsafe {
+            ghostty_terminal_set(
+                terminal,
+                GhosttyTerminalOption::ClipboardWriteMaxBytes,
+                &clipboard_write_max_bytes as *const _ as *const c_void,
+            )
+        };
+        if rc != 0 {
+            unsafe { ghostty_terminal_free(terminal) };
+            anyhow::bail!("ghostty_terminal_set(CLIPBOARD_WRITE_MAX_BYTES) failed: rc={rc}");
+        }
+
+        let mut callback_state = Box::new(VtCallbackState {
+            write_pty,
+            write_order: Arc::new(Mutex::new(())),
+            enquiry_response: b"con".to_vec().into_boxed_slice(),
+            clipboard_text: Mutex::new(None),
+            write_failed: Arc::new(AtomicBool::new(false)),
+            clipboard_write_enabled: AtomicBool::new(false),
+            clipboard_write_policy: Arc::new(ClipboardWritePolicy::new(true)),
+            pending_clipboard_write: Mutex::new(None),
+            pending_paste_write: Mutex::new(None),
+            rows: AtomicU16::new(rows),
+            cols: AtomicU16::new(cols),
+            cell_width: AtomicU32::new(1),
+            cell_height: AtomicU32::new(1),
+            dark_mode: AtomicBool::new(false),
+            device_attributes: default_device_attributes(),
+            metadata_dirty: AtomicU8::new(0),
+            bell_pending: AtomicBool::new(false),
+            desktop_notification_policy: Arc::new(DesktopNotificationPolicy::default()),
+            progress_epoch: Instant::now(),
+            progress: AtomicU64::new(0),
+            unknown_sequence_log_count: AtomicU8::new(0),
+            capture: Mutex::new(RenderCapture::default()),
+            program_events: Arc::new(Mutex::new(program_events::ProgramStatusBuffer::default())),
+        });
+        let userdata = callback_state.as_mut() as *mut VtCallbackState as *mut c_void;
+        let rc =
+            unsafe { ghostty_terminal_set(terminal, GhosttyTerminalOption::Userdata, userdata) };
+        if rc != 0 {
+            unsafe { ghostty_terminal_free(terminal) };
+            anyhow::bail!("ghostty_terminal_set(USERDATA) failed: rc={rc}");
+        }
+
+        let rc = unsafe {
+            ghostty_terminal_set(
+                terminal,
+                GhosttyTerminalOption::RenderHold,
+                vt_render_hold_callback as *const c_void,
+            )
+        };
+        if rc != GHOSTTY_SUCCESS {
+            unsafe { ghostty_terminal_free(terminal) };
+            anyhow::bail!("ghostty_terminal_set(RENDER_HOLD) failed: rc={rc}");
+        }
+
+        if callback_state.write_pty.is_some() {
             let rc = unsafe {
                 ghostty_terminal_set(
                     terminal,
@@ -981,6 +2664,11 @@ impl VtScreen {
                     vt_xtversion_callback as *const c_void,
                     "XTVERSION",
                 ),
+                (
+                    GhosttyTerminalOption::ClipboardRead,
+                    vt_clipboard_read_callback as *const c_void,
+                    "CLIPBOARD_READ",
+                ),
             ];
 
             for (option, callback, label) in callback_options {
@@ -989,6 +2677,82 @@ impl VtScreen {
                     unsafe { ghostty_terminal_free(terminal) };
                     anyhow::bail!("ghostty_terminal_set({label}) failed: rc={rc}");
                 }
+            }
+        }
+
+        let effect_callbacks = [
+            (
+                GhosttyTerminalOption::Bell,
+                vt_bell_callback as *const c_void,
+                "BELL",
+            ),
+            (
+                GhosttyTerminalOption::TitleChanged,
+                vt_title_changed_callback as *const c_void,
+                "TITLE_CHANGED",
+            ),
+            (
+                GhosttyTerminalOption::PwdChanged,
+                vt_pwd_changed_callback as *const c_void,
+                "PWD_CHANGED",
+            ),
+            (
+                GhosttyTerminalOption::DesktopNotification,
+                vt_desktop_notification_callback as *const c_void,
+                "DESKTOP_NOTIFICATION",
+            ),
+            (
+                GhosttyTerminalOption::ProgressReport,
+                vt_progress_report_callback as *const c_void,
+                "PROGRESS_REPORT",
+            ),
+            (
+                GhosttyTerminalOption::ProgramStatus,
+                vt_program_status_callback as *const c_void,
+                "PROGRAM_STATUS",
+            ),
+            (
+                GhosttyTerminalOption::SemanticPrompt,
+                vt_semantic_prompt_callback as *const c_void,
+                "SEMANTIC_PROMPT",
+            ),
+            (
+                GhosttyTerminalOption::Reset,
+                vt_reset_callback as *const c_void,
+                "RESET",
+            ),
+        ];
+        for (option, callback, label) in effect_callbacks {
+            let rc = unsafe { ghostty_terminal_set(terminal, option, callback) };
+            if rc != 0 {
+                unsafe { ghostty_terminal_free(terminal) };
+                anyhow::bail!("ghostty_terminal_set({label}) failed: rc={rc}");
+            }
+        }
+
+        if log::log_enabled!(target: UNKNOWN_SEQUENCE_LOG_TARGET, log::Level::Debug) {
+            let rc = unsafe {
+                ghostty_terminal_set(
+                    terminal,
+                    GhosttyTerminalOption::UnknownMaxBytes,
+                    &UNKNOWN_SEQUENCE_MAX_BYTES as *const _ as *const c_void,
+                )
+            };
+            if rc != 0 {
+                unsafe { ghostty_terminal_free(terminal) };
+                anyhow::bail!("ghostty_terminal_set(UNKNOWN_MAX_BYTES) failed: rc={rc}");
+            }
+
+            let rc = unsafe {
+                ghostty_terminal_set(
+                    terminal,
+                    GhosttyTerminalOption::UnknownSequence,
+                    vt_unknown_sequence_callback as *const c_void,
+                )
+            };
+            if rc != 0 {
+                unsafe { ghostty_terminal_free(terminal) };
+                anyhow::bail!("ghostty_terminal_set(UNKNOWN_SEQUENCE) failed: rc={rc}");
             }
         }
 
@@ -1036,30 +2800,215 @@ impl VtScreen {
             );
         }
 
+        let mut kitty_placement_iter: GhosttyKittyGraphicsPlacementIterator = std::ptr::null_mut();
+        let rc = unsafe {
+            ghostty_kitty_graphics_placement_iterator_new(
+                std::ptr::null(),
+                &mut kitty_placement_iter,
+            )
+        };
+        if rc != GHOSTTY_SUCCESS || kitty_placement_iter.is_null() {
+            unsafe {
+                if !row_cells.is_null() {
+                    ghostty_render_state_row_cells_free(row_cells);
+                }
+                if !row_iter.is_null() {
+                    ghostty_render_state_row_iterator_free(row_iter);
+                }
+                if !render_state.is_null() {
+                    ghostty_render_state_free(render_state);
+                }
+                ghostty_terminal_free(terminal);
+            }
+            anyhow::bail!("ghostty_kitty_graphics_placement_iterator_new failed: rc={rc}");
+        }
+
+        let mut key_encoder: GhosttyKeyEncoder = std::ptr::null_mut();
+        let rc = unsafe { ghostty_key_encoder_new(std::ptr::null(), &mut key_encoder) };
+        if rc != GHOSTTY_SUCCESS || key_encoder.is_null() {
+            unsafe {
+                ghostty_kitty_graphics_placement_iterator_free(kitty_placement_iter);
+                if !row_cells.is_null() {
+                    ghostty_render_state_row_cells_free(row_cells);
+                }
+                if !row_iter.is_null() {
+                    ghostty_render_state_row_iterator_free(row_iter);
+                }
+                if !render_state.is_null() {
+                    ghostty_render_state_free(render_state);
+                }
+                ghostty_terminal_free(terminal);
+            }
+            anyhow::bail!("ghostty_key_encoder_new failed: rc={rc}");
+        }
+
+        let mut key_event: GhosttyKeyEvent = std::ptr::null_mut();
+        let rc = unsafe { ghostty_key_event_new(std::ptr::null(), &mut key_event) };
+        if rc != GHOSTTY_SUCCESS || key_event.is_null() {
+            unsafe {
+                ghostty_key_encoder_free(key_encoder);
+                ghostty_kitty_graphics_placement_iterator_free(kitty_placement_iter);
+                if !row_cells.is_null() {
+                    ghostty_render_state_row_cells_free(row_cells);
+                }
+                if !row_iter.is_null() {
+                    ghostty_render_state_row_iterator_free(row_iter);
+                }
+                if !render_state.is_null() {
+                    ghostty_render_state_free(render_state);
+                }
+                ghostty_terminal_free(terminal);
+            }
+            anyhow::bail!("ghostty_key_event_new failed: rc={rc}");
+        }
+
         if let Some(theme) = theme {
             unsafe { apply_theme_to_terminal(terminal, theme) };
         }
 
+        callback_state.capture.get_mut().kitty.kitty_placement_iter = kitty_placement_iter;
         Ok(Self {
+            search: Mutex::new(None),
             inner: Arc::new(Mutex::new(VtInner {
                 terminal,
-                render_state,
-                row_iter,
-                row_cells,
+                focused: false,
+                key_encoder,
+                key_event,
+                mouse: None,
+                selection_gesture: None,
                 callback_state,
+                title: None,
+                title_reported: false,
+                current_dir: None,
                 cols,
                 rows,
                 generation: 0,
-                force_full_snapshot: true,
+                output_generation: 0,
+                required_full_snapshot_generation: 0,
+            })),
+            render: Mutex::new(VtRenderState {
+                render_state,
+                row_iter,
+                row_cells,
+                applied_full_snapshot_generation: u64::MAX,
+                force_full_snapshot: false,
                 scratch_cols: cols,
                 scratch_rows: rows,
                 scratch: Vec::with_capacity(cols as usize * rows as usize),
+                selection_ranges: Vec::with_capacity(rows as usize),
                 last_cursor: Cursor::default(),
-                osc_state: OscParseState::Ground,
-                osc_command: Vec::with_capacity(8),
-                osc7_buffer: Vec::with_capacity(256),
-            })),
+                snapshot_metadata: None,
+                capture_serial: 0,
+            }),
         })
+    }
+
+    pub fn set_clipboard_write_enabled(&self, enabled: bool) -> Result<(), String> {
+        let inner = self.inner.lock();
+        if enabled {
+            let clipboard_write_max_bytes = CLIPBOARD_WRITE_LIMIT_BYTES;
+            let rc = unsafe {
+                ghostty_terminal_set(
+                    inner.terminal,
+                    GhosttyTerminalOption::ClipboardWriteMaxBytes,
+                    &clipboard_write_max_bytes as *const _ as *const c_void,
+                )
+            };
+            if rc != 0 {
+                return Err(format!(
+                    "ghostty_terminal_set(CLIPBOARD_WRITE_MAX_BYTES) failed: rc={rc}"
+                ));
+            }
+
+            let rc = unsafe {
+                ghostty_terminal_set(
+                    inner.terminal,
+                    GhosttyTerminalOption::ClipboardWrite,
+                    vt_clipboard_write_callback as *const c_void,
+                )
+            };
+            if rc != 0 {
+                let disabled_limit = 0_usize;
+                let _ = unsafe {
+                    ghostty_terminal_set(
+                        inner.terminal,
+                        GhosttyTerminalOption::ClipboardWriteMaxBytes,
+                        &disabled_limit as *const _ as *const c_void,
+                    )
+                };
+                return Err(format!(
+                    "ghostty_terminal_set(CLIPBOARD_WRITE) failed: rc={rc}"
+                ));
+            }
+            inner
+                .callback_state
+                .clipboard_write_enabled
+                .store(true, Ordering::Release);
+            return Ok(());
+        }
+
+        inner
+            .callback_state
+            .clipboard_write_enabled
+            .store(false, Ordering::Release);
+        inner.callback_state.pending_clipboard_write.lock().take();
+        let callback_rc = unsafe {
+            ghostty_terminal_set(
+                inner.terminal,
+                GhosttyTerminalOption::ClipboardWrite,
+                std::ptr::null(),
+            )
+        };
+        let disabled_limit = 0_usize;
+        let limit_rc = unsafe {
+            ghostty_terminal_set(
+                inner.terminal,
+                GhosttyTerminalOption::ClipboardWriteMaxBytes,
+                &disabled_limit as *const _ as *const c_void,
+            )
+        };
+        if callback_rc != 0 {
+            return Err(format!(
+                "ghostty_terminal_set(CLIPBOARD_WRITE) failed: rc={callback_rc}"
+            ));
+        }
+        if limit_rc != 0 {
+            return Err(format!(
+                "ghostty_terminal_set(CLIPBOARD_WRITE_MAX_BYTES) failed: rc={limit_rc}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn take_clipboard_write(&self) -> Option<String> {
+        let inner = self.inner.lock();
+        let state = &inner.callback_state;
+        let pending = state.pending_clipboard_write.lock().take();
+        if state.clipboard_write_policy.is_enabled() {
+            pending
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn set_clipboard_write_policy(&self, policy: Arc<ClipboardWritePolicy>) {
+        let mut inner = self.inner.lock();
+        if !policy.is_enabled() {
+            inner.callback_state.pending_clipboard_write.lock().take();
+        }
+        inner.callback_state.clipboard_write_policy = policy;
+    }
+
+    pub fn take_desktop_notification(&self) -> Option<DesktopNotification> {
+        self.inner
+            .lock()
+            .callback_state
+            .desktop_notification_policy
+            .take()
+    }
+
+    pub(crate) fn set_desktop_notification_policy(&self, policy: Arc<DesktopNotificationPolicy>) {
+        self.inner.lock().callback_state.desktop_notification_policy = policy;
     }
 
     /// Replace the default fg/bg/palette. Bumps the snapshot
@@ -1067,8 +3016,8 @@ impl VtScreen {
     pub fn set_theme(&self, theme: &ThemeColors) {
         let mut inner = self.inner.lock();
         unsafe { apply_theme_to_terminal(inner.terminal, theme) };
-        inner.force_full_snapshot = true;
         inner.generation = inner.generation.wrapping_add(1);
+        inner.required_full_snapshot_generation = inner.generation;
     }
 
     /// Force the next `snapshot()` to report a new generation so the
@@ -1086,14 +3035,984 @@ impl VtScreen {
         self.inner.lock().generation
     }
 
+    /// Scrollbar chrome must follow the extracted snapshot, not a newer live
+    /// viewport parsed behind a render hold. Return its cache key atomically.
+    pub(crate) fn snapshot_scrollbar(&self) -> Option<(u64, Option<GhosttyScrollbar>)> {
+        self.render
+            .lock()
+            .snapshot_metadata
+            .as_ref()
+            .map(|metadata| (metadata.generation, metadata.scrollbar))
+    }
+
+    /// Copy the OSC 8 target at a viewport cell. No grid reference escapes the
+    /// parser lock: feeding, scrolling, or resizing can invalidate it.
+    pub fn hyperlink_at(&self, col: u16, row: u16) -> anyhow::Result<Option<String>> {
+        let inner = self.inner.lock();
+        if col >= inner.cols || row >= inner.rows {
+            return Ok(None);
+        }
+        let grid_ref = selection_grid_ref(inner.terminal, col, row)?;
+        let mut len = 0;
+        // SAFETY: the reference belongs to this locked terminal. NULL queries
+        // the required byte count; the URI is not NUL-terminated.
+        let rc =
+            unsafe { ghostty_grid_ref_hyperlink_uri(&grid_ref, std::ptr::null_mut(), 0, &mut len) };
+        if rc == GHOSTTY_SUCCESS && len == 0 {
+            return Ok(None);
+        }
+        if rc != GHOSTTY_OUT_OF_SPACE {
+            anyhow::bail!("ghostty_grid_ref_hyperlink_uri size query failed: rc={rc}");
+        }
+        let mut bytes = vec![0; len];
+        // SAFETY: the lock still prevents mutations and bytes has the exact
+        // capacity requested by Ghostty.
+        let rc = unsafe {
+            ghostty_grid_ref_hyperlink_uri(&grid_ref, bytes.as_mut_ptr(), bytes.len(), &mut len)
+        };
+        if rc != GHOSTTY_SUCCESS {
+            anyhow::bail!("ghostty_grid_ref_hyperlink_uri failed: rc={rc}");
+        }
+        bytes.truncate(len);
+        Ok(Some(String::from_utf8(bytes)?))
+    }
+
+    /// Begin a local text-selection gesture at a viewport cell.
+    ///
+    /// `click_count` comes from the platform event so OS accessibility
+    /// settings remain authoritative. A shifted single click extends an
+    /// existing active gesture; otherwise Ghostty's default cell/word/line
+    /// behavior is selected from the platform click count.
+    pub fn selection_press(
+        &self,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
+        click_count: u8,
+        extend: bool,
+    ) -> anyhow::Result<()> {
+        validate_selection_point(point)?;
+        let geometry = geometry.to_ffi()?;
+        let mut inner = self.inner.lock();
+        let terminal = inner.terminal;
+
+        if inner.selection_gesture.is_none() {
+            inner.selection_gesture = Some(SelectionGestureState::new()?);
+        }
+        let can_extend = extend
+            && click_count == 1
+            && has_selection_locked(&inner)?
+            && selection_gesture_click_count(&inner)? > 0;
+        let grid_ref = selection_grid_ref(terminal, point.col, point.row)?;
+        let state = inner
+            .selection_gesture
+            .as_ref()
+            .expect("selection gesture initialized");
+        let gesture = state.gesture;
+        let position = selection_surface_position(point);
+
+        if can_extend {
+            let event = state.drag;
+            selection_event_set(event, GhosttySelectionGestureEventOption::Ref, &grid_ref)?;
+            selection_event_set(
+                event,
+                GhosttySelectionGestureEventOption::Position,
+                &position,
+            )?;
+            selection_event_set(
+                event,
+                GhosttySelectionGestureEventOption::Geometry,
+                &geometry,
+            )?;
+            if let Some(selection) = apply_selection_gesture_event(gesture, terminal, event)? {
+                set_selection_locked(&mut inner, Some(&selection))?;
+            }
+            return Ok(());
+        }
+
+        // GPUI has already applied the platform's repeat interval and distance
+        // policy. Replay the reported count from a clean gesture so Ghostty
+        // selects the matching cell/word/line behavior without a second,
+        // hard-coded timing policy disagreeing with the OS.
+        unsafe { ghostty_selection_gesture_reset(gesture, terminal) };
+        let event = state.press;
+        let time_ns = state.time_ns();
+        let repeat_distance = f64::from(geometry.cell_width);
+        let repeat_interval_ns = u64::MAX;
+
+        selection_event_set(event, GhosttySelectionGestureEventOption::Ref, &grid_ref)?;
+        selection_event_set(
+            event,
+            GhosttySelectionGestureEventOption::Position,
+            &position,
+        )?;
+        selection_event_set(
+            event,
+            GhosttySelectionGestureEventOption::RepeatDistance,
+            &repeat_distance,
+        )?;
+        selection_event_set(event, GhosttySelectionGestureEventOption::TimeNs, &time_ns)?;
+        selection_event_set(
+            event,
+            GhosttySelectionGestureEventOption::RepeatIntervalNs,
+            &repeat_interval_ns,
+        )?;
+
+        let mut selection = None;
+        for _ in 0..click_count.clamp(1, 3) {
+            selection = apply_selection_gesture_event(gesture, terminal, event)?;
+        }
+        if let Some(selection) = selection {
+            set_selection_locked(&mut inner, Some(&selection))?;
+        } else if selection_gesture_click_count(&inner)? == 1 {
+            set_selection_locked(&mut inner, None)?;
+        }
+        Ok(())
+    }
+
+    /// Continue the active selection gesture. The returned direction tells the
+    /// view whether it should run selection autoscroll ticks.
+    pub fn selection_drag(
+        &self,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
+    ) -> anyhow::Result<SelectionAutoscroll> {
+        validate_selection_point(point)?;
+        let geometry = geometry.to_ffi()?;
+        let mut inner = self.inner.lock();
+        let terminal = inner.terminal;
+        let Some(state) = inner.selection_gesture.as_ref() else {
+            return Ok(SelectionAutoscroll::None);
+        };
+        let event = state.drag;
+        let gesture = state.gesture;
+        let grid_ref = selection_grid_ref(terminal, point.col, point.row)?;
+        let position = selection_surface_position(point);
+
+        selection_event_set(event, GhosttySelectionGestureEventOption::Ref, &grid_ref)?;
+        selection_event_set(
+            event,
+            GhosttySelectionGestureEventOption::Position,
+            &position,
+        )?;
+        selection_event_set(
+            event,
+            GhosttySelectionGestureEventOption::Geometry,
+            &geometry,
+        )?;
+
+        let selection = apply_selection_gesture_event(gesture, terminal, event)?;
+        let click_count = selection_gesture_click_count(&inner)?;
+        if let Some(selection) = selection {
+            set_selection_locked(&mut inner, Some(&selection))?;
+        } else if click_count > 0 {
+            set_selection_locked(&mut inner, None)?;
+        }
+        selection_gesture_autoscroll(&inner)
+    }
+
+    /// Advance an active selection autoscroll gesture by one row.
+    pub fn selection_autoscroll_tick(
+        &self,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
+    ) -> anyhow::Result<SelectionAutoscrollUpdate> {
+        validate_selection_point(point)?;
+        let geometry = geometry.to_ffi()?;
+        let mut inner = self.inner.lock();
+        let terminal = inner.terminal;
+        let Some(state) = inner.selection_gesture.as_ref() else {
+            return Ok(SelectionAutoscrollUpdate::default());
+        };
+        let event = state.autoscroll_tick;
+        let gesture = state.gesture;
+        let viewport = GhosttyPointCoordinate {
+            x: point.col,
+            y: u32::from(point.row),
+        };
+        let position = selection_surface_position(point);
+        let autoscroll_before = selection_gesture_autoscroll(&inner)?;
+        if autoscroll_before == SelectionAutoscroll::None {
+            return Ok(SelectionAutoscrollUpdate::default());
+        }
+
+        selection_event_set(
+            event,
+            GhosttySelectionGestureEventOption::Viewport,
+            &viewport,
+        )?;
+        selection_event_set(
+            event,
+            GhosttySelectionGestureEventOption::Position,
+            &position,
+        )?;
+        selection_event_set(
+            event,
+            GhosttySelectionGestureEventOption::Geometry,
+            &geometry,
+        )?;
+
+        let generation_before = inner.generation;
+        let offset_before = read_scrollbar(terminal).map(|scrollbar| scrollbar.offset);
+        let selection = apply_selection_gesture_event(gesture, terminal, event)?;
+        let offset_after = read_scrollbar(terminal).map(|scrollbar| scrollbar.offset);
+        let viewport_changed = match (offset_before, offset_after) {
+            (Some(before), Some(after)) => before != after,
+            // Preserve correctness if scrollbar introspection itself fails.
+            _ => true,
+        };
+        let result = (|| {
+            let click_count = selection_gesture_click_count(&inner)?;
+            let selection_changed = if let Some(selection) = selection {
+                set_selection_locked(&mut inner, Some(&selection))?
+            } else if click_count > 0 {
+                set_selection_locked(&mut inner, None)?
+            } else {
+                false
+            };
+            Ok::<_, anyhow::Error>((selection_gesture_autoscroll(&inner)?, selection_changed))
+        })();
+
+        // A successful tick mutates the viewport inside Ghostty. Keep that
+        // mutation and any selection install under this lock, but avoid a new
+        // snapshot generation when both were clamped/equal at a scrollback
+        // boundary. If a later query failed, still publish a real viewport
+        // movement before returning the error.
+        if viewport_changed && inner.generation == generation_before {
+            inner.generation = inner.generation.wrapping_add(1);
+        }
+        let (direction, selection_changed) = result?;
+        Ok(SelectionAutoscrollUpdate {
+            direction,
+            changed: viewport_changed || selection_changed,
+        })
+    }
+
+    /// Finish a normal pointer gesture while retaining repeat-click state for
+    /// a possible double or triple click.
+    pub fn selection_release(&self, point: Option<(u16, u16)>) -> anyhow::Result<()> {
+        let inner = self.inner.lock();
+        let terminal = inner.terminal;
+        let Some(state) = inner.selection_gesture.as_ref() else {
+            return Ok(());
+        };
+        let event = state.release;
+        let gesture = state.gesture;
+
+        let grid_ref = point
+            .map(|(col, row)| selection_grid_ref(terminal, col, row))
+            .transpose()?;
+        let value = grid_ref.as_ref().map_or(std::ptr::null(), |grid_ref| {
+            grid_ref as *const _ as *const c_void
+        });
+        let rc = unsafe {
+            ghostty_selection_gesture_event_set(
+                event,
+                GhosttySelectionGestureEventOption::Ref,
+                value,
+            )
+        };
+        if rc != GHOSTTY_SUCCESS {
+            anyhow::bail!("ghostty_selection_gesture_event_set(RELEASE REF) failed: rc={rc}");
+        }
+        let rc = unsafe {
+            ghostty_selection_gesture_event(gesture, terminal, event, std::ptr::null_mut())
+        };
+        if rc != GHOSTTY_NO_VALUE && rc != GHOSTTY_SUCCESS {
+            anyhow::bail!("ghostty_selection_gesture_event(RELEASE) failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    /// Abandon the active pointer gesture without changing the installed
+    /// terminal selection.
+    pub fn selection_cancel_gesture(&self) {
+        let inner = self.inner.lock();
+        if let Some(state) = inner.selection_gesture.as_ref() {
+            unsafe { ghostty_selection_gesture_reset(state.gesture, inner.terminal) };
+        }
+    }
+
+    /// Read selection presence. FFI failures are logged and reported as false.
+    pub fn has_selection(&self) -> bool {
+        match has_selection_locked(&self.inner.lock()) {
+            Ok(has_selection) => has_selection,
+            Err(err) => {
+                log::warn!("failed to read terminal selection: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// Format the active selection. FFI or UTF-8 failures are logged and
+    /// reported as no selection.
+    pub fn selection_text(&self) -> Option<String> {
+        match selection_text_locked(&self.inner.lock()) {
+            Ok(selection) => selection,
+            Err(err) => {
+                log::warn!("failed to format terminal selection: {err:#}");
+                None
+            }
+        }
+    }
+
+    /// Atomically format and clear the active selection.
+    ///
+    /// An empty string is a real empty selection; `None` means there was no
+    /// selection or formatting failed. Failures are logged and leave the
+    /// selection installed so a later copy can retry.
+    pub fn take_selection_text(&self) -> Option<String> {
+        let mut inner = self.inner.lock();
+        let result = (|| {
+            let Some(text) = selection_text_locked(&inner)? else {
+                return Ok(None);
+            };
+            if let Some(state) = inner.selection_gesture.as_ref() {
+                unsafe { ghostty_selection_gesture_reset(state.gesture, inner.terminal) };
+            }
+            set_selection_locked(&mut inner, None)?;
+            Ok::<_, anyhow::Error>(Some(text))
+        })();
+        match result {
+            Ok(selection) => selection,
+            Err(err) => {
+                log::warn!("failed to take terminal selection: {err:#}");
+                None
+            }
+        }
+    }
+
+    /// Clear the terminal-owned selection. Returns whether a selection was
+    /// present and successfully cleared.
+    pub fn clear_selection(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if let Some(state) = inner.selection_gesture.as_ref() {
+            unsafe { ghostty_selection_gesture_reset(state.gesture, inner.terminal) };
+        }
+        match set_selection_locked(&mut inner, None) {
+            Ok(changed) => changed,
+            Err(err) => {
+                log::warn!("failed to clear terminal selection: {err:#}");
+                false
+            }
+        }
+    }
+
+    pub(crate) fn acknowledge_snapshot(&self, generation: u64) {
+        let mut render = self.render.lock();
+        if !render
+            .snapshot_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.generation == generation)
+        {
+            return;
+        }
+
+        // Newer terminal output remains terminal-dirty until the next begin;
+        // only a newer render snapshot makes this acknowledgment stale.
+        let rc = unsafe { ghostty_render_state_clean(render.render_state) };
+        if rc != GHOSTTY_SUCCESS {
+            log::warn!("ghostty_render_state_clean rc={rc} generation={generation}");
+            return;
+        }
+        if let Some(metadata) = render.snapshot_metadata.as_mut() {
+            metadata.dirty_rows.clear();
+        }
+    }
+
+    /// Consume one or more bells coalesced since the previous drain.
+    pub fn take_bell(&self) -> bool {
+        self.inner
+            .lock()
+            .callback_state
+            .bell_pending
+            .swap(false, Ordering::Relaxed)
+    }
+
+    pub fn take_program_events(&self) -> Vec<ProgramStatusEvent> {
+        let inner = self.inner.lock();
+        inner.callback_state.program_events.lock().take()
+    }
+
+    pub fn push_program_event(&self, event: ProgramStatusEvent) {
+        let inner = self.inner.lock();
+        let mut events = inner.callback_state.program_events.lock();
+        program_events::reduce(&mut events, event);
+    }
+
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        let inner = self.inner.lock();
+        let state = &inner.callback_state;
+        let encoded = state.progress.load(Ordering::Relaxed);
+        if encoded == 0 {
+            return None;
+        }
+        let progress =
+            decode_timed_terminal_progress(encoded, terminal_progress_tick(&state.progress_epoch));
+        if progress.is_none() {
+            let _ =
+                state
+                    .progress
+                    .compare_exchange(encoded, 0, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        progress
+    }
+
+    pub fn is_write_desynchronized(&self) -> bool {
+        self.inner
+            .lock()
+            .callback_state
+            .write_failed
+            .load(Ordering::Acquire)
+    }
+
+    /// Enqueue raw user input through the same ordering boundary as encoded
+    /// keys and parser replies.
+    pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_bytes(bytes, PtyWriteClass::Regular, false)
+    }
+
+    /// Committed user text, unlike tool writes or protocol replies, acknowledges
+    /// this surface only after the host accepts the nonempty input.
+    pub fn write_user_input(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_bytes(bytes, PtyWriteClass::Regular, true)
+    }
+
+    /// Enqueue a state-balancing host report, such as a key or mouse release,
+    /// using the queue capacity reserved for terminal control traffic.
+    pub fn write_control(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_bytes(bytes, PtyWriteClass::ReservedControl, false)
+    }
+
+    /// Report actual pane/window focus transitions, not input broadcast targets.
+    pub fn set_focus(&self, focused: bool) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.focused == focused {
+            return Ok(());
+        }
+        // Track transitions even when reporting is disabled. Enabling mode
+        // 1004 alone must not synthesize a focus event.
+        inner.focused = focused;
+        let mut mode = GhosttyTerminalModeConfig {
+            mode: MODE_FOCUS_EVENT,
+            value: false,
+        };
+        let rc = unsafe {
+            ghostty_terminal_get(
+                inner.terminal,
+                GhosttyTerminalData::Mode,
+                &mut mode as *mut _ as *mut c_void,
+            )
+        };
+        anyhow::ensure!(rc == GHOSTTY_SUCCESS, "focus mode query failed: rc={rc}");
+        if !mode.value {
+            return Ok(());
+        }
+        let mut bytes = [0u8; 3];
+        let mut len = 0;
+        let rc = unsafe {
+            ghostty_focus_encode(
+                i32::from(!focused),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                &mut len,
+            )
+        };
+        anyhow::ensure!(rc == GHOSTTY_SUCCESS, "focus encoding failed: rc={rc}");
+        let state = &inner.callback_state;
+        let write_pty = state
+            .write_pty
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("focus reporting requires a WRITE_PTY callback"))?;
+        let write_order = state.write_order.clone();
+        let write_failed = state.write_failed.clone();
+        // Reserve the write before releasing the mode snapshot, just as keys
+        // and mouse reports do, so parser replies cannot overtake this event.
+        let _write_guard = write_order.lock();
+        drop(inner);
+        let result = write_pty(&bytes[..len], PtyWriteClass::ReservedControl);
+        if let Err(err) = &result {
+            mark_control_write_failed(&write_failed, err);
+        }
+        result.map_err(Into::into)
+    }
+
+    fn write_bytes(
+        &self,
+        bytes: &[u8],
+        class: PtyWriteClass,
+        acknowledge: bool,
+    ) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let inner = self.inner.lock();
+        let callback_state = &inner.callback_state;
+        let Some(write_pty) = callback_state.write_pty.clone() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "terminal input requires a WRITE_PTY callback",
+            ));
+        };
+        let write_failed = callback_state.write_failed.clone();
+        let write_order = callback_state.write_order.clone();
+        let program_events = callback_state.program_events.clone();
+        let write_guard = write_order.lock();
+        let mut events = acknowledge.then(|| program_events.lock());
+        drop(inner);
+        let result = write_pty(bytes, class);
+        if result.is_ok()
+            && let Some(events) = events.as_mut()
+        {
+            program_events::reduce(events, ProgramStatusEvent::Key);
+        }
+        drop(events);
+        if let Err(err) = &result
+            && class == PtyWriteClass::ReservedControl
+        {
+            mark_control_write_failed(&write_failed, err);
+        }
+        drop(write_guard);
+        result
+    }
+
     /// Feed bytes from the PTY into the parser. Non-reentrant per
     /// upstream: do not call from inside a registered callback.
     pub fn feed(&self, bytes: &[u8]) {
+        // Search pins must be reconciled at the same parser boundary as cells.
+        // Transfer ownership to the callback, never reborrow VtInner through
+        // userdata or acquire the search/render/parser locks in the callback.
+        let mut search = self.search.lock();
         let mut inner = self.inner.lock();
-        ingest_osc7_cwd(&mut inner, bytes);
+        {
+            let mut capture = inner.callback_state.capture.lock();
+            capture.search = search.take();
+            capture.generation = inner.generation;
+        }
         // SAFETY: terminal valid; bytes live for the call.
         unsafe { ghostty_terminal_vt_write(inner.terminal, bytes.as_ptr(), bytes.len()) };
+        let generation = {
+            let mut capture = inner.callback_state.capture.lock();
+            *search = capture.search.take();
+            capture.generation
+        };
+        // Tracking event and output format are last-write-wins terminal flags,
+        // not a pure function of the DEC mode bitset. Synchronize from the
+        // terminal after every parsed output chunk so repeated DECSET/DECRST
+        // sequences cannot leave the encoder on a stale protocol.
+        if let Some(mouse) = &inner.mouse {
+            unsafe { ghostty_mouse_encoder_setopt_from_terminal(mouse.encoder, inner.terminal) };
+        }
+        refresh_terminal_metadata(&mut inner);
+        inner.output_generation = inner.output_generation.wrapping_add(1);
+        inner.generation = generation.wrapping_add(1);
+    }
+
+    pub fn render_hold_deadline(&self) -> Option<Instant> {
+        self.inner.lock().callback_state.capture.lock().deadline
+    }
+
+    /// Expire only the hold for which the host armed its timer. Manual mode
+    /// changes do not invoke RENDER_HOLD, so release our capture explicitly.
+    pub fn expire_render_hold(&self, deadline: Instant) -> bool {
+        let mut inner = self.inner.lock();
+        let mut capture = inner.callback_state.capture.lock();
+        if capture.deadline != Some(deadline) || Instant::now() < deadline {
+            return false;
+        }
+        let mode = GhosttyTerminalModeConfig {
+            mode: ghostty_mode(2026, false),
+            value: false,
+        };
+        let rc = unsafe {
+            ghostty_terminal_set(
+                inner.terminal,
+                GhosttyTerminalOption::Mode,
+                (&mode as *const GhosttyTerminalModeConfig).cast(),
+            )
+        };
+        if rc != GHOSTTY_SUCCESS {
+            log::warn!("render hold timeout rc={rc}");
+            return false;
+        }
+        capture.deadline = None;
+        capture.pending = None;
+        drop(capture);
         inner.generation = inner.generation.wrapping_add(1);
+        true
+    }
+
+    /// Update the renderer geometry used for cell and SGR-pixel mouse formats.
+    /// Ghostty clears motion deduplication whenever this option is set, so
+    /// compare the complete geometry before crossing the FFI boundary.
+    pub fn set_mouse_geometry(
+        &self,
+        screen_width_px: u32,
+        screen_height_px: u32,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> anyhow::Result<()> {
+        let geometry = GhosttyMouseEncoderSize::new(
+            screen_width_px,
+            screen_height_px,
+            cell_width_px,
+            cell_height_px,
+        );
+        let mut inner = self.inner.lock();
+        if let Some(mouse) = inner.mouse.as_mut() {
+            if mouse.geometry == geometry {
+                return Ok(());
+            }
+            unsafe {
+                ghostty_mouse_encoder_setopt(
+                    mouse.encoder,
+                    GhosttyMouseEncoderOption::Size,
+                    &geometry as *const _ as *const c_void,
+                )
+            };
+            mouse.geometry = geometry;
+            return Ok(());
+        }
+        let terminal = inner.terminal;
+        inner.mouse = Some(MouseEncoderState::new(terminal, geometry)?);
+        Ok(())
+    }
+
+    /// Encode one normalized pointer event with Ghostty's effective terminal
+    /// mouse mode and synchronously write any resulting protocol bytes.
+    pub fn send_mouse_event(&self, event: VtMouseEvent) -> anyhow::Result<VtMouseOutcome> {
+        if !event.surface_x_px.is_finite() || !event.surface_y_px.is_finite() {
+            anyhow::bail!("terminal mouse position must be finite");
+        }
+        if event.action != VtMouseAction::Motion && event.button.is_none() {
+            anyhow::bail!("terminal mouse press and release events require a button");
+        }
+
+        let inner = self.inner.lock();
+        let mouse = inner
+            .mouse
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("terminal mouse geometry is not initialized"))?;
+        let callback_state = &inner.callback_state;
+        let Some(write_pty) = callback_state.write_pty.clone() else {
+            anyhow::bail!("terminal mouse encoding requires a WRITE_PTY callback");
+        };
+        let write_failed = callback_state.write_failed.clone();
+        let write_order = callback_state.write_order.clone();
+        let any_button_pressed = event.action == VtMouseAction::Press
+            || (event.action == VtMouseAction::Motion && event.button.is_some());
+
+        unsafe {
+            ghostty_mouse_encoder_setopt(
+                mouse.encoder,
+                GhosttyMouseEncoderOption::AnyButtonPressed,
+                &any_button_pressed as *const _ as *const c_void,
+            );
+            ghostty_mouse_event_set_action(mouse.event, ghostty_mouse_action(event.action));
+            if let Some(button) = event.button {
+                ghostty_mouse_event_set_button(mouse.event, ghostty_mouse_button(button));
+            } else {
+                ghostty_mouse_event_clear_button(mouse.event);
+            }
+            ghostty_mouse_event_set_mods(mouse.event, ghostty_mouse_modifiers(event.modifiers));
+            ghostty_mouse_event_set_position(
+                mouse.event,
+                GhosttyMousePosition {
+                    x: event.surface_x_px,
+                    y: event.surface_y_px,
+                },
+            );
+        }
+
+        let mut inline = [0_u8; 128];
+        let mut len = 0_usize;
+        let mut rc = unsafe {
+            ghostty_mouse_encoder_encode(
+                mouse.encoder,
+                mouse.event,
+                inline.as_mut_ptr().cast(),
+                inline.len(),
+                &mut len,
+            )
+        };
+
+        let mut overflow = Vec::new();
+        let bytes = if rc == GHOSTTY_OUT_OF_SPACE {
+            overflow.resize(len, 0);
+            rc = unsafe {
+                ghostty_mouse_encoder_encode(
+                    mouse.encoder,
+                    mouse.event,
+                    overflow.as_mut_ptr().cast(),
+                    overflow.len(),
+                    &mut len,
+                )
+            };
+            if rc != GHOSTTY_SUCCESS {
+                anyhow::bail!("ghostty_mouse_encoder_encode retry failed: rc={rc}");
+            }
+            if len > overflow.len() {
+                anyhow::bail!("ghostty mouse encoder exceeded its requested output size");
+            }
+            &overflow[..len]
+        } else {
+            if rc != GHOSTTY_SUCCESS {
+                anyhow::bail!("ghostty_mouse_encoder_encode failed: rc={rc}");
+            }
+            if len > inline.len() {
+                anyhow::bail!("ghostty mouse encoder returned an invalid output size");
+            }
+            &inline[..len]
+        };
+
+        if bytes.is_empty() {
+            return Ok(VtMouseOutcome::default());
+        }
+
+        // Reserve this host-write position before releasing the mode snapshot.
+        // Parser-generated replies cannot then overtake the encoded event.
+        let write_guard = write_order.lock();
+        drop(inner);
+        let class = if event.action == VtMouseAction::Release {
+            PtyWriteClass::ReservedControl
+        } else {
+            PtyWriteClass::Regular
+        };
+        let result = write_pty(bytes, class);
+        if let Err(err) = &result
+            && class == PtyWriteClass::ReservedControl
+        {
+            mark_control_write_failed(&write_failed, err);
+        }
+        drop(write_guard);
+        result.map_err(|err| anyhow::anyhow!("failed to write encoded mouse event: {err}"))?;
+
+        Ok(VtMouseOutcome {
+            output_written: true,
+        })
+    }
+
+    /// Encode one platform key event against the terminal's current modes
+    /// and synchronously write the resulting bytes through WRITE_PTY.
+    ///
+    /// The mode snapshot, reusable encoder/event, and terminal are all
+    /// protected by one mutex so DECCKM/modifyOtherKeys/Kitty state cannot
+    /// change between parsing output and encoding the next key.
+    pub fn send_key(&self, event: &VtKeyEvent<'_>) -> anyhow::Result<VtKeyOutcome> {
+        let inner = self.inner.lock();
+        let callback_state = &inner.callback_state;
+        let Some(write_pty) = callback_state.write_pty.clone() else {
+            anyhow::bail!("terminal key encoding requires a WRITE_PTY callback");
+        };
+        let write_failed = callback_state.write_failed.clone();
+        let write_order = callback_state.write_order.clone();
+        let program_events = callback_state.program_events.clone();
+
+        let mut kitty_flags = 0_u8;
+        let kitty_flags_rc = unsafe {
+            ghostty_terminal_get(
+                inner.terminal,
+                GhosttyTerminalData::KittyKeyboardFlags,
+                &mut kitty_flags as *mut _ as *mut c_void,
+            )
+        };
+        if kitty_flags_rc != GHOSTTY_SUCCESS {
+            kitty_flags = 0;
+        }
+
+        unsafe {
+            ghostty_key_encoder_setopt_from_terminal(inner.key_encoder, inner.terminal);
+            ghostty_key_event_set_action(inner.key_event, ghostty_key_action(event.action));
+            ghostty_key_event_set_key(inner.key_event, ghostty_key(event.key));
+            ghostty_key_event_set_mods(inner.key_event, ghostty_modifiers(event.modifiers));
+            ghostty_key_event_set_consumed_mods(
+                inner.key_event,
+                ghostty_modifiers(event.consumed_modifiers),
+            );
+            ghostty_key_event_set_composing(inner.key_event, false);
+            ghostty_key_event_set_utf8(
+                inner.key_event,
+                if event.text.is_empty() {
+                    std::ptr::null()
+                } else {
+                    event.text.as_ptr().cast()
+                },
+                event.text.len(),
+            );
+            ghostty_key_event_set_unshifted_codepoint(
+                inner.key_event,
+                event.unshifted_codepoint.map_or(0, u32::from),
+            );
+        }
+
+        let mut inline = [0_u8; 128];
+        let mut len = 0_usize;
+        let mut rc = unsafe {
+            ghostty_key_encoder_encode(
+                inner.key_encoder,
+                inner.key_event,
+                inline.as_mut_ptr().cast(),
+                inline.len(),
+                &mut len,
+            )
+        };
+
+        let mut overflow = Vec::new();
+        let bytes = if rc == GHOSTTY_OUT_OF_SPACE {
+            overflow.resize(len, 0);
+            rc = unsafe {
+                ghostty_key_encoder_encode(
+                    inner.key_encoder,
+                    inner.key_event,
+                    overflow.as_mut_ptr().cast(),
+                    overflow.len(),
+                    &mut len,
+                )
+            };
+            if rc != GHOSTTY_SUCCESS {
+                anyhow::bail!("ghostty_key_encoder_encode retry failed: rc={rc}");
+            }
+            if len > overflow.len() {
+                anyhow::bail!("ghostty key encoder exceeded its requested output size");
+            }
+            &overflow[..len]
+        } else {
+            if rc != GHOSTTY_SUCCESS {
+                anyhow::bail!("ghostty_key_encoder_encode failed: rc={rc}");
+            }
+            if len > inline.len() {
+                anyhow::bail!("ghostty key encoder returned an invalid output size");
+            }
+            &inline[..len]
+        };
+
+        if !bytes.is_empty() {
+            // Reserve the next host-write position before releasing the VT
+            // state. PTY feeds may then parse concurrently, but any generated
+            // reply waits behind this key instead of overtaking it. The real
+            // host callbacks enqueue into a non-blocking bounded queue.
+            let write_guard = write_order.lock();
+            // Keep newly generated reports behind acknowledgement of this
+            // accepted write. Rejection leaves completion state untouched.
+            let mut events = program_events.lock();
+            drop(inner);
+            let class = if event.action == VtKeyAction::Release {
+                PtyWriteClass::ReservedControl
+            } else {
+                PtyWriteClass::Regular
+            };
+            if let Err(err) = write_pty(bytes, class) {
+                if class == PtyWriteClass::ReservedControl {
+                    mark_control_write_failed(&write_failed, &err);
+                }
+                return Err(anyhow::anyhow!("failed to write encoded key: {err}"));
+            }
+            if matches!(event.action, VtKeyAction::Press | VtKeyAction::Repeat) {
+                program_events::reduce(&mut events, ProgramStatusEvent::Key);
+            }
+            drop(events);
+            drop(write_guard);
+        }
+
+        Ok(VtKeyOutcome {
+            output_accepted: !bytes.is_empty(),
+            report_releases: kitty_flags & GHOSTTY_KITTY_KEY_REPORT_EVENTS != 0,
+        })
+    }
+
+    /// Paste user-selected clipboard text according to the terminal's active
+    /// bracketed-paste and Kitty paste-event modes.
+    ///
+    /// Potential command injection is rejected before any PTY write. The UI
+    /// may explicitly retry with `confirm_unsafe_paste` after showing the text
+    /// to the user. A successful Kitty paste event caches only this user-approved
+    /// text for the event's one-time granted clipboard read.
+    pub fn paste_text(
+        &self,
+        text: &str,
+        source: VtPasteSource,
+        confirm_unsafe_paste: bool,
+    ) -> anyhow::Result<VtPasteResult> {
+        if text.len() > TERMINAL_PASTE_LIMIT_BYTES {
+            anyhow::bail!(
+                "terminal paste exceeds the {} byte safety limit",
+                TERMINAL_PASTE_LIMIT_BYTES
+            );
+        }
+
+        let inner = self.inner.lock();
+        let callback_state = &inner.callback_state;
+        let Some(write_pty) = callback_state.write_pty.as_ref() else {
+            anyhow::bail!("terminal paste requires a WRITE_PTY callback");
+        };
+        let previous = callback_state
+            .pending_paste_write
+            .lock()
+            .replace(PendingPasteWrite::Buffer(Vec::new()));
+        debug_assert!(previous.is_none(), "paste writes must not nest");
+
+        let mime = GhosttyString {
+            ptr: TEXT_PLAIN_MIME.as_ptr(),
+            len: TEXT_PLAIN_MIME.len(),
+        };
+        let mut reader = VtPasteReader {
+            text: text.as_bytes(),
+            served: false,
+        };
+        let paste = GhosttyPaste {
+            size: std::mem::size_of::<GhosttyPaste>(),
+            location: GhosttyClipboardLocation::Standard,
+            source: match source {
+                VtPasteSource::Clipboard => GhosttyPasteSource::Clipboard,
+                VtPasteSource::Text => GhosttyPasteSource::Text,
+            },
+            mimes: &mime,
+            mimes_len: 1,
+            reader: GhosttyMimeReader {
+                read: Some(vt_paste_read_callback),
+                userdata: (&mut reader as *mut VtPasteReader<'_>).cast(),
+            },
+            allow_unsafe: confirm_unsafe_paste,
+        };
+        let mut written = false;
+        let rc = unsafe { ghostty_terminal_paste(inner.terminal, &paste, &mut written) };
+        let pending_write = callback_state
+            .pending_paste_write
+            .lock()
+            .take()
+            .expect("paste write capture initialized");
+        match rc {
+            GHOSTTY_SUCCESS => {
+                let PendingPasteWrite::Buffer(output) = pending_write else {
+                    anyhow::bail!("terminal paste produced too much PTY output");
+                };
+                if !output.is_empty() {
+                    // The real host callback is a non-blocking bounded queue.
+                    // Keep the VT lock through this single enqueue so the
+                    // one-time Kitty grant is installed before a program can
+                    // react to the event and request its clipboard payload.
+                    let _write_guard = callback_state.write_order.lock();
+                    write_pty(&output, PtyWriteClass::Regular).map_err(|err| {
+                        anyhow::anyhow!("terminal paste failed to enqueue PTY bytes: {err}")
+                    })?;
+                }
+                if written && !reader.served && source == VtPasteSource::Clipboard {
+                    // Ghostty does not call the MIME reader for a Kitty paste
+                    // event. Retain the exact user-selected text for the
+                    // event's later one-time granted read.
+                    *callback_state.clipboard_text.lock() = Some(Arc::from(text));
+                }
+                Ok(if written {
+                    VtPasteResult::Accepted
+                } else {
+                    VtPasteResult::Empty
+                })
+            }
+            GHOSTTY_REJECTED => Ok(VtPasteResult::RequiresConfirmation),
+            GHOSTTY_IO_ERROR => {
+                anyhow::bail!("ghostty_terminal_paste failed to read clipboard text")
+            }
+            _ => anyhow::bail!("ghostty_terminal_paste failed: rc={rc}"),
+        }
     }
 
     pub fn clear_screen_and_scrollback(&self) {
@@ -1120,269 +4039,351 @@ impl VtScreen {
         }
         inner.cols = cols;
         inner.rows = rows;
-        if let Some(state) = inner.callback_state.as_ref() {
-            state.cols.store(cols, Ordering::Release);
-            state.rows.store(rows, Ordering::Release);
-            state
-                .cell_width
-                .store(cell_width_px.max(1), Ordering::Release);
-            state
-                .cell_height
-                .store(cell_height_px.max(1), Ordering::Release);
-        }
-        let total = cols as usize * rows as usize;
-        inner.scratch.clear();
-        inner.scratch.resize(total, Cell::default());
-        inner.scratch_cols = cols;
-        inner.scratch_rows = rows;
-        inner.force_full_snapshot = true;
+        let state = &inner.callback_state;
+        state.cols.store(cols, Ordering::Release);
+        state.rows.store(rows, Ordering::Release);
+        state
+            .cell_width
+            .store(cell_width_px.max(1), Ordering::Release);
+        state
+            .cell_height
+            .store(cell_height_px.max(1), Ordering::Release);
         inner.generation = inner.generation.wrapping_add(1);
+        inner.required_full_snapshot_generation = inner.generation;
         Ok(())
     }
 
     pub fn snapshot(&self) -> ScreenSnapshot {
+        self.snapshot_impl(true).unwrap_or_else(|| {
+            let inner = self.inner.lock();
+            empty_snapshot(inner.cols, inner.rows, inner.generation)
+        })
+    }
+
+    pub(crate) fn try_snapshot(&self) -> Option<ScreenSnapshot> {
+        self.snapshot_impl(false)
+    }
+
+    fn snapshot_impl(&self, wait_for_search: bool) -> Option<ScreenSnapshot> {
         let snapshot_started = perf_trace_enabled().then(Instant::now);
-        let mut inner = self.inner.lock();
+        // Query replacement/navigation can release a large result set.
+        // Rendering keeps the previous frame; text readers wait without
+        // holding the render lock or returning an empty terminal.
+        let mut search = if wait_for_search {
+            self.search.lock()
+        } else {
+            self.search.try_lock()?
+        };
+        let mut render = self.render.lock();
+        let epoch = 'capture: {
+            let inner = self.inner.lock();
+            let mut capture = inner.callback_state.capture.lock();
+            if capture.deadline.is_some() && capture.pending.is_none() {
+                // Already adopted, or capture failed: keep the last complete
+                // frame. Defer native damage recovery until a frame is ready
+                // or the hold ends, rather than erasing this fallback now.
+                drop(capture);
+                drop(inner);
+                drop(search);
+                return render
+                    .snapshot_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.snapshot(&render.scratch, &render.selection_ranges));
+            }
+            if render.capture_serial != capture.serial {
+                // begin_update consumes terminal damage, even when its result
+                // is superseded or released before the renderer adopts it.
+                render.invalidate_render_state();
+                render.capture_serial = capture.serial;
+            }
+            if let Some(mut frame) = capture.pending.take() {
+                render.render_state = std::mem::replace(&mut frame.state, std::ptr::null_mut());
+                break 'capture frame.epoch.clone();
+            }
+            if !render.ensure_render_state() {
+                return None;
+            }
+            let fallback_cols = inner.cols;
+            let fallback_rows = inner.rows;
 
-        let fallback_cols = inner.cols;
-        let fallback_rows = inner.rows;
+            if render
+                .snapshot_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.generation == inner.generation)
+            {
+                drop(capture);
+                drop(inner);
+                drop(search);
+                let metadata = render
+                    .snapshot_metadata
+                    .as_ref()
+                    .expect("snapshot metadata checked above");
+                return Some(metadata.snapshot(&render.scratch, &render.selection_ranges));
+            }
 
-        if inner.render_state.is_null() {
-            // Render-state path disabled — return empty snapshot. The
-            // renderer still clears the pane to the background.
-            return ScreenSnapshot {
-                cols: fallback_cols,
-                rows: fallback_rows,
-                cells: Vec::new(),
-                dirty_rows: Vec::new(),
-                cursor: Cursor::default(),
-                alternate_screen: false,
-                scrollbar: None,
-                title: None,
-                generation: inner.generation,
+            let mut active_screen = GhosttyTerminalScreen::Primary;
+            let rc = unsafe {
+                ghostty_terminal_get(
+                    inner.terminal,
+                    GhosttyTerminalData::ActiveScreen,
+                    &mut active_screen as *mut _ as *mut c_void,
+                )
             };
+            if rc != GHOSTTY_SUCCESS {
+                log::warn!("ghostty_terminal_get(ACTIVE_SCREEN) rc={rc}");
+                render.force_full_snapshot = true;
+                return None;
+            }
+
+            let kitty_placements = snapshot_kitty_placements(inner.terminal, &mut capture.kitty);
+            let epoch = SnapshotEpoch {
+                fallback_cols,
+                fallback_rows,
+                search_highlights: match search.as_mut() {
+                    Some(search) => match search.highlights(&inner) {
+                        Ok(highlights) => highlights,
+                        Err(err) => {
+                            log::warn!("{err}");
+                            return None;
+                        }
+                    },
+                    None => Vec::new(),
+                },
+                kitty_placements,
+                alternate_screen: active_screen == GhosttyTerminalScreen::Alternate,
+                scrollbar: read_scrollbar(inner.terminal),
+                generation: inner.generation,
+                required_full_snapshot_generation: inner.required_full_snapshot_generation,
+            };
+
+            let rc =
+                unsafe { ghostty_render_state_begin_update(render.render_state, inner.terminal) };
+            if rc != GHOSTTY_SUCCESS {
+                log::warn!("ghostty_render_state_begin_update rc={rc}");
+                // begin_update may consume terminal dirty state before an
+                // allocation fails. A new state forces the retry to rebuild
+                // from the terminal instead of reusing a partial update.
+                render.invalidate_render_state();
+                return None;
+            }
+            epoch
+        };
+        drop(search);
+
+        let rc = unsafe { ghostty_render_state_end_update(render.render_state) };
+        if rc != GHOSTTY_SUCCESS {
+            log::warn!("ghostty_render_state_end_update rc={rc}");
+            render.invalidate_render_state();
+            return None;
         }
 
-        // SAFETY: state + terminal valid for the lifetime of `inner`.
-        let rc = unsafe { ghostty_render_state_update(inner.render_state, inner.terminal) };
-        if rc != 0 {
-            log::warn!("ghostty_render_state_update rc={rc}");
-        }
-
-        // Palette defaults. Cells with no explicit SGR color report
-        // FG_COLOR / BG_COLOR as (0,0,0) — the renderer is expected to
-        // substitute the terminal's default foreground/background from
-        // the render state. Without this, the pwsh banner (and any
-        // unstyled text) renders black-on-black.
         let mut default_fg = GhosttyColorRgb {
             r: 0xCC,
             g: 0xCC,
             b: 0xCC,
         };
         let mut default_bg = GhosttyColorRgb::default();
-        // SAFETY: out params typed as GhosttyColorRgb per render.h.
-        unsafe {
-            let _ = ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::ColorForeground,
-                &mut default_fg as *mut _ as *mut c_void,
+        let mut cols = epoch.fallback_cols;
+        let mut rows = epoch.fallback_rows;
+        let mut state_dirty = GhosttyRenderStateDirty::False;
+        let mut cursor_data = GhosttyRenderStateCursor::default();
+        let render_state = render.render_state;
+        let state_keys = [
+            GhosttyRenderStateData::ColorForeground,
+            GhosttyRenderStateData::ColorBackground,
+            GhosttyRenderStateData::Cols,
+            GhosttyRenderStateData::Rows,
+            GhosttyRenderStateData::Dirty,
+            GhosttyRenderStateData::RowIterator,
+            GhosttyRenderStateData::Cursor,
+        ];
+        let mut state_values = [
+            &mut default_fg as *mut _ as *mut c_void,
+            &mut default_bg as *mut _ as *mut c_void,
+            &mut cols as *mut _ as *mut c_void,
+            &mut rows as *mut _ as *mut c_void,
+            &mut state_dirty as *mut _ as *mut c_void,
+            &mut render.row_iter as *mut _ as *mut c_void,
+            &mut cursor_data as *mut _ as *mut c_void,
+        ];
+        let mut state_written = 0_usize;
+        let rc = unsafe {
+            ghostty_render_state_get_multi(
+                render_state,
+                state_keys.len(),
+                state_keys.as_ptr(),
+                state_values.as_mut_ptr(),
+                &mut state_written,
+            )
+        };
+        if rc != GHOSTTY_SUCCESS || state_written != state_keys.len() {
+            log::warn!(
+                "ghostty_render_state_get_multi rc={rc} written={state_written}/{}",
+                state_keys.len()
             );
-            let _ = ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::ColorBackground,
-                &mut default_bg as *mut _ as *mut c_void,
-            );
+            render.force_full_snapshot = true;
+            return None;
         }
 
         // Ghostty's render-state dimensions can lag the host resize by a
-        // frame or two. Snapshot the actual render-state geometry so we
-        // don't invent blank tail rows from our requested size while the
-        // terminal catches up asynchronously.
-        let mut cols = fallback_cols;
-        let mut rows = fallback_rows;
-        unsafe {
-            let _ = ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::Cols,
-                &mut cols as *mut _ as *mut c_void,
-            );
-            let _ = ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::Rows,
-                &mut rows as *mut _ as *mut c_void,
-            );
-        }
+        // frame or two. Snapshot its actual geometry instead of inventing
+        // blank tail rows from the requested host size.
         cols = cols.max(1);
         rows = rows.max(1);
 
-        let mut active_screen = GhosttyTerminalScreen::Primary;
-        let active_screen_rc = unsafe {
-            ghostty_terminal_get(
-                inner.terminal,
-                GhosttyTerminalData::ActiveScreen,
-                &mut active_screen as *mut _ as *mut c_void,
-            )
-        };
-        let alternate_screen =
-            active_screen_rc == 0 && active_screen == GhosttyTerminalScreen::Alternate;
-
-        let mut force_all_dirty = inner.force_full_snapshot;
-        let mut full_redraw = force_all_dirty;
-        let mut state_dirty = GhosttyRenderStateDirty::False;
-        // SAFETY: DIRTY out param is sized for the enum.
-        unsafe {
-            let _ = ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::Dirty,
-                &mut state_dirty as *mut _ as *mut c_void,
-            );
-        }
+        let mut full_redraw = render.force_full_snapshot
+            || render.applied_full_snapshot_generation != epoch.required_full_snapshot_generation;
         if state_dirty == GhosttyRenderStateDirty::Full {
             full_redraw = true;
         }
 
         let total = cols as usize * rows as usize;
-        if inner.scratch.len() != total || inner.scratch_cols != cols || inner.scratch_rows != rows
+        if render.scratch.len() != total
+            || render.scratch_cols != cols
+            || render.scratch_rows != rows
         {
-            inner.scratch.clear();
-            inner.scratch.resize(total, Cell::default());
-            inner.scratch_cols = cols;
-            inner.scratch_rows = rows;
-            force_all_dirty = true;
+            render.scratch.clear();
+            render.scratch.resize(total, Cell::default());
+            render.selection_ranges.clear();
+            render.selection_ranges.resize(rows as usize, None);
+            render.scratch_cols = cols;
+            render.scratch_rows = rows;
             full_redraw = true;
         }
 
         let mut dirty_rows: Vec<u16> = Vec::new();
-
-        // Bind the row iterator to the current state.
-        // SAFETY: state + iter valid.
-        let rc = unsafe {
-            ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::RowIterator,
-                &mut inner.row_iter as *mut _ as *mut c_void,
-            )
-        };
-        if rc != 0 {
-            log::warn!("ghostty_render_state_get(ROW_ITERATOR) rc={rc}");
-            return empty_snapshot(cols, rows, inner.generation);
-        }
-
-        let mut row_idx: u16 = 0;
-        // SAFETY: row_iter valid; `_next` returns bool.
-        while unsafe { ghostty_render_state_row_iterator_next(inner.row_iter) } {
+        let mut next_full_row = 0_u16;
+        loop {
+            let row_idx = if full_redraw {
+                if !unsafe { ghostty_render_state_row_iterator_next(render.row_iter) } {
+                    break;
+                }
+                let row = next_full_row;
+                next_full_row = next_full_row.saturating_add(1);
+                row
+            } else {
+                let mut row = 0_u16;
+                if !unsafe {
+                    ghostty_render_state_row_iterator_next_dirty(render.row_iter, &mut row)
+                } {
+                    break;
+                }
+                row
+            };
             if row_idx >= rows {
+                if !full_redraw {
+                    log::warn!(
+                        "ghostty_render_state_row_iterator_next_dirty returned row {row_idx} for {rows} rows"
+                    );
+                    render.force_full_snapshot = true;
+                    return None;
+                }
                 break;
             }
 
-            let mut dirty = GhosttyRenderStateDirty::False;
-            // SAFETY: DIRTY out param is sized for the enum.
-            unsafe {
-                let _ = ghostty_render_state_row_get(
-                    inner.row_iter,
-                    GhosttyRenderStateRowData::Dirty,
-                    &mut dirty as *mut _ as *mut c_void,
-                );
-            }
-
-            if !full_redraw && dirty == GhosttyRenderStateDirty::False {
-                row_idx += 1;
-                continue;
-            }
-            let mut row_changed = force_all_dirty;
-
-            // Bind the cells iterator to the current row.
-            // SAFETY: iter + cells valid.
             let rc = unsafe {
                 ghostty_render_state_row_get(
-                    inner.row_iter,
+                    render.row_iter,
                     GhosttyRenderStateRowData::Cells,
-                    &mut inner.row_cells as *mut _ as *mut c_void,
+                    &mut render.row_cells as *mut _ as *mut c_void,
                 )
             };
-            if rc != 0 {
-                log::warn!("row_get(CELLS) rc={rc} at row {row_idx}");
-                row_idx += 1;
-                continue;
+            if rc != GHOSTTY_SUCCESS {
+                log::warn!("ghostty_render_state_row_get(CELLS) rc={rc} at row {row_idx}");
+                render.force_full_snapshot = true;
+                return None;
             }
+
+            let mut row_selection = GhosttyRenderStateRowSelection::default();
+            let rc = unsafe {
+                ghostty_render_state_row_get(
+                    render.row_iter,
+                    GhosttyRenderStateRowData::Selection,
+                    &mut row_selection as *mut _ as *mut c_void,
+                )
+            };
+            render.selection_ranges[row_idx as usize] = match rc {
+                GHOSTTY_SUCCESS
+                    if row_selection.start_x <= row_selection.end_x
+                        && row_selection.end_x < cols =>
+                {
+                    Some(SelectionRange {
+                        start: row_selection.start_x,
+                        end: row_selection.end_x,
+                    })
+                }
+                GHOSTTY_NO_VALUE => None,
+                GHOSTTY_SUCCESS => {
+                    log::warn!(
+                        "invalid render selection range at row {row_idx}: {}..={} for {cols} cols",
+                        row_selection.start_x,
+                        row_selection.end_x
+                    );
+                    render.force_full_snapshot = true;
+                    return None;
+                }
+                _ => {
+                    log::warn!("ghostty_render_state_row_get(SELECTION) rc={rc} at row {row_idx}");
+                    render.force_full_snapshot = true;
+                    return None;
+                }
+            };
 
             let row_start = row_idx as usize * cols as usize;
             let mut col_idx: u16 = 0;
             // SAFETY: cells valid; `_next` returns bool.
-            while unsafe { ghostty_render_state_row_cells_next(inner.row_cells) } {
+            while unsafe { ghostty_render_state_row_cells_next(render.row_cells) } {
                 if col_idx >= cols {
                     break;
                 }
-                let cell = read_cell(inner.row_cells, default_fg, default_bg, alternate_screen);
+                let Some(cell) = read_cell(
+                    render.row_cells,
+                    default_fg,
+                    default_bg,
+                    epoch.alternate_screen,
+                ) else {
+                    log::warn!("failed to read render cell at row={row_idx} col={col_idx}");
+                    render.force_full_snapshot = true;
+                    return None;
+                };
                 let idx = row_start + col_idx as usize;
-                row_changed |= inner.scratch[idx] != cell;
-                inner.scratch[idx] = cell;
+                render.scratch[idx] = cell;
                 col_idx += 1;
             }
-            // Clear trailing cells in the row.
-            for c in col_idx..cols {
-                let idx = row_start + c as usize;
-                row_changed |= inner.scratch[idx] != Cell::default();
-                inner.scratch[idx] = Cell::default();
+            if col_idx != cols {
+                log::warn!(
+                    "vt snapshot row ended early: row={row_idx} cells={col_idx} expected={cols}"
+                );
+                render.force_full_snapshot = true;
+                return None;
             }
 
-            if row_changed {
-                dirty_rows.push(row_idx);
-            }
-
-            row_idx += 1;
+            dirty_rows.push(row_idx);
         }
 
-        if full_redraw && row_idx < rows {
+        if full_redraw && next_full_row != rows {
             log::warn!(
-                "vt snapshot full redraw ended early: iter_rows={row_idx} expected_rows={rows} cols={cols}"
+                "vt snapshot full redraw ended early: iter_rows={next_full_row} expected_rows={rows} cols={cols}"
             );
-            for trailing_row in row_idx..rows {
-                let row_start = trailing_row as usize * cols as usize;
-                let row_end = row_start + cols as usize;
-                let mut row_changed = force_all_dirty;
-                for cell in &mut inner.scratch[row_start..row_end] {
-                    row_changed |= *cell != Cell::default();
-                    *cell = Cell::default();
-                }
-                if row_changed {
-                    dirty_rows.push(trailing_row);
-                }
+            render.force_full_snapshot = true;
+            return None;
+        }
+
+        render.force_full_snapshot = false;
+        render.applied_full_snapshot_generation = epoch.required_full_snapshot_generation;
+
+        let cursor = if cursor_data.viewport_has_value {
+            Cursor {
+                col: cursor_data.viewport_x,
+                row: cursor_data.viewport_y,
+                visible: cursor_data.visible,
+                style: CursorStyle::from_raw(cursor_data.visual_style),
+                blinking: cursor_data.blinking,
             }
-        }
-
-        inner.force_full_snapshot = false;
-
-        // Cursor read from the render state keys (not the terminal, to
-        // stay consistent with the render snapshot).
-        let mut visible: bool = false;
-        let mut col_u16: u16 = 0;
-        let mut row_u16: u16 = 0;
-        // SAFETY: out params sized per upstream render.h.
-        unsafe {
-            let _ = ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::CursorViewportX,
-                &mut col_u16 as *mut _ as *mut c_void,
-            );
-            let _ = ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::CursorViewportY,
-                &mut row_u16 as *mut _ as *mut c_void,
-            );
-            let _ = ghostty_render_state_get(
-                inner.render_state,
-                GhosttyRenderStateData::CursorVisible,
-                &mut visible as *mut _ as *mut c_void,
-            );
-        }
-
-        let cursor = Cursor {
-            col: col_u16,
-            row: row_u16,
-            visible,
+        } else {
+            Cursor::default()
         };
-        let previous_cursor = inner.last_cursor;
+        let previous_cursor = render.last_cursor;
         if previous_cursor != cursor {
             if previous_cursor.visible && previous_cursor.row < rows {
                 push_unique_row(&mut dirty_rows, previous_cursor.row);
@@ -1390,25 +4391,38 @@ impl VtScreen {
             if cursor.visible && cursor.row < rows {
                 push_unique_row(&mut dirty_rows, cursor.row);
             }
-            inner.last_cursor = cursor;
+            render.last_cursor = cursor;
+        }
+        // Search pins can move or disappear without a style change in the
+        // underlying cells. Repaint both old and new highlight rows.
+        for highlight in epoch.search_highlights.iter().chain(
+            render
+                .snapshot_metadata
+                .iter()
+                .flat_map(|metadata| &metadata.search_highlights),
+        ) {
+            if highlight.row < rows {
+                push_unique_row(&mut dirty_rows, highlight.row);
+            }
         }
         dirty_rows.sort_unstable();
 
-        let clone_started = perf_trace_enabled().then(Instant::now);
-        let cells = inner.scratch.clone();
-        let clone_elapsed_ms =
-            clone_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
-        let snapshot = ScreenSnapshot {
+        let metadata = SnapshotMetadata {
             cols,
             rows,
-            cells,
+            search_highlights: epoch.search_highlights,
+            kitty_placements: epoch.kitty_placements,
             dirty_rows,
             cursor,
-            alternate_screen,
-            scrollbar: read_scrollbar(inner.terminal),
-            title: None,
-            generation: inner.generation,
+            alternate_screen: epoch.alternate_screen,
+            scrollbar: epoch.scrollbar,
+            generation: epoch.generation,
         };
+        let clone_started = perf_trace_enabled().then(Instant::now);
+        let snapshot = metadata.snapshot(&render.scratch, &render.selection_ranges);
+        let clone_elapsed_ms =
+            clone_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+        render.snapshot_metadata = Some(metadata);
 
         if let Some(started) = snapshot_started {
             let total_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1439,7 +4453,7 @@ impl VtScreen {
             }
         }
 
-        snapshot
+        Some(snapshot)
     }
 
     pub fn size(&self) -> (u16, u16) {
@@ -1449,9 +4463,10 @@ impl VtScreen {
 
     pub fn set_dark_mode(&self, dark: bool) {
         let inner = self.inner.lock();
-        if let Some(state) = inner.callback_state.as_ref() {
-            state.dark_mode.store(dark, Ordering::Release);
-        }
+        inner
+            .callback_state
+            .dark_mode
+            .store(dark, Ordering::Release);
     }
 
     /// Returns `true` when at least one mouse-tracking mode is set
@@ -1463,6 +4478,13 @@ impl VtScreen {
             || self.mode_active(MODE_BUTTON_MOUSE)
             || self.mode_active(MODE_ANY_MOUSE)
             || self.mode_active(MODE_X10_MOUSE)
+    }
+
+    /// Returns `true` when the application requested pointer motion reports.
+    /// Normal (1000) and X10 tracking only receive button events; button-motion
+    /// (1002) and any-motion (1003) receive drag updates.
+    pub fn mouse_motion_tracking_active(&self) -> bool {
+        self.mode_active(MODE_BUTTON_MOUSE) || self.mode_active(MODE_ANY_MOUSE)
     }
 
     /// SGR (1006) mouse format is the extended coord encoding.
@@ -1489,29 +4511,24 @@ impl VtScreen {
         read_scrollbar(inner.terminal)
     }
 
-    /// Current working directory reported by shell integration (OSC 7).
-    ///
-    /// Returns `None` when the shell has not reported a cwd yet. Callers
-    /// should keep their launch cwd as a fallback for plain shells.
-    pub fn current_dir(&self) -> Option<String> {
-        let inner = self.inner.lock();
-        if inner.terminal.is_null() {
-            return None;
-        }
-        let mut pwd = GhosttyString::default();
-        let rc = unsafe {
-            ghostty_terminal_get(
-                inner.terminal,
-                GhosttyTerminalData::Pwd,
-                &mut pwd as *mut _ as *mut c_void,
-            )
-        };
-        if rc != 0 || pwd.ptr.is_null() || pwd.len == 0 {
-            return None;
-        }
+    /// Current title reported by OSC 0/2.
+    pub fn title(&self) -> Option<String> {
+        self.inner.lock().title.clone()
+    }
 
-        let bytes = unsafe { std::slice::from_raw_parts(pwd.ptr, pwd.len) };
-        String::from_utf8(bytes.to_vec()).ok()
+    /// Distinguishes no title report from an explicit title clear.
+    pub(crate) fn reported_title(&self) -> Option<Option<String>> {
+        let inner = self.inner.lock();
+        inner.title_reported.then(|| inner.title.clone())
+    }
+
+    /// Current working directory reported by shell integration.
+    ///
+    /// OSC 7 file URIs are decoded when the callback fires; OSC 9 and OSC 1337
+    /// paths are retained as reported. Returns `None` when the shell has not
+    /// reported a cwd or explicitly clears it.
+    pub fn current_dir(&self) -> Option<String> {
+        self.inner.lock().current_dir.clone()
     }
 
     /// Returns `true` while the alternate screen buffer is active.
@@ -1531,6 +4548,25 @@ impl VtScreen {
         rc == 0 && screen == GhosttyTerminalScreen::Alternate
     }
 
+    pub fn prompt_state(&self) -> crate::TerminalPromptState {
+        let inner = self.inner.lock();
+        if inner.terminal.is_null() {
+            return crate::TerminalPromptState::default();
+        }
+        let mut at_prompt = false;
+        let rc = unsafe {
+            ghostty_terminal_get(
+                inner.terminal,
+                GhosttyTerminalData::CursorAtPrompt,
+                &mut at_prompt as *mut _ as *mut c_void,
+            )
+        };
+        crate::TerminalPromptState {
+            cursor_at_prompt: rc == GHOSTTY_SUCCESS && at_prompt,
+            output_generation: inner.output_generation,
+        }
+    }
+
     /// Scroll the visible viewport by terminal rows. Negative is up;
     /// positive is down. Returns `true` when a scroll request was sent.
     pub fn scroll_viewport_delta(&self, delta_rows: isize) -> bool {
@@ -1546,8 +4582,8 @@ impl VtScreen {
             value: GhosttyTerminalScrollViewportValue { delta: delta_rows },
         };
         unsafe { ghostty_terminal_scroll_viewport(inner.terminal, behavior) };
-        inner.force_full_snapshot = true;
         inner.generation = inner.generation.wrapping_add(1);
+        inner.required_full_snapshot_generation = inner.generation;
         true
     }
 
@@ -1564,8 +4600,8 @@ impl VtScreen {
             value: GhosttyTerminalScrollViewportValue { delta: 0 },
         };
         unsafe { ghostty_terminal_scroll_viewport(inner.terminal, behavior) };
-        inner.force_full_snapshot = true;
         inner.generation = inner.generation.wrapping_add(1);
+        inner.required_full_snapshot_generation = inner.generation;
         true
     }
 
@@ -1590,11 +4626,348 @@ impl VtScreen {
         if inner.terminal.is_null() {
             return false;
         }
-        let mut on: bool = false;
-        // SAFETY: terminal valid; `on` is a 1-byte C `_Bool`.
-        let rc = unsafe { ghostty_terminal_mode_get(inner.terminal, mode, &mut on) };
-        rc == 0 && on
+        let mut config = GhosttyTerminalModeConfig { mode, value: false };
+        // SAFETY: terminal valid; `config` has the frozen C layout.
+        let rc = unsafe {
+            ghostty_terminal_get(
+                inner.terminal,
+                GhosttyTerminalData::Mode,
+                &mut config as *mut _ as *mut c_void,
+            )
+        };
+        rc == 0 && config.value
     }
+}
+
+fn refresh_terminal_metadata(inner: &mut VtInner) {
+    let dirty = inner
+        .callback_state
+        .metadata_dirty
+        .swap(0, Ordering::Relaxed);
+    if dirty & METADATA_DIRTY_TITLE != 0 {
+        let title = with_terminal_bytes(inner.terminal, GhosttyTerminalData::Title, |bytes| {
+            (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned())
+        });
+        if let Some(title) = title {
+            inner.title_reported = true;
+            inner.title = title;
+        }
+    }
+
+    if dirty & METADATA_DIRTY_PWD != 0 {
+        let current_dir = with_terminal_bytes(inner.terminal, GhosttyTerminalData::Pwd, |bytes| {
+            let pwd = std::str::from_utf8(bytes).ok()?;
+            if pwd.is_empty() {
+                None
+            } else if pwd.starts_with("file://") {
+                parse_osc7_cwd(pwd)
+            } else {
+                Some(pwd.to_owned())
+            }
+        });
+        if let Some(current_dir) = current_dir {
+            inner.current_dir = current_dir;
+        }
+    }
+}
+
+fn with_terminal_bytes<R>(
+    terminal: GhosttyTerminal,
+    data: GhosttyTerminalData,
+    read: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
+    let mut value = GhosttyString::default();
+    let rc =
+        unsafe { ghostty_terminal_get(terminal, data, (&mut value as *mut GhosttyString).cast()) };
+    if rc != GHOSTTY_SUCCESS || (value.ptr.is_null() && value.len > 0) {
+        return None;
+    }
+    if value.len == 0 {
+        return Some(read(&[]));
+    }
+    Some(read(unsafe {
+        std::slice::from_raw_parts(value.ptr, value.len)
+    }))
+}
+
+unsafe extern "C" fn vt_render_hold_callback(
+    terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    held: bool,
+) {
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    let mut capture = state.capture.lock();
+    if !held {
+        capture.deadline = None;
+        capture.pending = None;
+        return;
+    }
+    capture.deadline = Some(Instant::now() + std::time::Duration::from_secs(1));
+    capture.serial = capture.serial.wrapping_add(1);
+    capture.generation = capture.generation.wrapping_add(1);
+    capture.pending = None;
+    let cols = state.cols.load(Ordering::Relaxed);
+    let rows = state.rows.load(Ordering::Relaxed);
+    let mut active_screen = GhosttyTerminalScreen::Primary;
+    if unsafe {
+        ghostty_terminal_get(
+            terminal,
+            GhosttyTerminalData::ActiveScreen,
+            (&mut active_screen as *mut GhosttyTerminalScreen).cast(),
+        )
+    } != GHOSTTY_SUCCESS
+    {
+        return;
+    }
+    let highlights = match capture.search.as_mut() {
+        Some(search) => match search.capture_highlights(terminal, cols, rows, true) {
+            Ok(highlights) => highlights,
+            Err(err) => {
+                log::warn!("render hold search capture: {err}");
+                return;
+            }
+        },
+        None => Vec::new(),
+    };
+    let epoch = SnapshotEpoch {
+        fallback_cols: cols,
+        fallback_rows: rows,
+        search_highlights: highlights,
+        kitty_placements: snapshot_kitty_placements(terminal, &mut capture.kitty),
+        alternate_screen: active_screen == GhosttyTerminalScreen::Alternate,
+        scrollbar: read_scrollbar(terminal),
+        generation: capture.generation,
+        required_full_snapshot_generation: capture.generation,
+    };
+    let mut frame = HeldFrame {
+        state: std::ptr::null_mut(),
+        epoch,
+    };
+    let rc = unsafe { ghostty_render_state_new(std::ptr::null(), &mut frame.state) };
+    if rc != GHOSTTY_SUCCESS || frame.state.is_null() {
+        log::warn!("render hold state allocation rc={rc}");
+        return;
+    }
+    let rc = unsafe { ghostty_render_state_begin_update(frame.state, terminal) };
+    if rc != GHOSTTY_SUCCESS {
+        log::warn!("render hold begin_update rc={rc}");
+        return;
+    }
+    capture.pending = Some(frame);
+}
+
+unsafe extern "C" fn vt_paste_read_callback(
+    userdata: *mut c_void,
+    mime: GhosttyString,
+    writer: GhosttyWriter,
+) -> bool {
+    if userdata.is_null() || !ghostty_string_eq(mime, TEXT_PLAIN_MIME) {
+        return false;
+    }
+    let Some(write) = writer.write else {
+        return false;
+    };
+    let reader = unsafe { &mut *(userdata as *mut VtPasteReader<'_>) };
+    reader.served = true;
+    if reader.text.is_empty() {
+        return true;
+    }
+    unsafe { write(writer.userdata, reader.text.as_ptr(), reader.text.len()) }
+}
+
+unsafe extern "C" fn vt_clipboard_write_callback(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    write: *const GhosttyClipboardWrite,
+) {
+    if userdata.is_null() || write.is_null() {
+        return;
+    }
+    if unsafe { (*write).size } < std::mem::size_of::<GhosttyClipboardWrite>() {
+        return;
+    }
+
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    let write = unsafe { &*write };
+    if write.reply.is_none() {
+        return;
+    }
+
+    let result = if !state.clipboard_write_enabled.load(Ordering::Acquire)
+        || !state.clipboard_write_policy.is_enabled()
+    {
+        GhosttyClipboardWriteResult::Denied
+    } else if write.location != GhosttyClipboardLocation::Standard {
+        GhosttyClipboardWriteResult::Unsupported
+    } else {
+        let text = if write.contents_len == 0 {
+            Ok("")
+        } else if write.contents_len > 1 {
+            Err(GhosttyClipboardWriteResult::Unsupported)
+        } else if write.contents.is_null() {
+            Err(GhosttyClipboardWriteResult::InvalidData)
+        } else {
+            let content = unsafe { &*write.contents };
+            if !ghostty_string_is_supported_text(content.mime) {
+                Err(GhosttyClipboardWriteResult::Unsupported)
+            } else if content.data.len > CLIPBOARD_WRITE_LIMIT_BYTES
+                || (content.data.ptr.is_null() && content.data.len > 0)
+            {
+                Err(GhosttyClipboardWriteResult::InvalidData)
+            } else {
+                let bytes = if content.data.len == 0 {
+                    &[]
+                } else {
+                    unsafe { std::slice::from_raw_parts(content.data.ptr, content.data.len) }
+                };
+                std::str::from_utf8(bytes).map_err(|_| GhosttyClipboardWriteResult::InvalidData)
+            }
+        };
+        match text {
+            Err(result) => result,
+            Ok(text) => {
+                let mut pending = state.pending_clipboard_write.lock();
+                if !state.clipboard_write_enabled.load(Ordering::Acquire)
+                    || !state.clipboard_write_policy.is_enabled()
+                {
+                    GhosttyClipboardWriteResult::Denied
+                } else {
+                    *pending = Some(text.to_owned());
+                    GhosttyClipboardWriteResult::Success
+                }
+            }
+        }
+    };
+
+    reply_clipboard_write(write, result);
+}
+
+fn reply_clipboard_write(write: &GhosttyClipboardWrite, result: GhosttyClipboardWriteResult) {
+    let Some(reply) = write.reply else {
+        return;
+    };
+    let reply_value = GhosttyClipboardWriteReply {
+        size: std::mem::size_of::<GhosttyClipboardWriteReply>(),
+        result,
+        remember: false,
+    };
+    unsafe { reply(write, &reply_value) };
+}
+
+/// Clipboard reads initiated by a running program are denied by default.
+/// The only data-bearing read accepted here is a one-time Kitty paste grant
+/// minted by `ghostty_terminal_paste` after an explicit local paste action.
+/// This callback never enters GPUI or the system clipboard while the VT lock
+/// is held, avoiding a reader-thread/UI-thread lock inversion.
+unsafe extern "C" fn vt_clipboard_read_callback(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    read: *const GhosttyClipboardRead,
+) {
+    if userdata.is_null() || read.is_null() {
+        return;
+    }
+    if unsafe { (*read).size } < std::mem::size_of::<GhosttyClipboardRead>() {
+        return;
+    }
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    let read = unsafe { &*read };
+    let Some(reply) = read.reply else {
+        return;
+    };
+
+    let mut result = GhosttyClipboardReadResult::Success;
+    let mut available = GhosttyString::default();
+    let mut available_len = 0;
+    let mut content = GhosttyClipboardContent {
+        mime: GhosttyString::default(),
+        data: GhosttyString::default(),
+    };
+    let mut contents_len = 0;
+
+    // Do not hold a Rust mutex across the foreign reply callback: libghostty
+    // may synchronously advance another effect while consuming this payload.
+    // Arc keeps the bytes stable for the callback without copying the paste.
+    let clipboard_text = state.clipboard_text.lock().clone();
+    let listing_only = read.list && read.mimes_len == 0;
+    if read.location != GhosttyClipboardLocation::Standard {
+        result = GhosttyClipboardReadResult::Unsupported;
+    } else if !listing_only && !read.granted {
+        result = GhosttyClipboardReadResult::Denied;
+    } else if let Some(text) = clipboard_text.as_deref() {
+        if read.list {
+            available = GhosttyString {
+                ptr: TEXT_PLAIN_MIME.as_ptr(),
+                len: TEXT_PLAIN_MIME.len(),
+            };
+            available_len = 1;
+        }
+
+        if read.mimes_len > 0 {
+            if read.mimes.is_null() {
+                result = GhosttyClipboardReadResult::IoError;
+            } else {
+                let requested = unsafe { std::slice::from_raw_parts(read.mimes, read.mimes_len) };
+                if let Some(mime) = requested
+                    .iter()
+                    .copied()
+                    .find(|mime| ghostty_string_is_supported_text(*mime))
+                {
+                    content = GhosttyClipboardContent {
+                        mime,
+                        data: GhosttyString {
+                            ptr: text.as_ptr(),
+                            len: text.len(),
+                        },
+                    };
+                    contents_len = 1;
+                }
+            }
+        }
+    }
+
+    let reply_value = GhosttyClipboardReadReply {
+        size: std::mem::size_of::<GhosttyClipboardReadReply>(),
+        result,
+        contents: if contents_len == 0 {
+            std::ptr::null()
+        } else {
+            &content
+        },
+        contents_len,
+        available: if available_len == 0 {
+            std::ptr::null()
+        } else {
+            &available
+        },
+        available_len,
+        remember: false,
+    };
+    unsafe { reply(read, &reply_value) };
+}
+
+fn ghostty_string_eq(value: GhosttyString, expected: &[u8]) -> bool {
+    if value.len != expected.len() || (value.ptr.is_null() && value.len > 0) {
+        return false;
+    }
+    let bytes = if value.len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
+    };
+    bytes == expected
+}
+
+fn ghostty_string_is_supported_text(value: GhosttyString) -> bool {
+    if value.ptr.is_null() && value.len > 0 {
+        return false;
+    }
+    let bytes = if value.len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
+    };
+    crate::clipboard_mime_is_text(bytes)
 }
 
 unsafe extern "C" fn vt_write_pty_callback(
@@ -1608,8 +4981,315 @@ unsafe extern "C" fn vt_write_pty_callback(
     }
 
     let state = unsafe { &*(userdata as *const VtCallbackState) };
+    let Some(write_pty) = state.write_pty.as_ref() else {
+        return;
+    };
     let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-    (state.write_pty)(bytes);
+    {
+        let mut pending = state.pending_paste_write.lock();
+        if let Some(pending) = pending.as_mut() {
+            pending.append(bytes);
+            return;
+        }
+    }
+
+    let _write_guard = state.write_order.lock();
+    if let Err(err) = write_pty(bytes, PtyWriteClass::ReservedControl) {
+        mark_control_write_failed(&state.write_failed, &err);
+    }
+}
+
+unsafe extern "C" fn vt_bell_callback(_terminal: GhosttyTerminal, userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    state.bell_pending.store(true, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn vt_desktop_notification_callback(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    notification: *const GhosttyTerminalDesktopNotification,
+) {
+    if userdata.is_null() || notification.is_null() {
+        return;
+    }
+    if unsafe { notification.cast::<usize>().read_unaligned() }
+        < std::mem::size_of::<GhosttyTerminalDesktopNotification>()
+    {
+        return;
+    }
+
+    let notification = unsafe { &*notification };
+    let Some(title) = (unsafe { ghostty_string_bytes(&notification.title) }) else {
+        return;
+    };
+    let Some(body) = (unsafe { ghostty_string_bytes(&notification.body) }) else {
+        return;
+    };
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    state.desktop_notification_policy.push(title, body);
+}
+
+unsafe fn ghostty_string_bytes(value: &GhosttyString) -> Option<&[u8]> {
+    if value.ptr.is_null() && value.len > 0 {
+        return None;
+    }
+    Some(if value.len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(value.ptr, value.len) }
+    })
+}
+
+unsafe extern "C" fn vt_progress_report_callback(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    report: *const GhosttyTerminalProgressReport,
+) {
+    if userdata.is_null() || report.is_null() {
+        return;
+    }
+    if unsafe { report.cast::<usize>().read_unaligned() }
+        < std::mem::size_of::<GhosttyTerminalProgressReport>()
+    {
+        return;
+    }
+    let report = unsafe { &*report };
+    let Some(progress) = TerminalProgress::from_ghostty_report(report.state, report.progress)
+    else {
+        return;
+    };
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    state.progress.store(
+        encode_timed_terminal_progress(progress, terminal_progress_tick(&state.progress_epoch)),
+        Ordering::Relaxed,
+    );
+}
+
+unsafe extern "C" fn vt_program_status_callback(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    report: *const GhosttyTerminalProgramStatus,
+) {
+    if userdata.is_null() || report.is_null() {
+        return;
+    }
+    if unsafe { report.cast::<usize>().read_unaligned() }
+        < std::mem::size_of::<GhosttyTerminalProgramStatus>()
+    {
+        return;
+    }
+    let report = unsafe { &*report };
+    let (Some(id), Some(app), Some(title), Some(message)) = (unsafe {
+        (
+            ghostty_string_owned(&report.id, 128),
+            ghostty_string_owned(&report.app, 32),
+            ghostty_string_owned(&report.title, 192),
+            ghostty_string_owned(&report.message, 2048),
+        )
+    }) else {
+        return;
+    };
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    let mut events = state.program_events.lock();
+    program_events::reduce(
+        &mut events,
+        ProgramStatusEvent::Report {
+            state: report.state,
+            kind: report.kind,
+            progress: report.progress,
+            id,
+            app,
+            title,
+            message,
+        },
+    );
+}
+
+unsafe extern "C" fn vt_semantic_prompt_callback(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    event: *const GhosttyTerminalSemanticPrompt,
+) {
+    if userdata.is_null() || event.is_null() {
+        return;
+    }
+    if unsafe { event.cast::<usize>().read_unaligned() }
+        < std::mem::size_of::<GhosttyTerminalSemanticPrompt>()
+    {
+        return;
+    }
+    let event = unsafe { &*event };
+    // Prompt start is the only step that drops in-flight program status.
+    if event.size < std::mem::size_of::<i32>() * 2 + std::mem::size_of::<usize>() || event.kind != 1
+    {
+        return;
+    }
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    let mut events = state.program_events.lock();
+    program_events::reduce(&mut events, ProgramStatusEvent::Prompt);
+}
+
+unsafe extern "C" fn vt_reset_callback(_terminal: GhosttyTerminal, userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    let mut events = state.program_events.lock();
+    program_events::reduce(&mut events, ProgramStatusEvent::FullReset);
+}
+
+unsafe fn ghostty_string_owned(value: &GhosttyString, limit: usize) -> Option<String> {
+    if value.len > limit || (value.len != 0 && value.ptr.is_null()) {
+        return None;
+    }
+    if value.len == 0 {
+        return Some(String::new());
+    }
+    unsafe { ghostty_string_bytes(value) }
+        .and_then(|bytes| std::str::from_utf8(bytes).ok().map(str::to_owned))
+}
+
+fn encode_terminal_progress(progress: Option<TerminalProgress>) -> u16 {
+    let (state, percent) = match progress {
+        None => return 0,
+        Some(TerminalProgress::Running(percent)) => (1, percent),
+        Some(TerminalProgress::Error(percent)) => (2, percent),
+        Some(TerminalProgress::Indeterminate) => (3, None),
+        Some(TerminalProgress::Paused(percent)) => (4, percent),
+    };
+    (state << 8) | percent.map_or(0, |percent| u16::from(percent) + 1)
+}
+
+fn terminal_progress_tick(epoch: &Instant) -> u64 {
+    const MAX_TICK: u64 = u64::MAX >> u16::BITS;
+    u64::try_from(epoch.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .min(MAX_TICK - 1)
+        + 1
+}
+
+fn encode_timed_terminal_progress(progress: Option<TerminalProgress>, tick: u64) -> u64 {
+    let progress = encode_terminal_progress(progress);
+    if progress == 0 {
+        0
+    } else {
+        (tick << u16::BITS) | u64::from(progress)
+    }
+}
+
+fn decode_timed_terminal_progress(value: u64, now: u64) -> Option<TerminalProgress> {
+    let updated_at = value >> u16::BITS;
+    if updated_at == 0
+        || now.saturating_sub(updated_at)
+            >= u64::try_from(TERMINAL_PROGRESS_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+    {
+        return None;
+    }
+    decode_terminal_progress(value as u16)
+}
+
+fn decode_terminal_progress(value: u16) -> Option<TerminalProgress> {
+    let percent = match value & 0xff {
+        0 => None,
+        value => Some((value - 1) as u8),
+    };
+    match value >> 8 {
+        1 => Some(TerminalProgress::Running(percent)),
+        2 => Some(TerminalProgress::Error(percent)),
+        3 => Some(TerminalProgress::Indeterminate),
+        4 => Some(TerminalProgress::Paused(percent)),
+        _ => None,
+    }
+}
+
+unsafe extern "C" fn vt_unknown_sequence_callback(
+    _terminal: GhosttyTerminal,
+    userdata: *mut c_void,
+    sequence: *const GhosttyTerminalUnknownSequence,
+) {
+    if userdata.is_null()
+        || sequence.is_null()
+        || !log::log_enabled!(target: UNKNOWN_SEQUENCE_LOG_TARGET, log::Level::Debug)
+    {
+        return;
+    }
+
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    let Ok(log_index) = state.unknown_sequence_log_count.try_update(
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+        |count| (count <= UNKNOWN_SEQUENCE_LOG_LIMIT).then_some(count + 1),
+    ) else {
+        return;
+    };
+    if log_index == UNKNOWN_SEQUENCE_LOG_LIMIT {
+        log::debug!(
+            target: UNKNOWN_SEQUENCE_LOG_TARGET,
+            "further unknown terminal sequences suppressed"
+        );
+        return;
+    }
+
+    let sequence = unsafe { &*sequence };
+    if sequence.tag != GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_APC {
+        log::debug!(
+            target: UNKNOWN_SEQUENCE_LOG_TARGET,
+            "unknown terminal sequence tag={}",
+            sequence.tag
+        );
+        return;
+    }
+
+    let apc = unsafe { sequence.value.apc };
+    if apc.content.ptr.is_null() && apc.content.len != 0 {
+        log::debug!(
+            target: UNKNOWN_SEQUENCE_LOG_TARGET,
+            "unknown APC has invalid content pointer len={} truncated={}",
+            apc.content.len,
+            apc.truncated
+        );
+        return;
+    }
+    let content = if apc.content.len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(apc.content.ptr, apc.content.len) }
+    };
+    log::debug!(
+        target: UNKNOWN_SEQUENCE_LOG_TARGET,
+        "unknown APC len={} truncated={} content={content:02x?}",
+        content.len(),
+        apc.truncated
+    );
+}
+
+unsafe extern "C" fn vt_title_changed_callback(_terminal: GhosttyTerminal, userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    state
+        .metadata_dirty
+        .fetch_or(METADATA_DIRTY_TITLE, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn vt_pwd_changed_callback(_terminal: GhosttyTerminal, userdata: *mut c_void) {
+    if userdata.is_null() {
+        return;
+    }
+    let state = unsafe { &*(userdata as *const VtCallbackState) };
+    state
+        .metadata_dirty
+        .fetch_or(METADATA_DIRTY_PWD, Ordering::Relaxed);
+}
+
+fn mark_control_write_failed(write_failed: &AtomicBool, err: &std::io::Error) {
+    if !write_failed.swap(true, Ordering::AcqRel) {
+        log::error!("terminal control write failed; closing the desynchronized session: {err}");
+    }
 }
 
 unsafe extern "C" fn vt_enquiry_callback(
@@ -1697,11 +5377,219 @@ unsafe extern "C" fn vt_xtversion_callback(
     }
 }
 
+fn validate_selection_point(point: SelectionPoint) -> anyhow::Result<()> {
+    if !point.surface_x_px.is_finite() || !point.surface_y_px.is_finite() {
+        anyhow::bail!("selection surface position must be finite");
+    }
+    Ok(())
+}
+
+fn selection_surface_position(point: SelectionPoint) -> GhosttySurfacePosition {
+    GhosttySurfacePosition {
+        x: point.surface_x_px,
+        y: point.surface_y_px,
+    }
+}
+
+fn selection_grid_ref(
+    terminal: GhosttyTerminal,
+    col: u16,
+    row: u16,
+) -> anyhow::Result<GhosttyGridRef> {
+    let point = GhosttyPoint {
+        tag: GhosttyPointTag::Viewport,
+        value: GhosttyPointValue {
+            coordinate: GhosttyPointCoordinate {
+                x: col,
+                y: u32::from(row),
+            },
+        },
+    };
+    let mut grid_ref = GhosttyGridRef::default();
+    let rc = unsafe { ghostty_terminal_grid_ref(terminal, point, &mut grid_ref) };
+    if rc != GHOSTTY_SUCCESS {
+        anyhow::bail!("ghostty_terminal_grid_ref(VIEWPORT {col},{row}) failed: rc={rc}");
+    }
+    Ok(grid_ref)
+}
+
+fn selection_event_set<T>(
+    event: GhosttySelectionGestureEvent,
+    option: GhosttySelectionGestureEventOption,
+    value: &T,
+) -> anyhow::Result<()> {
+    let rc = unsafe {
+        ghostty_selection_gesture_event_set(event, option, value as *const T as *const c_void)
+    };
+    if rc != GHOSTTY_SUCCESS {
+        anyhow::bail!("ghostty_selection_gesture_event_set({option:?}) failed: rc={rc}");
+    }
+    Ok(())
+}
+
+fn apply_selection_gesture_event(
+    gesture: GhosttySelectionGesture,
+    terminal: GhosttyTerminal,
+    event: GhosttySelectionGestureEvent,
+) -> anyhow::Result<Option<GhosttySelection>> {
+    let mut selection = GhosttySelection::default();
+    let rc = unsafe { ghostty_selection_gesture_event(gesture, terminal, event, &mut selection) };
+    match rc {
+        GHOSTTY_SUCCESS => Ok(Some(selection)),
+        GHOSTTY_NO_VALUE => Ok(None),
+        _ => anyhow::bail!("ghostty_selection_gesture_event failed: rc={rc}"),
+    }
+}
+
+fn selection_gesture_click_count(inner: &VtInner) -> anyhow::Result<u8> {
+    let Some(state) = inner.selection_gesture.as_ref() else {
+        return Ok(0);
+    };
+    let mut click_count = 0_u8;
+    let rc = unsafe {
+        ghostty_selection_gesture_get(
+            state.gesture,
+            inner.terminal,
+            GhosttySelectionGestureData::ClickCount,
+            &mut click_count as *mut _ as *mut c_void,
+        )
+    };
+    if rc != GHOSTTY_SUCCESS {
+        anyhow::bail!("ghostty_selection_gesture_get(CLICK_COUNT) failed: rc={rc}");
+    }
+    Ok(click_count)
+}
+
+fn selection_gesture_autoscroll(inner: &VtInner) -> anyhow::Result<SelectionAutoscroll> {
+    let Some(state) = inner.selection_gesture.as_ref() else {
+        return Ok(SelectionAutoscroll::None);
+    };
+    // Read C enum output through its integer representation. Writing an
+    // upstream value added after our pinned revision directly into a Rust enum
+    // would create an invalid discriminant before we could validate it.
+    let mut autoscroll = GhosttySelectionGestureAutoscroll::None as c_int;
+    let rc = unsafe {
+        ghostty_selection_gesture_get(
+            state.gesture,
+            inner.terminal,
+            GhosttySelectionGestureData::Autoscroll,
+            &mut autoscroll as *mut _ as *mut c_void,
+        )
+    };
+    if rc != GHOSTTY_SUCCESS {
+        anyhow::bail!("ghostty_selection_gesture_get(AUTOSCROLL) failed: rc={rc}");
+    }
+    match autoscroll {
+        value if value == GhosttySelectionGestureAutoscroll::None as c_int => {
+            Ok(SelectionAutoscroll::None)
+        }
+        value if value == GhosttySelectionGestureAutoscroll::Up as c_int => {
+            Ok(SelectionAutoscroll::Up)
+        }
+        value if value == GhosttySelectionGestureAutoscroll::Down as c_int => {
+            Ok(SelectionAutoscroll::Down)
+        }
+        value => anyhow::bail!("unknown Ghostty selection autoscroll value: {value}"),
+    }
+}
+
+fn selection_locked(inner: &VtInner) -> anyhow::Result<Option<GhosttySelection>> {
+    let mut selection = GhosttySelection::default();
+    let rc = unsafe {
+        ghostty_terminal_get(
+            inner.terminal,
+            GhosttyTerminalData::Selection,
+            &mut selection as *mut _ as *mut c_void,
+        )
+    };
+    match rc {
+        GHOSTTY_SUCCESS => Ok(Some(selection)),
+        GHOSTTY_NO_VALUE => Ok(None),
+        _ => anyhow::bail!("ghostty_terminal_get(SELECTION) failed: rc={rc}"),
+    }
+}
+
+fn has_selection_locked(inner: &VtInner) -> anyhow::Result<bool> {
+    Ok(selection_locked(inner)?.is_some())
+}
+
+fn set_selection_locked(
+    inner: &mut VtInner,
+    selection: Option<&GhosttySelection>,
+) -> anyhow::Result<bool> {
+    let current = selection_locked(inner)?;
+    match (selection, current.as_ref()) {
+        (None, None) => return Ok(false),
+        (Some(selection), Some(current)) => {
+            let mut equal = false;
+            let rc = unsafe {
+                ghostty_terminal_selection_equal(inner.terminal, selection, current, &mut equal)
+            };
+            if rc != GHOSTTY_SUCCESS {
+                anyhow::bail!("ghostty_terminal_selection_equal failed: rc={rc}");
+            }
+            if equal {
+                return Ok(false);
+            }
+        }
+        _ => {}
+    }
+    let value = selection.map_or(std::ptr::null(), |selection| {
+        selection as *const GhosttySelection as *const c_void
+    });
+    let rc =
+        unsafe { ghostty_terminal_set(inner.terminal, GhosttyTerminalOption::Selection, value) };
+    if rc != GHOSTTY_SUCCESS {
+        anyhow::bail!("ghostty_terminal_set(SELECTION) failed: rc={rc}");
+    }
+    inner.generation = inner.generation.wrapping_add(1);
+    Ok(true)
+}
+
+fn selection_text_locked(inner: &VtInner) -> anyhow::Result<Option<String>> {
+    let options = GhosttyTerminalSelectionFormatOptions::default();
+    let mut ptr = std::ptr::null_mut();
+    let mut len = 0_usize;
+    let rc = unsafe {
+        ghostty_terminal_selection_format_alloc(
+            inner.terminal,
+            std::ptr::null(),
+            options,
+            &mut ptr,
+            &mut len,
+        )
+    };
+    match rc {
+        GHOSTTY_NO_VALUE => return Ok(None),
+        GHOSTTY_SUCCESS => {}
+        _ => anyhow::bail!("ghostty_terminal_selection_format_alloc failed: rc={rc}"),
+    }
+    if ptr.is_null() && len != 0 {
+        anyhow::bail!("ghostty selection formatter returned a null {len}-byte buffer");
+    }
+    let bytes = (|| {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len)?;
+        if len != 0 {
+            // SAFETY: format_alloc returned a readable `len`-byte allocation.
+            // Copy it because Ghostty and Rust may use different heaps on
+            // Windows; fallible reservation keeps the FFI buffer releasable if
+            // Rust cannot allocate the destination.
+            bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, len) });
+        }
+        Ok::<_, anyhow::Error>(bytes)
+    })();
+    unsafe { ghostty_free(std::ptr::null(), ptr, len) };
+    Ok(Some(String::from_utf8(bytes?)?))
+}
+
 fn empty_snapshot(cols: u16, rows: u16, generation: u64) -> ScreenSnapshot {
     ScreenSnapshot {
         cols,
         rows,
         cells: Vec::new(),
+        selection_ranges: Vec::new(),
+        kitty_placements: Arc::from([]),
         dirty_rows: Vec::new(),
         cursor: Cursor::default(),
         alternate_screen: false,
@@ -1709,6 +5597,279 @@ fn empty_snapshot(cols: u16, rows: u16, generation: u64) -> ScreenSnapshot {
         title: None,
         generation,
     }
+}
+
+fn snapshot_kitty_placements(
+    terminal: GhosttyTerminal,
+    inner: &mut KittySnapshot,
+) -> Arc<[KittyPlacement]> {
+    let mut graphics: GhosttyKittyGraphics = std::ptr::null_mut();
+    let rc = unsafe {
+        ghostty_terminal_get(
+            terminal,
+            GhosttyTerminalData::KittyGraphics,
+            &mut graphics as *mut _ as *mut c_void,
+        )
+    };
+    if rc != GHOSTTY_SUCCESS || inner.kitty_placement_iter.is_null() {
+        log::debug!("could not read Kitty graphics state for the current terminal generation");
+        return inner.kitty_placements.clone();
+    }
+    if graphics.is_null() {
+        inner.kitty_image_cache.clear();
+        inner.kitty_placements = Arc::from([]);
+        return inner.kitty_placements.clone();
+    }
+
+    let rc = unsafe {
+        ghostty_kitty_graphics_get(
+            graphics,
+            GhosttyKittyGraphicsData::PlacementIterator,
+            &mut inner.kitty_placement_iter as *mut _ as *mut c_void,
+        )
+    };
+    if rc != GHOSTTY_SUCCESS {
+        log::debug!("could not reset the Kitty placement iterator; retaining the prior snapshot");
+        return inner.kitty_placements.clone();
+    }
+
+    let mut images: HashMap<u32, Arc<KittyImage>> = HashMap::new();
+    let mut placements = Vec::new();
+    let mut scanned = 0_usize;
+    while unsafe { ghostty_kitty_graphics_placement_next(inner.kitty_placement_iter) } {
+        if scanned >= KITTY_PLACEMENT_SCAN_LIMIT {
+            log::debug!("stopping Kitty placement scan after {KITTY_PLACEMENT_SCAN_LIMIT} entries");
+            break;
+        }
+        scanned += 1;
+
+        let mut image_id = 0_u32;
+        let mut placement_id = 0_u32;
+        let mut is_virtual = false;
+        let mut cell_x_offset = 0_u32;
+        let mut cell_y_offset = 0_u32;
+        let mut z = 0_i32;
+        let keys = [
+            GhosttyKittyGraphicsPlacementData::ImageId,
+            GhosttyKittyGraphicsPlacementData::PlacementId,
+            GhosttyKittyGraphicsPlacementData::IsVirtual,
+            GhosttyKittyGraphicsPlacementData::XOffset,
+            GhosttyKittyGraphicsPlacementData::YOffset,
+            GhosttyKittyGraphicsPlacementData::Z,
+        ];
+        let mut values = [
+            &mut image_id as *mut _ as *mut c_void,
+            &mut placement_id as *mut _ as *mut c_void,
+            &mut is_virtual as *mut _ as *mut c_void,
+            &mut cell_x_offset as *mut _ as *mut c_void,
+            &mut cell_y_offset as *mut _ as *mut c_void,
+            &mut z as *mut _ as *mut c_void,
+        ];
+        let rc = unsafe {
+            ghostty_kitty_graphics_placement_get_multi(
+                inner.kitty_placement_iter,
+                keys.len(),
+                keys.as_ptr(),
+                values.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc != GHOSTTY_SUCCESS || is_virtual {
+            continue;
+        }
+
+        let image_handle = unsafe { ghostty_kitty_graphics_image(graphics, image_id) };
+        if image_handle.is_null() {
+            continue;
+        }
+        let mut info = GhosttyKittyGraphicsPlacementRenderInfo {
+            size: std::mem::size_of::<GhosttyKittyGraphicsPlacementRenderInfo>(),
+            ..GhosttyKittyGraphicsPlacementRenderInfo::default()
+        };
+        let rc = unsafe {
+            ghostty_kitty_graphics_placement_render_info(
+                inner.kitty_placement_iter,
+                image_handle,
+                terminal,
+                &mut info,
+            )
+        };
+        if rc != GHOSTTY_SUCCESS
+            || !info.viewport_visible
+            || info.pixel_width == 0
+            || info.pixel_height == 0
+            || info.source_width == 0
+            || info.source_height == 0
+        {
+            continue;
+        }
+        if placements.len() >= KITTY_PLACEMENT_SNAPSHOT_LIMIT {
+            log::debug!(
+                "truncating Kitty graphics snapshot at {KITTY_PLACEMENT_SNAPSHOT_LIMIT} visible placements"
+            );
+            break;
+        }
+
+        let image = if let Some(image) = images.get(&image_id) {
+            image.clone()
+        } else {
+            let Some(image) = snapshot_kitty_image(
+                image_handle,
+                image_id,
+                inner.kitty_image_cache.get(&image_id),
+            ) else {
+                continue;
+            };
+            images.insert(image_id, image.clone());
+            image
+        };
+        placements.push(KittyPlacement {
+            image,
+            placement_id,
+            z,
+            viewport_col: info.viewport_col,
+            viewport_row: info.viewport_row,
+            cell_x_offset,
+            cell_y_offset,
+            pixel_width: info.pixel_width,
+            pixel_height: info.pixel_height,
+            source_x: info.source_x,
+            source_y: info.source_y,
+            source_width: info.source_width,
+            source_height: info.source_height,
+        });
+    }
+
+    // Draw lower z-index placements first. `sort_by_key` is stable, preserving
+    // libghostty's iterator order for equal z values where the C API exposes no
+    // additional ordering key.
+    placements.sort_by_key(|placement| placement.z);
+    inner.kitty_image_cache = images;
+    inner.kitty_placements = placements.into();
+    inner.kitty_placements.clone()
+}
+
+fn snapshot_kitty_image(
+    image: GhosttyKittyGraphicsImage,
+    image_id: u32,
+    cached: Option<&Arc<KittyImage>>,
+) -> Option<Arc<KittyImage>> {
+    let mut generation = 0_u64;
+    let rc = unsafe {
+        ghostty_kitty_graphics_image_get(
+            image,
+            GhosttyKittyGraphicsImageData::Generation,
+            &mut generation as *mut _ as *mut c_void,
+        )
+    };
+    if rc != GHOSTTY_SUCCESS || generation == 0 {
+        return None;
+    }
+    if let Some(cached) = cached.filter(|cached| cached.generation == generation) {
+        return Some(cached.clone());
+    }
+
+    let mut width = 0_u32;
+    let mut height = 0_u32;
+    let mut format_raw = GhosttyKittyImageFormat::Rgba as c_int;
+    let mut compression_raw = GhosttyKittyImageCompression::None as c_int;
+    let mut data_ptr: *const u8 = std::ptr::null();
+    let mut data_len = 0_usize;
+    let keys = [
+        GhosttyKittyGraphicsImageData::Width,
+        GhosttyKittyGraphicsImageData::Height,
+        GhosttyKittyGraphicsImageData::Format,
+        GhosttyKittyGraphicsImageData::Compression,
+        GhosttyKittyGraphicsImageData::DataPtr,
+        GhosttyKittyGraphicsImageData::DataLen,
+    ];
+    let mut values = [
+        &mut width as *mut _ as *mut c_void,
+        &mut height as *mut _ as *mut c_void,
+        &mut format_raw as *mut _ as *mut c_void,
+        &mut compression_raw as *mut _ as *mut c_void,
+        &mut data_ptr as *mut _ as *mut c_void,
+        &mut data_len as *mut _ as *mut c_void,
+    ];
+    let rc = unsafe {
+        ghostty_kitty_graphics_image_get_multi(
+            image,
+            keys.len(),
+            keys.as_ptr(),
+            values.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != GHOSTTY_SUCCESS
+        || width == 0
+        || height == 0
+        || data_ptr.is_null()
+        || compression_raw != GhosttyKittyImageCompression::None as c_int
+    {
+        return None;
+    }
+
+    // Read C enums through their integer representation so a future upstream
+    // format cannot create an invalid Rust enum discriminant before the ABI
+    // manifest check reports the drift.
+    let format = match format_raw {
+        value if value == GhosttyKittyImageFormat::Rgb as c_int => GhosttyKittyImageFormat::Rgb,
+        value if value == GhosttyKittyImageFormat::Rgba as c_int => GhosttyKittyImageFormat::Rgba,
+        value if value == GhosttyKittyImageFormat::GrayAlpha as c_int => {
+            GhosttyKittyImageFormat::GrayAlpha
+        }
+        value if value == GhosttyKittyImageFormat::Gray as c_int => GhosttyKittyImageFormat::Gray,
+        _ => return None,
+    };
+
+    let bytes_per_pixel = match format {
+        GhosttyKittyImageFormat::Rgb => 3,
+        GhosttyKittyImageFormat::Rgba => 4,
+        GhosttyKittyImageFormat::GrayAlpha => 2,
+        GhosttyKittyImageFormat::Gray => 1,
+        GhosttyKittyImageFormat::Png => return None,
+    };
+    let expected_len = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(bytes_per_pixel)?;
+    if data_len != expected_len || data_len > KITTY_IMAGE_STORAGE_LIMIT_BYTES as usize {
+        return None;
+    }
+    let source = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    let rgba: Arc<[u8]> = match format {
+        GhosttyKittyImageFormat::Rgba => Arc::from(source),
+        GhosttyKittyImageFormat::Rgb => {
+            let mut rgba = Vec::with_capacity(source.len() / 3 * 4);
+            for &[red, green, blue] in source.as_chunks::<3>().0 {
+                rgba.extend_from_slice(&[red, green, blue, 0xFF]);
+            }
+            rgba.into()
+        }
+        GhosttyKittyImageFormat::GrayAlpha => {
+            let mut rgba = Vec::with_capacity(source.len() / 2 * 4);
+            for &[gray, alpha] in source.as_chunks::<2>().0 {
+                rgba.extend_from_slice(&[gray, gray, gray, alpha]);
+            }
+            rgba.into()
+        }
+        GhosttyKittyImageFormat::Gray => {
+            let mut rgba = Vec::with_capacity(source.len() * 4);
+            for gray in source {
+                rgba.extend_from_slice(&[*gray, *gray, *gray, 0xFF]);
+            }
+            rgba.into()
+        }
+        GhosttyKittyImageFormat::Png => return None,
+    };
+
+    Some(Arc::new(KittyImage {
+        id: image_id,
+        generation,
+        width,
+        height,
+        rgba,
+    }))
 }
 
 fn read_scrollbar(terminal: GhosttyTerminal) -> Option<GhosttyScrollbar> {
@@ -1741,74 +5902,120 @@ fn read_cell(
     default_fg: GhosttyColorRgb,
     default_bg: GhosttyColorRgb,
     alternate_screen: bool,
-) -> Cell {
+) -> Option<Cell> {
     // RAW here is an **opaque `GhosttyCell` u64 snapshot**, not a packed
     // codepoint. Decode fields via `ghostty_cell_get(cell, KEY, &out)`
     // per `screen.h`. Previous code bitshifted RAW directly and produced
     // nonsense codepoints (U+015C etc. for the "PowerShell" banner).
     let mut raw: GhosttyCell = 0;
     let mut style = GhosttyStyle::new();
-    // BG_COLOR / FG_COLOR write a `GhosttyColorRgb` (3 bytes: R, G, B)
-    // to the out pointer — NOT a packed u32.
-    let mut bg = GhosttyColorRgb::default();
-    let mut fg = GhosttyColorRgb::default();
-
-    // SAFETY: out params typed per upstream contract (RAW=GhosttyCell u64,
-    // STYLE=GhosttyStyle by value with `size` set to sizeof, BG/FG=GhosttyColorRgb).
-    unsafe {
-        let _ = ghostty_render_state_row_cells_get(
+    let mut fg = default_fg;
+    let mut bg = default_bg;
+    let mut graphemes_len = 0_u32;
+    let keys = [
+        GhosttyRenderStateRowCellsData::Raw,
+        GhosttyRenderStateRowCellsData::Style,
+        GhosttyRenderStateRowCellsData::GraphemesLen,
+        GhosttyRenderStateRowCellsData::FgColor,
+        GhosttyRenderStateRowCellsData::BgColor,
+    ];
+    let mut values = [
+        &mut raw as *mut _ as *mut c_void,
+        &mut style as *mut _ as *mut c_void,
+        &mut graphemes_len as *mut _ as *mut c_void,
+        &mut fg as *mut _ as *mut c_void,
+        &mut bg as *mut _ as *mut c_void,
+    ];
+    let mut written = 0_usize;
+    let rc = unsafe {
+        ghostty_render_state_row_cells_get_multi(
             cells,
-            GhosttyRenderStateRowCellsData::Raw,
-            &mut raw as *mut _ as *mut c_void,
-        );
-        let _ = ghostty_render_state_row_cells_get(
-            cells,
-            GhosttyRenderStateRowCellsData::Style,
-            &mut style as *mut _ as *mut c_void,
-        );
-        let _ = ghostty_render_state_row_cells_get(
-            cells,
-            GhosttyRenderStateRowCellsData::BgColor,
-            &mut bg as *mut _ as *mut c_void,
-        );
-        let _ = ghostty_render_state_row_cells_get(
-            cells,
-            GhosttyRenderStateRowCellsData::FgColor,
-            &mut fg as *mut _ as *mut c_void,
-        );
-    }
+            keys.len(),
+            keys.as_ptr(),
+            values.as_mut_ptr(),
+            &mut written,
+        )
+    };
+    let bg_was_default = match (rc, written) {
+        (GHOSTTY_SUCCESS, 5) => false,
+        (GHOSTTY_INVALID_VALUE, 3) => {
+            let rc = unsafe {
+                ghostty_render_state_row_cells_get(
+                    cells,
+                    GhosttyRenderStateRowCellsData::BgColor,
+                    &mut bg as *mut _ as *mut c_void,
+                )
+            };
+            match rc {
+                GHOSTTY_SUCCESS => false,
+                GHOSTTY_INVALID_VALUE => true,
+                _ => return None,
+            }
+        }
+        (GHOSTTY_INVALID_VALUE, 4) => true,
+        _ => return None,
+    };
 
     // Gate codepoint decode on HAS_TEXT — blank cells carry a bogus
     // grapheme-tag codepoint we'd otherwise rasterize.
     let mut has_text: bool = false;
     let mut codepoint: u32 = 0;
-    // SAFETY: `has_text` is a C `_Bool` (1 byte); `codepoint` is uint32.
-    unsafe {
-        let _ = ghostty_cell_get(
+    let mut wide: c_int = 0;
+    let cell_keys = [
+        GhosttyCellData::HasText,
+        GhosttyCellData::Codepoint,
+        GhosttyCellData::Wide,
+    ];
+    let mut cell_values = [
+        &mut has_text as *mut _ as *mut c_void,
+        &mut codepoint as *mut _ as *mut c_void,
+        &mut wide as *mut _ as *mut c_void,
+    ];
+    let mut cell_written = 0_usize;
+    let rc = unsafe {
+        ghostty_cell_get_multi(
             raw,
-            GhosttyCellData::HasText,
-            &mut has_text as *mut _ as *mut c_void,
-        );
-        if has_text {
-            let _ = ghostty_cell_get(
-                raw,
-                GhosttyCellData::Codepoint,
-                &mut codepoint as *mut _ as *mut c_void,
-            );
-        }
+            cell_keys.len(),
+            cell_keys.as_ptr(),
+            cell_values.as_mut_ptr(),
+            &mut cell_written,
+        )
+    };
+    if rc != GHOSTTY_SUCCESS || cell_written != cell_keys.len() {
+        return None;
+    }
+    if !has_text {
+        codepoint = 0;
     }
 
-    // Substitute the palette's default fg/bg when the cell's style
-    // reports no SGR override (tag == GHOSTTY_STYLE_COLOR_NONE). The
-    // row_cells FG_COLOR / BG_COLOR accessors return (0,0,0) for
-    // unstyled cells, so without this substitution default-bg cells
-    // would paint pure black. Key off the style tag, not the RGB value:
-    // explicit black may still resolve to the same RGB as the default.
-    const STYLE_COLOR_TAG_NONE: u32 = 0;
+    let width = match wide {
+        0 => CellWidth::Narrow,
+        1 => CellWidth::Wide,
+        2 => CellWidth::SpacerTail,
+        3 => CellWidth::SpacerHead,
+        _ => return None,
+    };
+    let mut grapheme = None;
+    if graphemes_len > 1 {
+        let mut scalars = vec![0_u32; graphemes_len as usize];
+        // GRAPHEMES_BUF writes graphemes_len u32 scalars, including the base.
+        // The render lock keeps this iterator valid throughout both reads.
+        if unsafe {
+            ghostty_render_state_row_cells_get(
+                cells,
+                GhosttyRenderStateRowCellsData::GraphemesBuf,
+                scalars.as_mut_ptr().cast(),
+            )
+        } != GHOSTTY_SUCCESS
+        {
+            return None;
+        }
+        let text: Option<String> = scalars.into_iter().map(char::from_u32).collect();
+        grapheme = Some(Arc::from(text?));
+    }
+
     const STYLE_COLOR_TAG_PALETTE: u32 = 1;
     const PALETTE_BLACK: u8 = 0;
-    let fg_was_default = style.fg_color.tag == STYLE_COLOR_TAG_NONE;
-    let bg_was_default = style.bg_color.tag == STYLE_COLOR_TAG_NONE;
     // Curses-style full-screen apps often paint their canvas with SGR
     // 40 instead of default background. For themes whose ANSI black is
     // a raised surface (Catppuccin, Nord, Everforest), that makes htop
@@ -1819,7 +6026,6 @@ fn read_cell(
     let bg_is_alt_canvas_black = alternate_screen
         && style.bg_color.tag == STYLE_COLOR_TAG_PALETTE
         && style.bg_color.value as u8 == PALETTE_BLACK;
-    let fg = if fg_was_default { default_fg } else { fg };
     let bg = if bg_was_default || bg_is_alt_canvas_black {
         default_bg
     } else {
@@ -1859,34 +6065,61 @@ fn read_cell(
     if style.inverse {
         attrs |= ATTR_INVERSE;
     }
+    if style.invisible {
+        attrs |= ATTR_INVISIBLE;
+    }
 
-    Cell {
+    Some(Cell {
         codepoint,
+        grapheme,
+        width,
         fg: pack(fg, 0xFF),
         bg: pack(bg, bg_alpha),
         attrs,
-        _pad: [0; 3],
-    }
+    })
 }
 
 impl Drop for VtScreen {
     fn drop(&mut self) {
+        // Free tracked search pins while terminal access is exclusive, even
+        // when a PTY callback still owns an inner Arc.
+        {
+            let _inner = self.inner.lock();
+            self.search.get_mut().take();
+        }
         if let Some(mutex) = Arc::get_mut(&mut self.inner) {
             let inner = mutex.get_mut();
-            // Free in reverse-creation order: cells, iter, state, terminal.
+            let render = self.render.get_mut();
+            // Free every object that can refer to the terminal before the
+            // terminal itself.
             // SAFETY: unique owner via Arc::get_mut.
-            if !inner.row_cells.is_null() {
-                unsafe { ghostty_render_state_row_cells_free(inner.row_cells) };
-                inner.row_cells = std::ptr::null_mut();
+            if let Some(mut mouse) = inner.mouse.take() {
+                unsafe { mouse.free() };
             }
-            if !inner.row_iter.is_null() {
-                unsafe { ghostty_render_state_row_iterator_free(inner.row_iter) };
-                inner.row_iter = std::ptr::null_mut();
+            if !inner.key_event.is_null() {
+                unsafe { ghostty_key_event_free(inner.key_event) };
+                inner.key_event = std::ptr::null_mut();
             }
-            if !inner.render_state.is_null() {
-                unsafe { ghostty_render_state_free(inner.render_state) };
-                inner.render_state = std::ptr::null_mut();
+            if !inner.key_encoder.is_null() {
+                unsafe { ghostty_key_encoder_free(inner.key_encoder) };
+                inner.key_encoder = std::ptr::null_mut();
             }
+            if !render.row_cells.is_null() {
+                unsafe { ghostty_render_state_row_cells_free(render.row_cells) };
+                render.row_cells = std::ptr::null_mut();
+            }
+            if !render.row_iter.is_null() {
+                unsafe { ghostty_render_state_row_iterator_free(render.row_iter) };
+                render.row_iter = std::ptr::null_mut();
+            }
+            if !render.render_state.is_null() {
+                unsafe { ghostty_render_state_free(render.render_state) };
+                render.render_state = std::ptr::null_mut();
+            }
+            if let Some(mut selection_gesture) = inner.selection_gesture.take() {
+                unsafe { selection_gesture.free(inner.terminal) };
+            }
+            *inner.callback_state.capture.get_mut() = RenderCapture::default();
             if !inner.terminal.is_null() {
                 unsafe { ghostty_terminal_free(inner.terminal) };
                 inner.terminal = std::ptr::null_mut();
@@ -1898,6 +6131,3057 @@ impl Drop for VtScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CStr;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn snapshot_preserves_graphemes_and_terminal_widths() {
+        let screen = VtScreen::new(24, 3, None).unwrap();
+        screen.feed(b"\x1b[?2027h");
+        let text = "Ae\u{301}👩\u{200d}🚒❤\u{fe0f}中Z";
+        screen.feed(text.as_bytes());
+        let snapshot = screen.snapshot();
+        assert_eq!(crate::transcript::snapshot_to_lines(&snapshot, 3), [text]);
+        assert!(snapshot.cells[0].grapheme.is_none());
+        assert_eq!(snapshot.cells[1].grapheme.as_deref(), Some("e\u{301}"));
+        assert_eq!(snapshot.cells[2].grapheme.as_deref(), Some("👩\u{200d}🚒"));
+        assert_eq!(snapshot.cells[2].width, CellWidth::Wide);
+        assert_eq!(snapshot.cells[3].width, CellWidth::SpacerTail);
+        assert_eq!(snapshot.cells[4].grapheme.as_deref(), Some("❤\u{fe0f}"));
+        assert_eq!(snapshot.cells[4].width, CellWidth::Wide);
+        assert_eq!(snapshot.cells[8].codepoint, 'Z' as u32);
+        assert_eq!(snapshot.cursor.col, 9);
+
+        screen.acknowledge_snapshot(snapshot.generation);
+        screen.feed(b"\r\x1b[2Kplain");
+        let replaced = screen.snapshot();
+        assert_eq!(
+            crate::transcript::snapshot_to_lines(&replaced, 3),
+            ["plain"]
+        );
+        assert!(replaced.cells.iter().all(|cell| cell.grapheme.is_none()));
+        // Old snapshots own their strings independently of the native iterator.
+        assert_eq!(crate::transcript::snapshot_to_lines(&snapshot, 3), [text]);
+    }
+
+    #[test]
+    fn concealed_graphemes_keep_grid_width_without_leaking_text() {
+        let screen = VtScreen::new(12, 2, None).unwrap();
+        screen.feed("\x1b[?2027h\x1b[8me\u{301}👩\u{200d}🚒\x1b[28mZ".as_bytes());
+        let snapshot = screen.snapshot();
+        let painted: String = snapshot.cells[..4]
+            .iter()
+            .map(|cell| cell.for_render().text(&mut [0; 4]).to_owned())
+            .collect();
+        assert_eq!(painted, "   Z");
+        assert_eq!(
+            crate::transcript::snapshot_to_lines(&snapshot, 2),
+            ["e\u{301}👩\u{200d}🚒Z"]
+        );
+    }
+
+    #[test]
+    fn synchronized_output_captures_same_write_boundary() {
+        let screen = VtScreen::new(20, 3, None).unwrap();
+        screen.feed(b"prefix\x1b[?2026hhidden");
+        let held = screen.snapshot();
+        assert_eq!(held.cells[0].codepoint, 'p' as u32);
+        assert_eq!(held.cells[6].codepoint, 0);
+        assert_eq!(held.cursor.col, 6);
+        screen.feed(b"more");
+        assert_eq!(screen.snapshot().generation, held.generation);
+        screen.feed(b"\x1b[?2026l");
+        assert_eq!(screen.snapshot().cells[6].codepoint, 'h' as u32);
+    }
+
+    #[test]
+    fn synchronized_output_failed_capture_keeps_last_complete_frame() {
+        let screen = VtScreen::new(10, 3, None).unwrap();
+        screen.feed(b"old");
+        let old = screen.snapshot();
+        screen.acknowledge_snapshot(old.generation);
+        screen.feed(b"\x1b[2;1Hnew\x1b[H\x1b[?2026hhidden");
+        // Inject a capture failure after native damage has been consumed.
+        screen.inner.lock().callback_state.capture.lock().pending = None;
+        let fallback = screen.snapshot();
+        assert_eq!(fallback.cells, old.cells);
+        assert_eq!(fallback.generation, old.generation);
+        screen.acknowledge_snapshot(fallback.generation);
+        screen.feed(b"\x1b[?2026l");
+        let live = screen.snapshot();
+        assert_eq!(live.cells[0].codepoint, 'h' as u32);
+        assert_eq!(live.cells[10].codepoint, 'n' as u32);
+        assert_ne!(live.generation, old.generation);
+    }
+
+    #[test]
+    fn synchronized_output_coalesces_boundaries_without_losing_damage() {
+        let screen = VtScreen::new(10, 3, None).unwrap();
+        screen.feed(b"old");
+        let old = screen.snapshot();
+        screen.acknowledge_snapshot(old.generation);
+        screen.feed(b"\rfirst\x1b[?2026h\rsecond\x1b[?2026l\x1b[?2026h\rthird");
+        screen.acknowledge_snapshot(old.generation);
+        let held = screen.snapshot();
+        assert_ne!(held.generation, old.generation);
+        assert_eq!(held.cells[0].codepoint, 's' as u32);
+        assert!(!held.dirty_rows.is_empty());
+        screen.acknowledge_snapshot(held.generation);
+        assert!(screen.snapshot().dirty_rows.is_empty());
+        screen.feed(b"\x1b[?2026l");
+        let released = screen.snapshot();
+        assert_eq!(released.cells[0].codepoint, 't' as u32);
+        screen.acknowledge_snapshot(released.generation);
+
+        // The callback consumes row 1 damage, but its capture is released
+        // before adoption. Only row 2 is dirtied after that boundary.
+        // Park the cursor elsewhere: cursor-row damage would mask the loss.
+        screen.feed(b"\x1b[2;1Hchanged\x1b[H\x1b[?2026h\x1b[3;1Htail\x1b[H\x1b[?2026l");
+        let live = screen.snapshot();
+        assert_eq!(live.cells[10].codepoint, 'c' as u32);
+        assert_eq!(live.cells[20].codepoint, 't' as u32);
+    }
+
+    #[test]
+    fn synchronized_output_repeated_set_reset_resize_and_timeout() {
+        let screen = VtScreen::new(12, 3, None).unwrap();
+        screen.feed(b"\x1b[?25l\x1b[2 qA\x1b[?2026hB");
+        let deadline = screen.render_hold_deadline().unwrap();
+        let held = screen.snapshot();
+        assert!(!held.cursor.visible);
+        assert!(!held.cursor.blinking);
+        screen.feed(b"\x1b[?2026hC");
+        assert_eq!(screen.render_hold_deadline(), Some(deadline));
+        assert!(!screen.expire_render_hold(deadline));
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        assert!(screen.expire_render_hold(deadline));
+        assert!(!screen.mode_active(ghostty_mode(2026, false)));
+        let live = screen.snapshot();
+        assert_ne!(live.generation, held.generation);
+        assert_eq!(live.cells[2].codepoint, 'C' as u32);
+        screen.feed(b"\x1b[?2026hD");
+        assert!(
+            !screen.expire_render_hold(deadline),
+            "stale timer must not release a new hold"
+        );
+        screen.resize(15, 4, 8, 16).unwrap();
+        assert_eq!(screen.render_hold_deadline(), None);
+        assert_eq!(screen.snapshot().cols, 15);
+        screen.feed(b"\x1b[?2026hE\x1bc");
+        assert_eq!(screen.render_hold_deadline(), None);
+        assert_eq!(screen.snapshot().cells[0].codepoint, 0);
+    }
+
+    #[test]
+    fn synchronized_output_feed_does_not_wait_for_render_extraction() {
+        let screen = Arc::new(VtScreen::new(10, 3, None).unwrap());
+        let render = screen.render.lock();
+        let writer = screen.clone();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            writer.feed(b"prefix\x1b[?2026hhidden");
+            tx.send(()).unwrap();
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        drop(render);
+        worker.join().unwrap();
+        result.expect("hold capture must not acquire the canonical render lock");
+        assert_eq!(screen.snapshot().cursor.col, 6);
+    }
+
+    #[test]
+    fn synchronized_output_captures_kitty_and_screen_metadata() {
+        let screen = VtScreen::new(20, 3, None).unwrap();
+        screen.resize(20, 3, 8, 16).unwrap();
+        screen.feed(b"1\r\n2\r\n3\r\n4\r\n");
+        screen.feed(b"\x1b_Ga=T,f=32,s=1,v=1,i=7,q=2;AAAA/w==\x1b\\\x1b[?2026h\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?1049h");
+        let held = screen.snapshot();
+        assert_eq!(held.kitty_placements.len(), 1);
+        assert_eq!(
+            held.kitty_placements[0].image.rgba.as_ref(),
+            &[0, 0, 0, 255]
+        );
+        assert!(!held.alternate_screen);
+        assert!(held.scrollbar.is_some());
+        assert_eq!(
+            screen.snapshot_scrollbar(),
+            Some((held.generation, held.scrollbar))
+        );
+        assert_ne!(
+            screen.scrollbar(),
+            held.scrollbar,
+            "live alternate screen differs from the held primary viewport"
+        );
+        screen.feed(b"\x1b[?2026l");
+        let live = screen.snapshot();
+        assert!(live.kitty_placements.is_empty());
+        assert!(live.alternate_screen);
+        assert_eq!(
+            screen.snapshot_scrollbar(),
+            Some((live.generation, live.scrollbar))
+        );
+    }
+
+    #[test]
+    fn hyperlink_at_reads_targets_not_labels_and_respects_boundaries() {
+        let screen = VtScreen::new(20, 3, None).unwrap();
+        screen.feed(b"x\x1b]8;id=one;https://example.com/hidden\x1b\\label\x1b]8;;\x1b\\y");
+        assert_eq!(screen.hyperlink_at(0, 0).unwrap(), None);
+        for col in 1..6 {
+            assert_eq!(
+                screen.hyperlink_at(col, 0).unwrap().as_deref(),
+                Some("https://example.com/hidden")
+            );
+        }
+        assert_eq!(screen.hyperlink_at(6, 0).unwrap(), None);
+        assert_eq!(screen.hyperlink_at(20, 0).unwrap(), None);
+        assert_eq!(screen.hyperlink_at(0, 3).unwrap(), None);
+        let owned = screen.hyperlink_at(1, 0).unwrap().unwrap();
+        screen.feed(b"\r\x1b[2K");
+        assert_eq!(screen.hyperlink_at(1, 0).unwrap(), None);
+        assert_eq!(owned, "https://example.com/hidden");
+    }
+
+    #[test]
+    fn hyperlink_at_tracks_wide_cells_wrap_resize_and_scrollback() {
+        let screen = VtScreen::new(6, 3, None).unwrap();
+        screen.feed("xx\x1b]8;;https://example.com/wide\x07界abcd\x1b]8;;\x07".as_bytes());
+        for (col, row) in [(2, 0), (3, 0), (5, 0), (0, 1), (1, 1)] {
+            assert_eq!(
+                screen.hyperlink_at(col, row).unwrap().as_deref(),
+                Some("https://example.com/wide")
+            );
+        }
+        assert_eq!(screen.hyperlink_at(2, 1).unwrap(), None);
+        screen.resize(10, 3, 8, 16).unwrap();
+        assert_eq!(
+            screen.hyperlink_at(7, 0).unwrap().as_deref(),
+            Some("https://example.com/wide")
+        );
+        screen.feed(b"\r\nline2\r\nline3\r\nline4");
+        assert_eq!(screen.hyperlink_at(2, 0).unwrap(), None);
+        screen.scroll_viewport_delta(-1);
+        assert_eq!(
+            screen.hyperlink_at(2, 0).unwrap().as_deref(),
+            Some("https://example.com/wide")
+        );
+        screen.scroll_viewport_bottom();
+        assert_eq!(screen.hyperlink_at(2, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn libghostty_vt_manifest_matches_handwritten_ffi() {
+        let manifest = unsafe {
+            let ptr = ghostty_type_json();
+            assert!(!ptr.is_null(), "ghostty_type_json returned null");
+            CStr::from_ptr(ptr).to_str().expect("manifest is utf-8")
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_str(manifest).expect("manifest is valid json");
+        let types = &manifest["types"];
+
+        assert_eq!(manifest["schema"].as_u64(), Some(1));
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["RENDER_HOLD"].as_i64(),
+            Some(GhosttyTerminalOption::RenderHold as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["MODE"].as_i64(),
+            Some(GhosttyTerminalOption::Mode as i64)
+        );
+        for (name, style) in [
+            ("BAR", CursorStyle::Bar),
+            ("BLOCK", CursorStyle::Block),
+            ("UNDERLINE", CursorStyle::Underline),
+            ("BLOCK_HOLLOW", CursorStyle::HollowBlock),
+        ] {
+            assert_eq!(
+                types["GhosttyRenderStateCursorVisualStyle"]["values"][name].as_u64(),
+                Some(style as u64),
+            );
+        }
+        assert_eq!(
+            types["GhosttyCell"]["size"].as_u64(),
+            Some(std::mem::size_of::<GhosttyCell>() as u64)
+        );
+        assert_eq!(
+            types["GhosttyStyle"]["size"].as_u64(),
+            Some(std::mem::size_of::<GhosttyStyle>() as u64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalModeConfig"]["size"].as_u64(),
+            Some(std::mem::size_of::<GhosttyTerminalModeConfig>() as u64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalModeConfig"]["fields"]["mode"]["offset"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            types["GhosttyTerminalModeConfig"]["fields"]["value"]["offset"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["SCROLLBACK_MAX_LINES"].as_i64(),
+            Some(GhosttyTerminalOption::ScrollbackMaxLines as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["RESIZE_PULL_SCROLLBACK"].as_i64(),
+            Some(GhosttyTerminalOption::ResizePullScrollback as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["KITTY_IMAGE_STORAGE_LIMIT"].as_i64(),
+            Some(GhosttyTerminalOption::KittyImageStorageLimit as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["SELECTION"].as_i64(),
+            Some(GhosttyTerminalOption::Selection as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["CLIPBOARD_READ"].as_i64(),
+            Some(GhosttyTerminalOption::ClipboardRead as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["CLIPBOARD_WRITE"].as_i64(),
+            Some(GhosttyTerminalOption::ClipboardWrite as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["CLIPBOARD_WRITE_MAX_BYTES"].as_i64(),
+            Some(GhosttyTerminalOption::ClipboardWriteMaxBytes as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["BELL"].as_i64(),
+            Some(GhosttyTerminalOption::Bell as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["TITLE_CHANGED"].as_i64(),
+            Some(GhosttyTerminalOption::TitleChanged as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["PWD_CHANGED"].as_i64(),
+            Some(GhosttyTerminalOption::PwdChanged as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["DESKTOP_NOTIFICATION"].as_i64(),
+            Some(GhosttyTerminalOption::DesktopNotification as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["PROGRESS_REPORT"].as_i64(),
+            Some(GhosttyTerminalOption::ProgressReport as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["SEMANTIC_PROMPT"].as_i64(),
+            Some(GhosttyTerminalOption::SemanticPrompt as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["RESET"].as_i64(),
+            Some(GhosttyTerminalOption::Reset as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["PROGRAM_STATUS"].as_i64(),
+            Some(GhosttyTerminalOption::ProgramStatus as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalProgramStatus"]["size"].as_u64(),
+            Some(std::mem::size_of::<GhosttyTerminalProgramStatus>() as u64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["UNKNOWN_SEQUENCE"].as_i64(),
+            Some(GhosttyTerminalOption::UnknownSequence as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalOption"]["values"]["UNKNOWN_MAX_BYTES"].as_i64(),
+            Some(GhosttyTerminalOption::UnknownMaxBytes as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalData"]["values"]["CLIPBOARD_WRITE_MAX_BYTES"].as_i64(),
+            Some(GhosttyTerminalData::ClipboardWriteMaxBytes as i64)
+        );
+        for (name, size, align) in [
+            (
+                "GhosttyMousePosition",
+                std::mem::size_of::<GhosttyMousePosition>(),
+                std::mem::align_of::<GhosttyMousePosition>(),
+            ),
+            (
+                "GhosttyMouseEncoderSize",
+                std::mem::size_of::<GhosttyMouseEncoderSize>(),
+                std::mem::align_of::<GhosttyMouseEncoderSize>(),
+            ),
+            (
+                "GhosttyWriter",
+                std::mem::size_of::<GhosttyWriter>(),
+                std::mem::align_of::<GhosttyWriter>(),
+            ),
+            (
+                "GhosttyMimeReader",
+                std::mem::size_of::<GhosttyMimeReader>(),
+                std::mem::align_of::<GhosttyMimeReader>(),
+            ),
+            (
+                "GhosttyPaste",
+                std::mem::size_of::<GhosttyPaste>(),
+                std::mem::align_of::<GhosttyPaste>(),
+            ),
+            (
+                "GhosttyClipboardContent",
+                std::mem::size_of::<GhosttyClipboardContent>(),
+                std::mem::align_of::<GhosttyClipboardContent>(),
+            ),
+            (
+                "GhosttyClipboardWriteReply",
+                std::mem::size_of::<GhosttyClipboardWriteReply>(),
+                std::mem::align_of::<GhosttyClipboardWriteReply>(),
+            ),
+            (
+                "GhosttyClipboardWrite",
+                std::mem::size_of::<GhosttyClipboardWrite>(),
+                std::mem::align_of::<GhosttyClipboardWrite>(),
+            ),
+            (
+                "GhosttyClipboardReadReply",
+                std::mem::size_of::<GhosttyClipboardReadReply>(),
+                std::mem::align_of::<GhosttyClipboardReadReply>(),
+            ),
+            (
+                "GhosttyClipboardRead",
+                std::mem::size_of::<GhosttyClipboardRead>(),
+                std::mem::align_of::<GhosttyClipboardRead>(),
+            ),
+            (
+                "GhosttyTerminalDesktopNotification",
+                std::mem::size_of::<GhosttyTerminalDesktopNotification>(),
+                std::mem::align_of::<GhosttyTerminalDesktopNotification>(),
+            ),
+            (
+                "GhosttyTerminalProgressReport",
+                std::mem::size_of::<GhosttyTerminalProgressReport>(),
+                std::mem::align_of::<GhosttyTerminalProgressReport>(),
+            ),
+            (
+                "GhosttyTerminalUnknownStringSequence",
+                std::mem::size_of::<GhosttyTerminalUnknownStringSequence>(),
+                std::mem::align_of::<GhosttyTerminalUnknownStringSequence>(),
+            ),
+            (
+                "GhosttyTerminalUnknownSequenceValue",
+                std::mem::size_of::<GhosttyTerminalUnknownSequenceValue>(),
+                std::mem::align_of::<GhosttyTerminalUnknownSequenceValue>(),
+            ),
+            (
+                "GhosttyTerminalUnknownSequence",
+                std::mem::size_of::<GhosttyTerminalUnknownSequence>(),
+                std::mem::align_of::<GhosttyTerminalUnknownSequence>(),
+            ),
+            (
+                "GhosttySysImage",
+                std::mem::size_of::<GhosttySysImage>(),
+                std::mem::align_of::<GhosttySysImage>(),
+            ),
+            (
+                "GhosttyKittyGraphicsPlacementRenderInfo",
+                std::mem::size_of::<GhosttyKittyGraphicsPlacementRenderInfo>(),
+                std::mem::align_of::<GhosttyKittyGraphicsPlacementRenderInfo>(),
+            ),
+            (
+                "GhosttyRenderStateCursor",
+                std::mem::size_of::<GhosttyRenderStateCursor>(),
+                std::mem::align_of::<GhosttyRenderStateCursor>(),
+            ),
+            (
+                "GhosttyRenderStateRowSelection",
+                std::mem::size_of::<GhosttyRenderStateRowSelection>(),
+                std::mem::align_of::<GhosttyRenderStateRowSelection>(),
+            ),
+            (
+                "GhosttyRenderStateColors",
+                std::mem::size_of::<GhosttyRenderStateColors>(),
+                std::mem::align_of::<GhosttyRenderStateColors>(),
+            ),
+            (
+                "GhosttyPointValue",
+                std::mem::size_of::<GhosttyPointValue>(),
+                std::mem::align_of::<GhosttyPointValue>(),
+            ),
+            (
+                "GhosttyPoint",
+                std::mem::size_of::<GhosttyPoint>(),
+                std::mem::align_of::<GhosttyPoint>(),
+            ),
+            (
+                "GhosttyPointCoordinate",
+                std::mem::size_of::<GhosttyPointCoordinate>(),
+                std::mem::align_of::<GhosttyPointCoordinate>(),
+            ),
+            (
+                "GhosttyGridRef",
+                std::mem::size_of::<GhosttyGridRef>(),
+                std::mem::align_of::<GhosttyGridRef>(),
+            ),
+            (
+                "GhosttySelection",
+                std::mem::size_of::<GhosttySelection>(),
+                std::mem::align_of::<GhosttySelection>(),
+            ),
+            (
+                "GhosttyTerminalSelectionFormatOptions",
+                std::mem::size_of::<GhosttyTerminalSelectionFormatOptions>(),
+                std::mem::align_of::<GhosttyTerminalSelectionFormatOptions>(),
+            ),
+            (
+                "GhosttySurfacePosition",
+                std::mem::size_of::<GhosttySurfacePosition>(),
+                std::mem::align_of::<GhosttySurfacePosition>(),
+            ),
+            (
+                "GhosttySelectionGestureGeometry",
+                std::mem::size_of::<GhosttySelectionGestureGeometry>(),
+                std::mem::align_of::<GhosttySelectionGestureGeometry>(),
+            ),
+        ] {
+            assert_eq!(
+                types[name]["size"].as_u64(),
+                Some(size as u64),
+                "{name} size"
+            );
+            assert_eq!(
+                types[name]["align"].as_u64(),
+                Some(align as u64),
+                "{name} alignment"
+            );
+        }
+        let cursor_fields = &types["GhosttyRenderStateCursor"]["fields"];
+        for (name, offset) in [
+            ("size", std::mem::offset_of!(GhosttyRenderStateCursor, size)),
+            (
+                "viewport_has_value",
+                std::mem::offset_of!(GhosttyRenderStateCursor, viewport_has_value),
+            ),
+            (
+                "viewport_x",
+                std::mem::offset_of!(GhosttyRenderStateCursor, viewport_x),
+            ),
+            (
+                "viewport_y",
+                std::mem::offset_of!(GhosttyRenderStateCursor, viewport_y),
+            ),
+            (
+                "wide_tail",
+                std::mem::offset_of!(GhosttyRenderStateCursor, wide_tail),
+            ),
+            (
+                "visible",
+                std::mem::offset_of!(GhosttyRenderStateCursor, visible),
+            ),
+            (
+                "blinking",
+                std::mem::offset_of!(GhosttyRenderStateCursor, blinking),
+            ),
+            (
+                "password_input",
+                std::mem::offset_of!(GhosttyRenderStateCursor, password_input),
+            ),
+            (
+                "visual_style",
+                std::mem::offset_of!(GhosttyRenderStateCursor, visual_style),
+            ),
+        ] {
+            assert_eq!(
+                cursor_fields[name]["offset"].as_u64(),
+                Some(offset as u64),
+                "GhosttyRenderStateCursor::{name} offset"
+            );
+        }
+        let row_selection_fields = &types["GhosttyRenderStateRowSelection"]["fields"];
+        for (name, offset) in [
+            (
+                "size",
+                std::mem::offset_of!(GhosttyRenderStateRowSelection, size),
+            ),
+            (
+                "start_x",
+                std::mem::offset_of!(GhosttyRenderStateRowSelection, start_x),
+            ),
+            (
+                "end_x",
+                std::mem::offset_of!(GhosttyRenderStateRowSelection, end_x),
+            ),
+        ] {
+            assert_eq!(
+                row_selection_fields[name]["offset"].as_u64(),
+                Some(offset as u64),
+                "GhosttyRenderStateRowSelection::{name} offset"
+            );
+        }
+        let colors_fields = &types["GhosttyRenderStateColors"]["fields"];
+        for (name, offset) in [
+            ("size", std::mem::offset_of!(GhosttyRenderStateColors, size)),
+            (
+                "background",
+                std::mem::offset_of!(GhosttyRenderStateColors, background),
+            ),
+            (
+                "foreground",
+                std::mem::offset_of!(GhosttyRenderStateColors, foreground),
+            ),
+            (
+                "cursor",
+                std::mem::offset_of!(GhosttyRenderStateColors, cursor),
+            ),
+            (
+                "cursor_has_value",
+                std::mem::offset_of!(GhosttyRenderStateColors, cursor_has_value),
+            ),
+            (
+                "palette",
+                std::mem::offset_of!(GhosttyRenderStateColors, palette),
+            ),
+        ] {
+            assert_eq!(
+                colors_fields[name]["offset"].as_u64(),
+                Some(offset as u64),
+                "GhosttyRenderStateColors::{name} offset"
+            );
+        }
+        for (type_name, fields) in [
+            (
+                "GhosttyPoint",
+                &[
+                    ("tag", std::mem::offset_of!(GhosttyPoint, tag)),
+                    ("value", std::mem::offset_of!(GhosttyPoint, value)),
+                ][..],
+            ),
+            (
+                "GhosttyPointCoordinate",
+                &[
+                    ("x", std::mem::offset_of!(GhosttyPointCoordinate, x)),
+                    ("y", std::mem::offset_of!(GhosttyPointCoordinate, y)),
+                ],
+            ),
+            (
+                "GhosttyGridRef",
+                &[
+                    ("size", std::mem::offset_of!(GhosttyGridRef, size)),
+                    ("node", std::mem::offset_of!(GhosttyGridRef, node)),
+                    ("x", std::mem::offset_of!(GhosttyGridRef, x)),
+                    ("y", std::mem::offset_of!(GhosttyGridRef, y)),
+                ],
+            ),
+            (
+                "GhosttySelection",
+                &[
+                    ("size", std::mem::offset_of!(GhosttySelection, size)),
+                    ("start", std::mem::offset_of!(GhosttySelection, start)),
+                    ("end", std::mem::offset_of!(GhosttySelection, end)),
+                    (
+                        "rectangle",
+                        std::mem::offset_of!(GhosttySelection, rectangle),
+                    ),
+                ],
+            ),
+            (
+                "GhosttyTerminalSelectionFormatOptions",
+                &[
+                    (
+                        "size",
+                        std::mem::offset_of!(GhosttyTerminalSelectionFormatOptions, size),
+                    ),
+                    (
+                        "emit",
+                        std::mem::offset_of!(GhosttyTerminalSelectionFormatOptions, emit),
+                    ),
+                    (
+                        "unwrap",
+                        std::mem::offset_of!(GhosttyTerminalSelectionFormatOptions, unwrap),
+                    ),
+                    (
+                        "trim",
+                        std::mem::offset_of!(GhosttyTerminalSelectionFormatOptions, trim),
+                    ),
+                    (
+                        "selection",
+                        std::mem::offset_of!(GhosttyTerminalSelectionFormatOptions, selection),
+                    ),
+                ],
+            ),
+            (
+                "GhosttySurfacePosition",
+                &[
+                    ("x", std::mem::offset_of!(GhosttySurfacePosition, x)),
+                    ("y", std::mem::offset_of!(GhosttySurfacePosition, y)),
+                ],
+            ),
+            (
+                "GhosttySelectionGestureGeometry",
+                &[
+                    (
+                        "columns",
+                        std::mem::offset_of!(GhosttySelectionGestureGeometry, columns),
+                    ),
+                    (
+                        "cell_width",
+                        std::mem::offset_of!(GhosttySelectionGestureGeometry, cell_width),
+                    ),
+                    (
+                        "padding_left",
+                        std::mem::offset_of!(GhosttySelectionGestureGeometry, padding_left),
+                    ),
+                    (
+                        "screen_height",
+                        std::mem::offset_of!(GhosttySelectionGestureGeometry, screen_height),
+                    ),
+                ],
+            ),
+        ] {
+            for (field_name, offset) in fields {
+                assert_eq!(
+                    types[type_name]["fields"][field_name]["offset"].as_u64(),
+                    Some(*offset as u64),
+                    "{type_name}::{field_name} offset"
+                );
+            }
+        }
+        for (name, value) in [
+            ("NONE", GhosttySelectionGestureAutoscroll::None),
+            ("UP", GhosttySelectionGestureAutoscroll::Up),
+            ("DOWN", GhosttySelectionGestureAutoscroll::Down),
+        ] {
+            assert_eq!(
+                types["GhosttySelectionGestureAutoscroll"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttySelectionGestureAutoscroll::{name}"
+            );
+        }
+        for (name, value) in [
+            ("CLICK_COUNT", GhosttySelectionGestureData::ClickCount),
+            ("AUTOSCROLL", GhosttySelectionGestureData::Autoscroll),
+        ] {
+            assert_eq!(
+                types["GhosttySelectionGestureData"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttySelectionGestureData::{name}"
+            );
+        }
+        for (name, value) in [
+            ("PRESS", GhosttySelectionGestureEventType::Press),
+            ("RELEASE", GhosttySelectionGestureEventType::Release),
+            ("DRAG", GhosttySelectionGestureEventType::Drag),
+            (
+                "AUTOSCROLL_TICK",
+                GhosttySelectionGestureEventType::AutoscrollTick,
+            ),
+        ] {
+            assert_eq!(
+                types["GhosttySelectionGestureEventType"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttySelectionGestureEventType::{name}"
+            );
+        }
+        for (name, value) in [
+            ("REF", GhosttySelectionGestureEventOption::Ref),
+            ("POSITION", GhosttySelectionGestureEventOption::Position),
+            (
+                "REPEAT_DISTANCE",
+                GhosttySelectionGestureEventOption::RepeatDistance,
+            ),
+            ("TIME_NS", GhosttySelectionGestureEventOption::TimeNs),
+            (
+                "REPEAT_INTERVAL_NS",
+                GhosttySelectionGestureEventOption::RepeatIntervalNs,
+            ),
+            ("GEOMETRY", GhosttySelectionGestureEventOption::Geometry),
+            ("VIEWPORT", GhosttySelectionGestureEventOption::Viewport),
+        ] {
+            assert_eq!(
+                types["GhosttySelectionGestureEventOption"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttySelectionGestureEventOption::{name}"
+            );
+        }
+        assert_eq!(
+            types["GhosttyFormatterFormat"]["values"]["PLAIN"].as_i64(),
+            Some(GhosttyFormatterFormat::Plain as i64)
+        );
+        assert_eq!(
+            types["GhosttyPointTag"]["values"]["VIEWPORT"].as_i64(),
+            Some(GhosttyPointTag::Viewport as i64)
+        );
+        for (name, value) in [
+            ("STANDARD", GhosttyClipboardLocation::Standard),
+            ("SELECTION", GhosttyClipboardLocation::Selection),
+            ("PRIMARY", GhosttyClipboardLocation::Primary),
+        ] {
+            assert_eq!(
+                types["GhosttyClipboardLocation"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyClipboardLocation::{name}"
+            );
+        }
+        for (name, value) in [
+            ("CLIPBOARD", GhosttyPasteSource::Clipboard),
+            ("TEXT", GhosttyPasteSource::Text),
+        ] {
+            assert_eq!(
+                types["GhosttyPasteSource"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyPasteSource::{name}"
+            );
+        }
+        for (name, value) in [
+            ("SUCCESS", GhosttyClipboardWriteResult::Success),
+            ("DENIED", GhosttyClipboardWriteResult::Denied),
+            ("UNSUPPORTED", GhosttyClipboardWriteResult::Unsupported),
+            ("BUSY", GhosttyClipboardWriteResult::Busy),
+            ("INVALID_DATA", GhosttyClipboardWriteResult::InvalidData),
+            ("IO_ERROR", GhosttyClipboardWriteResult::IoError),
+        ] {
+            assert_eq!(
+                types["GhosttyClipboardWriteResult"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyClipboardWriteResult::{name}"
+            );
+        }
+        for (name, value) in [
+            ("SUCCESS", GhosttyClipboardReadResult::Success),
+            ("DENIED", GhosttyClipboardReadResult::Denied),
+            ("UNSUPPORTED", GhosttyClipboardReadResult::Unsupported),
+            ("BUSY", GhosttyClipboardReadResult::Busy),
+            ("IO_ERROR", GhosttyClipboardReadResult::IoError),
+        ] {
+            assert_eq!(
+                types["GhosttyClipboardReadResult"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyClipboardReadResult::{name}"
+            );
+        }
+        assert_eq!(
+            types["GhosttyResult"]["values"]["IO_ERROR"].as_i64(),
+            Some(GHOSTTY_IO_ERROR as i64)
+        );
+        assert_eq!(
+            types["GhosttyResult"]["values"]["INVALID_VALUE"].as_i64(),
+            Some(GHOSTTY_INVALID_VALUE as i64)
+        );
+        assert_eq!(
+            types["GhosttyResult"]["values"]["REJECTED"].as_i64(),
+            Some(GHOSTTY_REJECTED as i64)
+        );
+        assert_eq!(
+            types["GhosttyResult"]["values"]["NO_VALUE"].as_i64(),
+            Some(GHOSTTY_NO_VALUE as i64)
+        );
+        for (name, value) in [
+            ("CURSOR", GhosttyRenderStateData::Cursor),
+            ("COLORS", GhosttyRenderStateData::Colors),
+        ] {
+            assert_eq!(
+                types["GhosttyRenderStateData"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyRenderStateData::{name}"
+            );
+        }
+        for (name, value) in [
+            ("SELECTION", GhosttyRenderStateRowData::Selection),
+            ("CELLS_RAW", GhosttyRenderStateRowData::CellsRaw),
+        ] {
+            assert_eq!(
+                types["GhosttyRenderStateRowData"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyRenderStateRowData::{name}"
+            );
+        }
+        for (name, value) in [
+            ("SELECTED", GhosttyRenderStateRowCellsData::Selected),
+            ("HAS_STYLING", GhosttyRenderStateRowCellsData::HasStyling),
+            (
+                "GRAPHEMES_UTF8",
+                GhosttyRenderStateRowCellsData::GraphemesUtf8,
+            ),
+        ] {
+            assert_eq!(
+                types["GhosttyRenderStateRowCellsData"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyRenderStateRowCellsData::{name}"
+            );
+        }
+        assert_eq!(
+            types["GhosttyTerminalData"]["values"]["MODE"].as_i64(),
+            Some(GhosttyTerminalData::Mode as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalData"]["values"]["CURSOR_AT_PROMPT"].as_i64(),
+            Some(GhosttyTerminalData::CursorAtPrompt as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalData"]["values"]["KITTY_KEYBOARD_FLAGS"].as_i64(),
+            Some(GhosttyTerminalData::KittyKeyboardFlags as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalData"]["values"]["KITTY_IMAGE_STORAGE_LIMIT"].as_i64(),
+            Some(GhosttyTerminalData::KittyImageStorageLimit as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalData"]["values"]["KITTY_GRAPHICS"].as_i64(),
+            Some(GhosttyTerminalData::KittyGraphics as i64)
+        );
+        assert_eq!(
+            types["GhosttyTerminalData"]["values"]["SELECTION"].as_i64(),
+            Some(GhosttyTerminalData::Selection as i64)
+        );
+        assert_eq!(
+            types["GhosttySysOption"]["values"]["DECODE_PNG"].as_i64(),
+            Some(GhosttySysOption::DecodePng as i64)
+        );
+        assert_eq!(
+            types["GhosttyKittyGraphicsData"]["values"]["PLACEMENT_ITERATOR"].as_i64(),
+            Some(GhosttyKittyGraphicsData::PlacementIterator as i64)
+        );
+        for (name, value) in [
+            ("IMAGE_ID", GhosttyKittyGraphicsPlacementData::ImageId),
+            (
+                "PLACEMENT_ID",
+                GhosttyKittyGraphicsPlacementData::PlacementId,
+            ),
+            ("IS_VIRTUAL", GhosttyKittyGraphicsPlacementData::IsVirtual),
+            ("X_OFFSET", GhosttyKittyGraphicsPlacementData::XOffset),
+            ("Y_OFFSET", GhosttyKittyGraphicsPlacementData::YOffset),
+            ("Z", GhosttyKittyGraphicsPlacementData::Z),
+        ] {
+            assert_eq!(
+                types["GhosttyKittyGraphicsPlacementData"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyKittyGraphicsPlacementData::{name}"
+            );
+        }
+        for (name, value) in [
+            ("WIDTH", GhosttyKittyGraphicsImageData::Width),
+            ("HEIGHT", GhosttyKittyGraphicsImageData::Height),
+            ("FORMAT", GhosttyKittyGraphicsImageData::Format),
+            ("COMPRESSION", GhosttyKittyGraphicsImageData::Compression),
+            ("DATA_PTR", GhosttyKittyGraphicsImageData::DataPtr),
+            ("DATA_LEN", GhosttyKittyGraphicsImageData::DataLen),
+            ("GENERATION", GhosttyKittyGraphicsImageData::Generation),
+        ] {
+            assert_eq!(
+                types["GhosttyKittyGraphicsImageData"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyKittyGraphicsImageData::{name}"
+            );
+        }
+        for (name, value) in [
+            ("RGB", GhosttyKittyImageFormat::Rgb),
+            ("RGBA", GhosttyKittyImageFormat::Rgba),
+            ("PNG", GhosttyKittyImageFormat::Png),
+            ("GRAY_ALPHA", GhosttyKittyImageFormat::GrayAlpha),
+            ("GRAY", GhosttyKittyImageFormat::Gray),
+        ] {
+            assert_eq!(
+                types["GhosttyKittyImageFormat"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyKittyImageFormat::{name}"
+            );
+        }
+        for (name, value) in [
+            ("NONE", GhosttyKittyImageCompression::None),
+            ("ZLIB_DEFLATE", GhosttyKittyImageCompression::ZlibDeflate),
+        ] {
+            assert_eq!(
+                types["GhosttyKittyImageCompression"]["values"][name].as_i64(),
+                Some(value as i64),
+                "GhosttyKittyImageCompression::{name}"
+            );
+        }
+        let render_info = &types["GhosttyKittyGraphicsPlacementRenderInfo"]["fields"];
+        for (name, offset) in [
+            ("size", 0),
+            ("pixel_width", 8),
+            ("viewport_visible", 32),
+            ("source_x", 36),
+            ("source_height", 48),
+        ] {
+            assert_eq!(
+                render_info[name]["offset"].as_u64(),
+                Some(offset),
+                "GhosttyKittyGraphicsPlacementRenderInfo::{name} offset"
+            );
+        }
+        assert_eq!(
+            types["GhosttyKittyKeyFlags"]["size"].as_u64(),
+            Some(std::mem::size_of::<u8>() as u64)
+        );
+        assert_eq!(
+            types["GhosttyKeyAction"]["values"]["RELEASE"].as_i64(),
+            Some(ghostty_key_action(VtKeyAction::Release) as i64)
+        );
+        assert_eq!(
+            types["GhosttyKeyAction"]["values"]["PRESS"].as_i64(),
+            Some(ghostty_key_action(VtKeyAction::Press) as i64)
+        );
+        assert_eq!(
+            types["GhosttyKeyAction"]["values"]["REPEAT"].as_i64(),
+            Some(ghostty_key_action(VtKeyAction::Repeat) as i64)
+        );
+
+        for (name, action) in [
+            ("PRESS", GhosttyMouseAction::Press),
+            ("RELEASE", GhosttyMouseAction::Release),
+            ("MOTION", GhosttyMouseAction::Motion),
+        ] {
+            assert_eq!(
+                types["GhosttyMouseAction"]["values"][name].as_i64(),
+                Some(action as i64),
+                "GhosttyMouseAction::{name}"
+            );
+        }
+        for (name, button) in [
+            ("LEFT", GhosttyMouseButton::Left),
+            ("RIGHT", GhosttyMouseButton::Right),
+            ("MIDDLE", GhosttyMouseButton::Middle),
+            ("FOUR", GhosttyMouseButton::Four),
+            ("FIVE", GhosttyMouseButton::Five),
+            ("SIX", GhosttyMouseButton::Six),
+            ("SEVEN", GhosttyMouseButton::Seven),
+        ] {
+            assert_eq!(
+                types["GhosttyMouseButton"]["values"][name].as_i64(),
+                Some(button as i64),
+                "GhosttyMouseButton::{name}"
+            );
+        }
+        for (name, option) in [
+            ("SIZE", GhosttyMouseEncoderOption::Size),
+            (
+                "ANY_BUTTON_PRESSED",
+                GhosttyMouseEncoderOption::AnyButtonPressed,
+            ),
+            ("TRACK_LAST_CELL", GhosttyMouseEncoderOption::TrackLastCell),
+        ] {
+            assert_eq!(
+                types["GhosttyMouseEncoderOption"]["values"][name].as_i64(),
+                Some(option as i64),
+                "GhosttyMouseEncoderOption::{name}"
+            );
+        }
+        for (name, offset) in [
+            ("x", std::mem::offset_of!(GhosttyMousePosition, x)),
+            ("y", std::mem::offset_of!(GhosttyMousePosition, y)),
+        ] {
+            assert_eq!(
+                types["GhosttyMousePosition"]["fields"][name]["offset"].as_u64(),
+                Some(offset as u64),
+                "GhosttyMousePosition::{name} offset"
+            );
+        }
+        for (name, offset) in [
+            ("size", std::mem::offset_of!(GhosttyMouseEncoderSize, size)),
+            (
+                "screen_width",
+                std::mem::offset_of!(GhosttyMouseEncoderSize, screen_width),
+            ),
+            (
+                "screen_height",
+                std::mem::offset_of!(GhosttyMouseEncoderSize, screen_height),
+            ),
+            (
+                "cell_width",
+                std::mem::offset_of!(GhosttyMouseEncoderSize, cell_width),
+            ),
+            (
+                "cell_height",
+                std::mem::offset_of!(GhosttyMouseEncoderSize, cell_height),
+            ),
+            (
+                "padding_top",
+                std::mem::offset_of!(GhosttyMouseEncoderSize, padding_top),
+            ),
+            (
+                "padding_bottom",
+                std::mem::offset_of!(GhosttyMouseEncoderSize, padding_bottom),
+            ),
+            (
+                "padding_right",
+                std::mem::offset_of!(GhosttyMouseEncoderSize, padding_right),
+            ),
+            (
+                "padding_left",
+                std::mem::offset_of!(GhosttyMouseEncoderSize, padding_left),
+            ),
+        ] {
+            assert_eq!(
+                types["GhosttyMouseEncoderSize"]["fields"][name]["offset"].as_u64(),
+                Some(offset as u64),
+                "GhosttyMouseEncoderSize::{name} offset"
+            );
+        }
+
+        let keys = &types["GhosttyKey"]["values"];
+        for (name, key) in [
+            ("UNIDENTIFIED", GhosttyKey::Unidentified),
+            ("ALT_LEFT", GhosttyKey::AltLeft),
+            ("ALT_RIGHT", GhosttyKey::AltRight),
+            ("BACKSPACE", GhosttyKey::Backspace),
+            ("CAPS_LOCK", GhosttyKey::CapsLock),
+            ("CONTEXT_MENU", GhosttyKey::ContextMenu),
+            ("CONTROL_LEFT", GhosttyKey::ControlLeft),
+            ("CONTROL_RIGHT", GhosttyKey::ControlRight),
+            ("ENTER", GhosttyKey::Enter),
+            ("META_LEFT", GhosttyKey::MetaLeft),
+            ("META_RIGHT", GhosttyKey::MetaRight),
+            ("SHIFT_LEFT", GhosttyKey::ShiftLeft),
+            ("SHIFT_RIGHT", GhosttyKey::ShiftRight),
+            ("SPACE", GhosttyKey::Space),
+            ("TAB", GhosttyKey::Tab),
+            ("DELETE", GhosttyKey::Delete),
+            ("END", GhosttyKey::End),
+            ("HELP", GhosttyKey::Help),
+            ("HOME", GhosttyKey::Home),
+            ("INSERT", GhosttyKey::Insert),
+            ("PAGE_DOWN", GhosttyKey::PageDown),
+            ("PAGE_UP", GhosttyKey::PageUp),
+            ("ARROW_DOWN", GhosttyKey::ArrowDown),
+            ("ARROW_LEFT", GhosttyKey::ArrowLeft),
+            ("ARROW_RIGHT", GhosttyKey::ArrowRight),
+            ("ARROW_UP", GhosttyKey::ArrowUp),
+            ("ESCAPE", GhosttyKey::Escape),
+            ("F1", GhosttyKey::F1),
+            ("F2", GhosttyKey::F2),
+            ("F3", GhosttyKey::F3),
+            ("F4", GhosttyKey::F4),
+            ("F5", GhosttyKey::F5),
+            ("F6", GhosttyKey::F6),
+            ("F7", GhosttyKey::F7),
+            ("F8", GhosttyKey::F8),
+            ("F9", GhosttyKey::F9),
+            ("F10", GhosttyKey::F10),
+            ("F11", GhosttyKey::F11),
+            ("F12", GhosttyKey::F12),
+            ("F13", GhosttyKey::F13),
+            ("F14", GhosttyKey::F14),
+            ("F15", GhosttyKey::F15),
+            ("F16", GhosttyKey::F16),
+            ("F17", GhosttyKey::F17),
+            ("F18", GhosttyKey::F18),
+            ("F19", GhosttyKey::F19),
+            ("F20", GhosttyKey::F20),
+            ("F21", GhosttyKey::F21),
+            ("F22", GhosttyKey::F22),
+            ("F23", GhosttyKey::F23),
+            ("F24", GhosttyKey::F24),
+            ("F25", GhosttyKey::F25),
+            ("PRINT_SCREEN", GhosttyKey::PrintScreen),
+            ("SCROLL_LOCK", GhosttyKey::ScrollLock),
+            ("PAUSE", GhosttyKey::Pause),
+        ] {
+            assert_eq!(keys[name].as_i64(), Some(key as i64), "GhosttyKey::{key:?}");
+        }
+    }
+
+    fn test_selection_geometry(columns: u32, rows: u32) -> SelectionGeometry {
+        SelectionGeometry {
+            columns,
+            cell_width_px: 10,
+            padding_left_px: 0,
+            screen_height_px: rows * 20,
+        }
+    }
+
+    fn test_selection_point(col: u16, row: u16, x_offset_px: f64) -> SelectionPoint {
+        SelectionPoint {
+            col,
+            row,
+            surface_x_px: f64::from(col) * 10.0 + x_offset_px,
+            surface_y_px: f64::from(row) * 20.0 + 10.0,
+        }
+    }
+
+    #[test]
+    fn terminal_selection_formats_text_and_advances_generation() {
+        let screen = VtScreen::new(20, 3, None).expect("create vt screen");
+        screen.feed(b"alpha beta\r\nsecond line");
+        let geometry = test_selection_geometry(20, 3);
+        let baseline_generation = screen.generation();
+
+        screen
+            .selection_press(test_selection_point(0, 0, 1.0), geometry, 1, false)
+            .expect("press selection anchor");
+        assert!(!screen.has_selection());
+        assert_eq!(screen.generation(), baseline_generation);
+
+        screen
+            .selection_drag(test_selection_point(4, 0, 9.0), geometry)
+            .expect("drag selection");
+        assert!(screen.has_selection());
+        assert_eq!(screen.selection_text().as_deref(), Some("alpha"));
+        assert_eq!(screen.generation(), baseline_generation.wrapping_add(1));
+
+        let selected_generation = screen.generation();
+        screen
+            .selection_drag(test_selection_point(4, 0, 9.0), geometry)
+            .expect("repeat drag in selected cell");
+        assert_eq!(screen.generation(), selected_generation);
+
+        screen
+            .selection_release(Some((4, 0)))
+            .expect("release selection");
+        assert!(screen.clear_selection());
+        assert!(!screen.has_selection());
+        assert_eq!(screen.selection_text(), None);
+        assert_eq!(screen.generation(), baseline_generation.wrapping_add(2));
+
+        let cleared_generation = screen.generation();
+        assert!(!screen.clear_selection());
+        assert_eq!(screen.generation(), cleared_generation);
+    }
+
+    #[test]
+    fn snapshots_cache_terminal_selection_ranges_and_clear_stale_rows() {
+        let screen = VtScreen::new(6, 3, None).expect("create vt screen");
+        screen.feed(b"abcdef\r\nghijkl\x1b[?25l");
+        let geometry = test_selection_geometry(6, 3);
+        let baseline = screen.snapshot();
+        assert_eq!(baseline.selection_ranges, vec![None; 3]);
+        screen.acknowledge_snapshot(baseline.generation);
+
+        screen
+            .selection_press(test_selection_point(2, 0, 1.0), geometry, 1, false)
+            .expect("press selection anchor");
+        screen
+            .selection_drag(test_selection_point(3, 1, 9.0), geometry)
+            .expect("drag selection across rows");
+
+        let selected = screen.snapshot();
+        assert_eq!(
+            selected.selection_ranges,
+            vec![
+                Some(SelectionRange { start: 2, end: 5 }),
+                Some(SelectionRange { start: 0, end: 3 }),
+                None,
+            ]
+        );
+        assert!(selected.generation > baseline.generation);
+        assert_eq!(selected.dirty_rows, vec![0, 1, 2]);
+        assert!(selected.selection_ranges[0].is_some_and(|range| range.contains(2)));
+        assert!(!selected.selection_ranges[0].is_some_and(|range| range.contains(1)));
+
+        let cached = screen.snapshot();
+        assert_eq!(cached.generation, selected.generation);
+        assert_eq!(cached.selection_ranges, selected.selection_ranges);
+        screen.acknowledge_snapshot(selected.generation);
+
+        screen.feed(b"\x1b[3;1HX");
+        let partial = screen.snapshot();
+        assert_eq!(partial.selection_ranges, selected.selection_ranges);
+        assert_eq!(partial.dirty_rows, vec![1, 2]);
+        screen.acknowledge_snapshot(partial.generation);
+
+        assert!(screen.clear_selection());
+        let cleared = screen.snapshot();
+        assert!(cleared.generation > partial.generation);
+        assert_eq!(cleared.selection_ranges, vec![None; 3]);
+        assert_eq!(cleared.dirty_rows, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn repeat_clicks_select_word_then_line() {
+        let screen = VtScreen::new(20, 2, None).expect("create vt screen");
+        screen.feed(b"alpha beta");
+        let geometry = test_selection_geometry(20, 2);
+        let point = test_selection_point(1, 0, 5.0);
+
+        screen
+            .selection_press(point, geometry, 1, false)
+            .expect("first click");
+        screen
+            .selection_release(Some((point.col, point.row)))
+            .expect("first release");
+        assert_eq!(screen.selection_text(), None);
+
+        screen
+            .selection_press(point, geometry, 2, false)
+            .expect("second click");
+        assert_eq!(screen.selection_text().as_deref(), Some("alpha"));
+        screen
+            .selection_release(Some((point.col, point.row)))
+            .expect("second release");
+
+        screen
+            .selection_press(point, geometry, 3, false)
+            .expect("third click");
+        assert_eq!(screen.selection_text().as_deref(), Some("alpha beta"));
+    }
+
+    #[test]
+    fn shifted_single_click_falls_back_to_a_fresh_press_after_gesture_reset() {
+        let screen = VtScreen::new(20, 2, None).expect("create vt screen");
+        screen.feed(b"alpha beta");
+        let geometry = test_selection_geometry(20, 2);
+
+        screen
+            .selection_press(test_selection_point(0, 0, 1.0), geometry, 1, false)
+            .expect("press initial anchor");
+        screen
+            .selection_drag(test_selection_point(4, 0, 9.0), geometry)
+            .expect("select alpha");
+        screen
+            .selection_release(Some((4, 0)))
+            .expect("release initial selection");
+        screen.selection_cancel_gesture();
+
+        screen
+            .selection_press(test_selection_point(6, 0, 1.0), geometry, 1, true)
+            .expect("shifted press after reset");
+        screen
+            .selection_drag(test_selection_point(9, 0, 9.0), geometry)
+            .expect("drag from fallback anchor");
+        assert_eq!(screen.selection_text().as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn shifted_repeat_click_keeps_platform_word_behavior() {
+        let screen = VtScreen::new(20, 2, None).expect("create vt screen");
+        screen.feed(b"alpha beta");
+        let geometry = test_selection_geometry(20, 2);
+
+        screen
+            .selection_press(test_selection_point(0, 0, 1.0), geometry, 1, false)
+            .expect("first click");
+        screen
+            .selection_release(Some((0, 0)))
+            .expect("first release");
+        screen
+            .selection_press(test_selection_point(7, 0, 5.0), geometry, 2, true)
+            .expect("shifted double click");
+
+        assert_eq!(screen.selection_text().as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn clearing_selection_resets_repeat_click_state() {
+        let screen = VtScreen::new(20, 2, None).expect("create vt screen");
+        screen.feed(b"alpha beta");
+        let geometry = test_selection_geometry(20, 2);
+        let point = test_selection_point(1, 0, 5.0);
+
+        screen
+            .selection_press(point, geometry, 1, false)
+            .expect("first click");
+        screen
+            .selection_release(Some((point.col, point.row)))
+            .expect("first release");
+        assert!(!screen.clear_selection());
+
+        screen
+            .selection_press(point, geometry, 1, false)
+            .expect("click after clear");
+        assert_eq!(screen.selection_text(), None);
+    }
+
+    #[test]
+    fn drag_after_release_extends_existing_selection() {
+        let screen = VtScreen::new(20, 2, None).expect("create vt screen");
+        screen.feed(b"alpha beta");
+        let geometry = test_selection_geometry(20, 2);
+
+        screen
+            .selection_press(test_selection_point(0, 0, 1.0), geometry, 1, false)
+            .expect("press selection anchor");
+        screen
+            .selection_drag(test_selection_point(4, 0, 9.0), geometry)
+            .expect("drag initial selection");
+        screen
+            .selection_release(Some((4, 0)))
+            .expect("release initial selection");
+
+        screen
+            .selection_drag(test_selection_point(9, 0, 9.0), geometry)
+            .expect("extend released selection");
+        assert_eq!(screen.selection_text().as_deref(), Some("alpha beta"));
+    }
+
+    #[test]
+    fn mouse_motion_tracking_excludes_press_only_modes() {
+        let screen = VtScreen::new(20, 2, None).expect("create vt screen");
+        assert!(!screen.mouse_motion_tracking_active());
+
+        screen.feed(b"\x1b[?1000h");
+        assert!(screen.mouse_tracking_active());
+        assert!(!screen.mouse_motion_tracking_active());
+
+        screen.feed(b"\x1b[?1000l\x1b[?1002h");
+        assert!(screen.mouse_motion_tracking_active());
+
+        screen.feed(b"\x1b[?1002l\x1b[?1003h");
+        assert!(screen.mouse_motion_tracking_active());
+
+        screen.feed(b"\x1b[?1003l\x1b[?9h");
+        assert!(screen.mouse_tracking_active());
+        assert!(!screen.mouse_motion_tracking_active());
+    }
+
+    #[test]
+    fn terminal_selection_survives_reflow_and_clears_across_screen_switches() {
+        let screen = VtScreen::new(20, 3, None).expect("create vt screen");
+        screen.feed(b"alpha beta");
+        let geometry = test_selection_geometry(20, 3);
+        screen
+            .selection_press(test_selection_point(0, 0, 1.0), geometry, 1, false)
+            .expect("press selection anchor");
+        screen
+            .selection_drag(test_selection_point(4, 0, 9.0), geometry)
+            .expect("drag selection");
+        screen
+            .selection_release(Some((4, 0)))
+            .expect("release selection");
+
+        screen.resize(8, 3, 10, 20).expect("reflow terminal");
+        assert_eq!(screen.selection_text().as_deref(), Some("alpha"));
+
+        screen.feed(b"\x1b[?1049h");
+        assert!(!screen.has_selection());
+        assert_eq!(screen.selection_text(), None);
+
+        screen.feed(b"\x1b[?1049l");
+        assert!(!screen.has_selection());
+        assert_eq!(screen.selection_text(), None);
+    }
+
+    #[test]
+    fn terminal_selection_preserves_graphemes_across_soft_wraps() {
+        let screen = VtScreen::new(5, 3, None).expect("create vt screen");
+        screen.feed("cafe\u{301}xy".as_bytes());
+        let geometry = test_selection_geometry(5, 3);
+
+        screen
+            .selection_press(test_selection_point(0, 0, 1.0), geometry, 1, false)
+            .expect("press selection anchor");
+        screen
+            .selection_drag(test_selection_point(0, 1, 9.0), geometry)
+            .expect("drag selection across soft wrap");
+
+        assert_eq!(screen.selection_text().as_deref(), Some("cafe\u{301}xy"));
+    }
+
+    #[test]
+    fn terminal_selection_tracks_text_into_scrollback() {
+        let screen = VtScreen::new(10, 2, None).expect("create vt screen");
+        screen.feed(b"alpha\r\nbeta");
+        let geometry = test_selection_geometry(10, 2);
+
+        screen
+            .selection_press(test_selection_point(0, 0, 1.0), geometry, 1, false)
+            .expect("press selection anchor");
+        screen
+            .selection_drag(test_selection_point(4, 0, 9.0), geometry)
+            .expect("drag selection");
+        screen
+            .selection_release(Some((4, 0)))
+            .expect("release selection");
+
+        screen.feed(b"\r\ngamma");
+
+        assert_eq!(screen.selection_text().as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn terminal_selection_autoscroll_tick_extends_into_scrollback() {
+        let screen = VtScreen::new(10, 2, None).expect("create vt screen");
+        screen.feed(b"one\r\ntwo\r\nthree");
+        let geometry = test_selection_geometry(10, 2);
+        let mut point_above_viewport = test_selection_point(0, 0, 1.0);
+        point_above_viewport.surface_y_px = -1.0;
+        assert_eq!(screen.scrollbar().map(|state| state.offset), Some(1));
+
+        screen
+            .selection_press(test_selection_point(4, 1, 9.0), geometry, 1, false)
+            .expect("press selection anchor");
+        assert_eq!(
+            screen
+                .selection_drag(point_above_viewport, geometry)
+                .expect("drag above viewport"),
+            SelectionAutoscroll::Up
+        );
+        let generation_before_tick = screen.generation();
+
+        let update = screen
+            .selection_autoscroll_tick(point_above_viewport, geometry)
+            .expect("autoscroll selection");
+        assert_eq!(update.direction, SelectionAutoscroll::Up);
+        assert!(update.changed);
+
+        assert!(screen.generation() > generation_before_tick);
+        assert_eq!(screen.scrollbar().map(|state| state.offset), Some(0));
+        assert_eq!(screen.selection_text().as_deref(), Some("one\ntwo\nthree"));
+
+        let generation_at_boundary = screen.generation();
+        let update = screen
+            .selection_autoscroll_tick(point_above_viewport, geometry)
+            .expect("clamped autoscroll selection");
+        assert_eq!(update.direction, SelectionAutoscroll::Up);
+        assert!(!update.changed);
+        assert_eq!(screen.generation(), generation_at_boundary);
+    }
+
+    #[test]
+    fn taking_selection_formats_and_clears_in_one_generation() {
+        let screen = VtScreen::new(20, 2, None).expect("create vt screen");
+        screen.feed(b"alpha beta");
+        let geometry = test_selection_geometry(20, 2);
+        screen
+            .selection_press(test_selection_point(0, 0, 1.0), geometry, 1, false)
+            .expect("press selection anchor");
+        screen
+            .selection_drag(test_selection_point(4, 0, 9.0), geometry)
+            .expect("select alpha");
+        let generation = screen.generation();
+
+        assert_eq!(screen.take_selection_text().as_deref(), Some("alpha"));
+        assert!(!screen.has_selection());
+        assert_eq!(screen.generation(), generation.wrapping_add(1));
+        assert_eq!(screen.take_selection_text(), None);
+    }
+
+    #[test]
+    fn selection_rejects_invalid_view_geometry_without_mutation() {
+        let screen = VtScreen::new(20, 2, None).expect("create vt screen");
+        let generation = screen.generation();
+        let mut point = test_selection_point(0, 0, 1.0);
+        point.surface_x_px = f64::NAN;
+
+        assert!(
+            screen
+                .selection_press(point, test_selection_geometry(20, 2), 1, false)
+                .is_err()
+        );
+        assert!(
+            screen
+                .selection_press(
+                    test_selection_point(0, 0, 1.0),
+                    SelectionGeometry {
+                        columns: 20,
+                        cell_width_px: 0,
+                        padding_left_px: 0,
+                        screen_height_px: 40,
+                    },
+                    1,
+                    false,
+                )
+                .is_err()
+        );
+        assert!(!screen.has_selection());
+        assert_eq!(screen.generation(), generation);
+    }
+
+    #[test]
+    fn resize_scrollback_policy_matches_pty() {
+        // Row growth and column reflow independently pull history by default.
+        // Check after RIS too: this is PTY configuration, not terminal state.
+        for reset in [false, true] {
+            for (cols, output, new_cols, new_rows, windows_rows, unix_rows) in [
+                (
+                    7,
+                    "1ABCD\r\n2EFGH\r\n3IJKL\r\n4ABCD\r\n5EFGH",
+                    7,
+                    5,
+                    vec!["3IJKL", "4ABCD", "5EFGH", "", ""],
+                    vec!["1ABCD", "2EFGH", "3IJKL", "4ABCD", "5EFGH"],
+                ),
+                (
+                    5,
+                    "1AAAA\r\n2BBBB\r\n3CCCCDD\r\n4E",
+                    10,
+                    3,
+                    vec!["3CCCCDD", "4E", ""],
+                    vec!["2BBBB", "3CCCCDD", "4E"],
+                ),
+            ] {
+                let screen = VtScreen::new(cols, 3, None).expect("create vt screen");
+                if reset {
+                    screen.feed(b"\x1bc");
+                }
+                screen.feed(output.as_bytes());
+                screen.resize(new_cols, new_rows, 10, 20).expect("resize");
+                let snapshot = screen.try_snapshot().expect("render resized terminal");
+                let lines: Vec<String> = snapshot
+                    .cells
+                    .chunks(new_cols as usize)
+                    .map(|row| {
+                        row.iter()
+                            .map(|cell| char::from_u32(cell.codepoint).unwrap_or(' '))
+                            .collect::<String>()
+                            .trim_end_matches([' ', '\0'])
+                            .to_owned()
+                    })
+                    .collect();
+                let expected = if cfg!(target_os = "windows") {
+                    windows_rows
+                } else {
+                    unix_rows
+                };
+                assert_eq!(lines, expected, "reset={reset}, cols={cols}");
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_damage_tracks_render_acknowledgment() {
+        let screen = VtScreen::new(4, 3, None).expect("create vt screen");
+
+        screen.feed(b"\x1b[?25l");
+        let baseline = screen.snapshot();
+        screen.acknowledge_snapshot(baseline.generation);
+
+        screen.feed(b"A\x1b[3;1H");
+        let first = screen.snapshot();
+        assert!(first.dirty_rows.contains(&0));
+        assert_eq!(screen.snapshot().dirty_rows, first.dirty_rows);
+
+        screen.feed(b"B");
+        screen.acknowledge_snapshot(first.generation);
+        let second = screen.snapshot();
+        assert_eq!(second.dirty_rows, vec![2]);
+
+        screen.feed(b"\x1b[2;1HC");
+        let combined = screen.snapshot();
+        assert_eq!(combined.dirty_rows, vec![1, 2]);
+        screen.acknowledge_snapshot(second.generation);
+        assert_eq!(screen.snapshot().dirty_rows, combined.dirty_rows);
+
+        screen.acknowledge_snapshot(combined.generation);
+        assert!(screen.snapshot().dirty_rows.is_empty());
+    }
+
+    #[test]
+    fn snapshot_preserves_cursor_style_and_blink_policy() {
+        let screen = VtScreen::new(8, 3, None).expect("create vt screen");
+        screen.feed(b"\x1b[2;4H");
+        for (sequence, style, blinking) in [
+            (b"\x1b[1 q", CursorStyle::Block, true),
+            (b"\x1b[2 q", CursorStyle::Block, false),
+            (b"\x1b[3 q", CursorStyle::Underline, true),
+            (b"\x1b[4 q", CursorStyle::Underline, false),
+            (b"\x1b[5 q", CursorStyle::Bar, true),
+            (b"\x1b[6 q", CursorStyle::Bar, false),
+        ] {
+            screen.feed(sequence);
+            let snapshot = screen.snapshot();
+            assert_eq!(
+                snapshot.cursor,
+                Cursor {
+                    col: 3,
+                    row: 1,
+                    visible: true,
+                    style,
+                    blinking
+                }
+            );
+            assert!(snapshot.dirty_rows.contains(&1));
+            screen.acknowledge_snapshot(snapshot.generation);
+        }
+        screen.feed(b"\x1b[?25l");
+        assert!(!screen.snapshot().cursor.visible);
+        screen.feed(b"\x1b[?25h\x1b[?12h");
+        assert!(screen.snapshot().cursor.blinking);
+        screen.feed(b"\x1b[?12l");
+        assert!(!screen.snapshot().cursor.blinking);
+    }
+
+    #[test]
+    fn discarded_render_state_rebuilds_from_clean_terminal() {
+        let screen = VtScreen::new(4, 3, None).expect("create vt screen");
+
+        screen.feed(b"A");
+        let first = screen.try_snapshot().expect("extract initial snapshot");
+        assert_eq!(first.cells[0].codepoint, u32::from('A'));
+
+        screen.render.lock().invalidate_render_state();
+
+        let recovered = screen.try_snapshot().expect("rebuild render state");
+        assert_eq!(recovered.generation, first.generation);
+        assert_eq!(recovered.cells[0].codepoint, u32::from('A'));
+        assert_eq!(recovered.cells.len(), 12);
+    }
+
+    #[test]
+    fn kitty_graphics_snapshot_decodes_png_and_reuses_unchanged_pixels() {
+        let screen = VtScreen::new_with_write_pty(80, 24, None, Some(Arc::new(|_, _| Ok(()))))
+            .expect("create vt screen");
+        screen.resize(80, 24, 8, 16).expect("set cell size");
+        screen.feed(
+            b"\x1b_Ga=T,f=100,q=2;\
+              iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAA\
+              DUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==\
+              \x1b\\",
+        );
+
+        let first = screen.snapshot();
+        assert_eq!(first.kitty_placements.len(), 1);
+        let placement = &first.kitty_placements[0];
+        assert_eq!((placement.image.width, placement.image.height), (1, 1));
+        assert_eq!(placement.image.rgba.as_ref(), &[0xFF, 0, 0, 0xFF]);
+        assert_eq!(
+            (
+                placement.source_x,
+                placement.source_y,
+                placement.source_width,
+                placement.source_height,
+            ),
+            (0, 0, 1, 1)
+        );
+
+        let pixels = placement.image.clone();
+        screen.bump_generation();
+        let second = screen.snapshot();
+        assert_eq!(second.kitty_placements.len(), 1);
+        assert!(Arc::ptr_eq(&pixels, &second.kitty_placements[0].image));
+    }
+
+    type MouseWrites = Arc<Mutex<Vec<(Vec<u8>, PtyWriteClass)>>>;
+
+    fn mouse_test_screen(cols: u16, rows: u16) -> (VtScreen, MouseWrites) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let callback_writes = writes.clone();
+        let screen = VtScreen::new_with_write_pty(
+            cols,
+            rows,
+            None,
+            Some(Arc::new(move |bytes, class| {
+                callback_writes.lock().push((bytes.to_vec(), class));
+                Ok(())
+            })),
+        )
+        .expect("create mouse test screen");
+        screen
+            .set_mouse_geometry(u32::from(cols) * 10, u32::from(rows) * 20, 10, 20)
+            .expect("initialize mouse geometry");
+        (screen, writes)
+    }
+
+    fn test_mouse_event(
+        action: VtMouseAction,
+        button: Option<VtMouseButton>,
+        x: f32,
+        y: f32,
+    ) -> VtMouseEvent {
+        VtMouseEvent {
+            action,
+            button,
+            modifiers: VtMouseModifiers::default(),
+            surface_x_px: x,
+            surface_y_px: y,
+        }
+    }
+
+    #[test]
+    fn mouse_encoder_emits_legacy_utf8_sgr_urxvt_and_pixel_formats() {
+        let cases = [
+            (
+                b"\x1b[?1000h".as_slice(),
+                test_mouse_event(VtMouseAction::Press, Some(VtMouseButton::Left), 15.0, 10.0),
+                b"\x1b[M \"!".as_slice(),
+                80,
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1005h".as_slice(),
+                test_mouse_event(
+                    VtMouseAction::Press,
+                    Some(VtMouseButton::Left),
+                    2235.0,
+                    10.0,
+                ),
+                b"\x1b[M \xc4\x80!".as_slice(),
+                300,
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1006h".as_slice(),
+                VtMouseEvent {
+                    modifiers: VtMouseModifiers {
+                        shift: true,
+                        control: true,
+                        alt: true,
+                    },
+                    ..test_mouse_event(
+                        VtMouseAction::Release,
+                        Some(VtMouseButton::Right),
+                        15.0,
+                        10.0,
+                    )
+                },
+                b"\x1b[<30;2;1m".as_slice(),
+                80,
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1015h".as_slice(),
+                test_mouse_event(
+                    VtMouseAction::Release,
+                    Some(VtMouseButton::Right),
+                    15.0,
+                    10.0,
+                ),
+                b"\x1b[35;2;1M".as_slice(),
+                80,
+            ),
+            (
+                b"\x1b[?1000h\x1b[?1016h".as_slice(),
+                test_mouse_event(
+                    VtMouseAction::Press,
+                    Some(VtMouseButton::Left),
+                    15.25,
+                    10.75,
+                ),
+                b"\x1b[<0;15;11M".as_slice(),
+                80,
+            ),
+        ];
+
+        for (modes, event, expected, cols) in cases {
+            let (screen, writes) = mouse_test_screen(cols, 24);
+            screen.feed(modes);
+            let outcome = screen.send_mouse_event(event).expect("encode mouse event");
+            assert!(outcome.output_written, "modes={modes:?}");
+            let writes = writes.lock();
+            assert_eq!(writes.len(), 1, "modes={modes:?}");
+            assert_eq!(writes[0].0.as_slice(), expected, "modes={modes:?}");
+            assert_eq!(
+                writes[0].1,
+                if event.action == VtMouseAction::Release {
+                    PtyWriteClass::ReservedControl
+                } else {
+                    PtyWriteClass::Regular
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_encoder_maps_buttons_without_swapping_middle_and_right() {
+        let (screen, writes) = mouse_test_screen(80, 24);
+        screen.feed(b"\x1b[?1000h\x1b[?1006h");
+
+        for (button, code) in [
+            (VtMouseButton::Left, 0),
+            (VtMouseButton::Middle, 1),
+            (VtMouseButton::Right, 2),
+            (VtMouseButton::Button4, 64),
+            (VtMouseButton::Button5, 65),
+        ] {
+            assert!(
+                screen
+                    .send_mouse_event(test_mouse_event(
+                        VtMouseAction::Press,
+                        Some(button),
+                        5.0,
+                        5.0,
+                    ))
+                    .expect("encode button press")
+                    .output_written
+            );
+            assert_eq!(
+                writes
+                    .lock()
+                    .last()
+                    .expect("captured button press")
+                    .0
+                    .as_slice(),
+                format!("\x1b[<{code};1;1M").into_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn mouse_encoder_applies_x10_gating_and_effective_terminal_state() {
+        let (screen, writes) = mouse_test_screen(300, 24);
+        screen.feed(b"\x1b[?9h");
+        let event = VtMouseEvent {
+            modifiers: VtMouseModifiers {
+                shift: true,
+                control: true,
+                alt: true,
+            },
+            ..test_mouse_event(VtMouseAction::Press, Some(VtMouseButton::Left), 15.0, 10.0)
+        };
+        assert!(screen.send_mouse_event(event).unwrap().output_written);
+        assert_eq!(writes.lock()[0].0.as_slice(), b"\x1b[M \"!");
+
+        assert!(
+            !screen
+                .send_mouse_event(test_mouse_event(
+                    VtMouseAction::Release,
+                    Some(VtMouseButton::Left),
+                    15.0,
+                    10.0,
+                ))
+                .unwrap()
+                .output_written
+        );
+        assert!(
+            !screen
+                .send_mouse_event(test_mouse_event(
+                    VtMouseAction::Press,
+                    Some(VtMouseButton::Left),
+                    2235.0,
+                    10.0,
+                ))
+                .unwrap()
+                .output_written
+        );
+        assert_eq!(writes.lock().len(), 1);
+
+        // The public bitset route still sees 1002, but DECRST 1000 made the
+        // terminal's last-write-wins effective event mode `none`.
+        screen.feed(b"\x1b[?9l\x1b[?1000h\x1b[?1002h\x1b[?1000l");
+        assert!(screen.mouse_tracking_active());
+        assert!(
+            !screen
+                .send_mouse_event(test_mouse_event(
+                    VtMouseAction::Press,
+                    Some(VtMouseButton::Left),
+                    5.0,
+                    5.0,
+                ))
+                .unwrap()
+                .output_written
+        );
+        assert_eq!(writes.lock().len(), 1);
+    }
+
+    #[test]
+    fn mouse_encoder_deduplicates_motion_across_equal_geometry_updates() {
+        let (screen, writes) = mouse_test_screen(80, 24);
+        screen.feed(b"\x1b[?1002h\x1b[?1006h");
+        let drag = test_mouse_event(VtMouseAction::Motion, Some(VtMouseButton::Left), 5.0, 5.0);
+
+        assert!(screen.send_mouse_event(drag).unwrap().output_written);
+        assert!(!screen.send_mouse_event(drag).unwrap().output_written);
+        screen
+            .set_mouse_geometry(800, 480, 10, 20)
+            .expect("keep equal mouse geometry");
+        assert!(!screen.send_mouse_event(drag).unwrap().output_written);
+        assert_eq!(writes.lock().len(), 1);
+    }
+
+    #[test]
+    fn mouse_encoder_reports_only_pressed_motion_outside_the_viewport() {
+        let cases = [
+            (
+                b"\x1b[?1002h\x1b[?1006h".as_slice(),
+                Some(VtMouseButton::Left),
+                Some(b"\x1b[<32;1;1M".as_slice()),
+            ),
+            (b"\x1b[?1003h\x1b[?1006h".as_slice(), None, None),
+        ];
+
+        for (modes, button, expected) in cases {
+            let (screen, writes) = mouse_test_screen(80, 24);
+            screen.feed(modes);
+            let outcome = screen
+                .send_mouse_event(test_mouse_event(VtMouseAction::Motion, button, -5.0, -5.0))
+                .expect("encode out-of-viewport motion");
+            assert_eq!(outcome.output_written, expected.is_some());
+            let writes = writes.lock();
+            assert_eq!(writes.len(), usize::from(expected.is_some()));
+            if let Some(expected) = expected {
+                assert_eq!(writes[0].0.as_slice(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_encoder_reports_no_button_motion_in_any_event_mode() {
+        let (screen, writes) = mouse_test_screen(80, 24);
+        screen.feed(b"\x1b[?1003h\x1b[?1006h");
+
+        assert!(
+            screen
+                .send_mouse_event(test_mouse_event(VtMouseAction::Motion, None, 5.0, 5.0))
+                .unwrap()
+                .output_written
+        );
+        assert_eq!(writes.lock()[0].0.as_slice(), b"\x1b[<35;1;1M");
+    }
+
+    #[test]
+    fn key_encoder_tracks_legacy_terminal_modes() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let output_for_callback = output.clone();
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(move |bytes, _| {
+                output_for_callback.lock().extend_from_slice(bytes);
+                Ok(())
+            })),
+        )
+        .expect("create vt screen");
+
+        let ctrl_c = VtKeyEvent {
+            key: "c",
+            text: "c",
+            unshifted_codepoint: Some('c'),
+            action: VtKeyAction::Press,
+            modifiers: VtKeyModifiers {
+                control: true,
+                ..VtKeyModifiers::default()
+            },
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        assert!(
+            screen
+                .send_key(&ctrl_c)
+                .expect("encode Ctrl-C")
+                .output_accepted
+        );
+        assert_eq!(output.lock().as_slice(), b"\x03");
+
+        output.lock().clear();
+        screen.feed(b"\x1b[?1h");
+        let up = VtKeyEvent {
+            key: "up",
+            text: "",
+            unshifted_codepoint: None,
+            action: VtKeyAction::Press,
+            modifiers: VtKeyModifiers::default(),
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        assert!(
+            screen
+                .send_key(&up)
+                .expect("encode DECCKM up")
+                .output_accepted
+        );
+        assert_eq!(output.lock().as_slice(), b"\x1bOA");
+
+        output.lock().clear();
+        let alt_backspace = VtKeyEvent {
+            key: "backspace",
+            text: "",
+            unshifted_codepoint: None,
+            action: VtKeyAction::Press,
+            modifiers: VtKeyModifiers {
+                alt: true,
+                ..VtKeyModifiers::default()
+            },
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        assert!(
+            screen
+                .send_key(&alt_backspace)
+                .expect("encode Alt-Backspace")
+                .output_accepted
+        );
+        assert_eq!(output.lock().as_slice(), b"\x1b\x7f");
+
+        output.lock().clear();
+        let shift_tab = VtKeyEvent {
+            key: "tab",
+            text: "",
+            unshifted_codepoint: None,
+            action: VtKeyAction::Press,
+            modifiers: VtKeyModifiers {
+                shift: true,
+                ..VtKeyModifiers::default()
+            },
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        assert!(
+            screen
+                .send_key(&shift_tab)
+                .expect("encode Shift-Tab")
+                .output_accepted
+        );
+        assert_eq!(output.lock().as_slice(), b"\x1b[Z");
+
+        output.lock().clear();
+        let mut space = VtKeyEvent {
+            key: "space",
+            text: " ",
+            unshifted_codepoint: Some(' '),
+            action: VtKeyAction::Press,
+            modifiers: VtKeyModifiers::default(),
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        assert!(
+            screen
+                .send_key(&space)
+                .expect("encode Space")
+                .output_accepted
+        );
+        assert_eq!(output.lock().as_slice(), b" ");
+
+        output.lock().clear();
+        space.modifiers.control = true;
+        assert!(
+            screen
+                .send_key(&space)
+                .expect("encode Ctrl-Space")
+                .output_accepted
+        );
+        assert_eq!(output.lock().as_slice(), b"\x00");
+    }
+
+    /// Encoder behavior that changed in Ghostty `492300ca`: modifyOtherKeys=2
+    /// now covers Ctrl chords and Alt+Escape, F13-F25/Help gained sequences,
+    /// and Alt with non-ASCII text prefixes the whole UTF-8 sequence.
+    #[test]
+    fn key_encoder_tracks_modify_other_keys_and_extended_function_keys() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let output_for_callback = output.clone();
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(move |bytes, _| {
+                output_for_callback.lock().extend_from_slice(bytes);
+                Ok(())
+            })),
+        )
+        .expect("create vt screen");
+
+        let key = |key, text, unshifted_codepoint, modifiers| VtKeyEvent {
+            key,
+            text,
+            unshifted_codepoint,
+            action: VtKeyAction::Press,
+            modifiers,
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        let ctrl = VtKeyModifiers {
+            control: true,
+            ..VtKeyModifiers::default()
+        };
+        let alt = VtKeyModifiers {
+            alt: true,
+            ..VtKeyModifiers::default()
+        };
+        let none = VtKeyModifiers::default();
+        let encode = |event: &VtKeyEvent<'_>| {
+            output.lock().clear();
+            assert!(screen.send_key(event).expect("encode key").output_accepted);
+            output.lock().clone()
+        };
+
+        let ctrl_p = key("p", "p", Some('p'), ctrl);
+        let ctrl_space = key("space", " ", Some(' '), ctrl);
+        let alt_escape = key("escape", "", None, alt);
+
+        assert_eq!(encode(&ctrl_p), b"\x10");
+        assert_eq!(encode(&alt_escape), b"\x1b\x1b");
+
+        screen.feed(b"\x1b[>4;2m");
+        assert_eq!(encode(&ctrl_p), b"\x1b[27;5;112~");
+        assert_eq!(encode(&ctrl_space), b"\x1b[27;5;32~");
+        assert_eq!(encode(&alt_escape), b"\x1b[27;3;27~");
+
+        screen.feed(b"\x1b[>4;0m");
+        assert_eq!(encode(&ctrl_p), b"\x10");
+
+        assert_eq!(encode(&key("f13", "", None, none)), b"\x1b[25~");
+        assert_eq!(encode(&key("help", "", None, none)), b"\x1b[28~");
+        assert_eq!(encode(&key("ф", "ф", Some('ф'), alt)), "\x1bф".as_bytes());
+    }
+
+    #[test]
+    fn key_encoder_handles_kitty_press_repeat_and_release() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let output_for_callback = output.clone();
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(move |bytes, _| {
+                output_for_callback.lock().extend_from_slice(bytes);
+                Ok(())
+            })),
+        )
+        .expect("create vt screen");
+        screen.feed(b"\x1b[>3u");
+
+        for (action, expected) in [
+            (VtKeyAction::Press, b"a".as_slice()),
+            (VtKeyAction::Repeat, b"a".as_slice()),
+            (VtKeyAction::Release, b"\x1b[97;1:3u".as_slice()),
+        ] {
+            output.lock().clear();
+            let event = VtKeyEvent {
+                key: "a",
+                text: "a",
+                unshifted_codepoint: Some('a'),
+                action,
+                modifiers: VtKeyModifiers::default(),
+                consumed_modifiers: VtKeyModifiers::default(),
+            };
+            let outcome = screen.send_key(&event).expect("encode Kitty key event");
+            assert!(outcome.output_accepted);
+            assert!(outcome.report_releases);
+            assert_eq!(output.lock().as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn key_encoder_propagates_pty_write_failures() {
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(|_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test PTY is closed",
+                ))
+            })),
+        )
+        .expect("create vt screen");
+        let event = VtKeyEvent {
+            key: "c",
+            text: "c",
+            unshifted_codepoint: Some('c'),
+            action: VtKeyAction::Press,
+            modifiers: VtKeyModifiers::default(),
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+
+        let err = screen
+            .send_key(&event)
+            .expect_err("surface write must fail");
+        assert!(err.to_string().contains("test PTY is closed"));
+    }
+
+    #[test]
+    fn focus_reporting_tracks_transitions_even_while_disabled() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured = writes.clone();
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(move |bytes, class| {
+                assert_eq!(class, PtyWriteClass::ReservedControl);
+                captured.lock().push(bytes.to_vec());
+                Ok(())
+            })),
+        )
+        .unwrap();
+        screen.set_focus(true).unwrap();
+        assert!(writes.lock().is_empty());
+        screen.feed(b"\x1b[?1004h");
+        screen.set_focus(true).unwrap();
+        assert!(
+            writes.lock().is_empty(),
+            "enabling the mode is not a focus transition"
+        );
+        screen.set_focus(false).unwrap();
+        screen.set_focus(false).unwrap();
+        screen.set_focus(true).unwrap();
+        screen.feed(b"\x1b[?1004l");
+        screen.set_focus(false).unwrap();
+        screen.feed(b"\x1b[?1004h");
+        screen.set_focus(true).unwrap();
+        assert_eq!(*writes.lock(), [b"\x1b[O", b"\x1b[I", b"\x1b[I"]);
+    }
+
+    #[test]
+    fn failed_focus_report_marks_the_session_desynchronized() {
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(|_, class| {
+                assert_eq!(class, PtyWriteClass::ReservedControl);
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "full"))
+            })),
+        )
+        .unwrap();
+        screen.feed(b"\x1b[?1004h");
+        assert!(screen.set_focus(true).is_err());
+        assert!(screen.is_write_desynchronized());
+    }
+
+    #[test]
+    fn raw_input_cannot_be_overtaken_by_a_terminal_reply() {
+        assert_host_write_precedes_reply(false);
+    }
+
+    #[test]
+    fn focus_report_cannot_be_overtaken_by_a_terminal_reply() {
+        assert_host_write_precedes_reply(true);
+    }
+
+    fn assert_host_write_precedes_reply(focus_report: bool) {
+        let gate = Arc::new((Mutex::new(false), parking_lot::Condvar::new()));
+        let callback_gate = gate.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let callback_writes = writes.clone();
+        let input_bytes: &[u8] = if focus_report { b"\x1b[I" } else { b"user" };
+        let screen = Arc::new(
+            VtScreen::new_with_write_pty(
+                80,
+                24,
+                None,
+                Some(Arc::new(move |bytes, priority| {
+                    if bytes == input_bytes {
+                        entered_tx.send(()).expect("signal host write callback");
+                        let (open, ready) = &*callback_gate;
+                        let mut open = open.lock();
+                        while !*open {
+                            ready.wait(&mut open);
+                        }
+                    }
+                    callback_writes.lock().push((bytes.to_vec(), priority));
+                    Ok(())
+                })),
+            )
+            .expect("create vt screen"),
+        );
+
+        screen.feed(b"\x1b[?1004h");
+        let input_screen = screen.clone();
+        let input = std::thread::spawn(move || {
+            if focus_report {
+                input_screen.set_focus(true).expect("report focus");
+            } else {
+                input_screen
+                    .write_input(input_bytes)
+                    .expect("write raw input");
+            }
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("host write callback must start");
+
+        assert!(
+            screen
+                .inner
+                .lock()
+                .callback_state
+                .write_order
+                .try_lock()
+                .is_none(),
+            "host callback must own the write ordering gate"
+        );
+        let reply_screen = screen.clone();
+        let reply = std::thread::spawn(move || reply_screen.feed(b"\x1b[5n"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while screen.inner.try_lock().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "terminal reply did not reach the ordering gate"
+            );
+            std::thread::yield_now();
+        }
+
+        let (open, ready) = &*gate;
+        *open.lock() = true;
+        ready.notify_all();
+        input.join().expect("raw input thread");
+        reply.join().expect("terminal reply thread");
+
+        let writes = writes.lock();
+        let class = if focus_report {
+            PtyWriteClass::ReservedControl
+        } else {
+            PtyWriteClass::Regular
+        };
+        assert_eq!(writes[0], (input_bytes.to_vec(), class));
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1].1, PtyWriteClass::ReservedControl);
+        assert!(writes[1].0.starts_with(b"\x1b[0n"));
+    }
+
+    #[test]
+    fn failed_terminal_reply_marks_the_session_desynchronized() {
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(|_, class| {
+                assert_eq!(class, PtyWriteClass::ReservedControl);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "reserved PTY capacity exhausted",
+                ))
+            })),
+        )
+        .expect("create vt screen");
+
+        screen.feed(b"\x1b[5n");
+
+        assert!(screen.is_write_desynchronized());
+    }
+
+    #[test]
+    fn vt_screen_configures_line_scrollback_limit() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+        let inner = screen.inner.lock();
+        let mut max_lines = 0_usize;
+        let rc = unsafe {
+            ghostty_terminal_get(
+                inner.terminal,
+                GhosttyTerminalData::ScrollbackMaxLines,
+                &mut max_lines as *mut _ as *mut c_void,
+            )
+        };
+
+        assert_eq!(rc, 0);
+        assert_eq!(max_lines, 10_000);
+    }
+
+    #[test]
+    fn terminal_clipboard_writes_require_opt_in_and_coalesce_pending_text() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+        let policy = Arc::new(ClipboardWritePolicy::new(true));
+        screen.set_clipboard_write_policy(policy.clone());
+        let clipboard_write_limit = || {
+            let inner = screen.inner.lock();
+            let mut limit = usize::MAX;
+            let rc = unsafe {
+                ghostty_terminal_get(
+                    inner.terminal,
+                    GhosttyTerminalData::ClipboardWriteMaxBytes,
+                    &mut limit as *mut _ as *mut c_void,
+                )
+            };
+            assert_eq!(rc, 0);
+            limit
+        };
+
+        assert_eq!(clipboard_write_limit(), 0);
+        screen.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(screen.take_clipboard_write(), None);
+
+        screen
+            .set_clipboard_write_enabled(true)
+            .expect("enable clipboard writes");
+        assert_eq!(clipboard_write_limit(), CLIPBOARD_WRITE_LIMIT_BYTES);
+        screen.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        screen.feed(b"\x1b]52;c;d29ybGQ=\x07");
+        assert_eq!(screen.take_clipboard_write().as_deref(), Some("world"));
+        assert_eq!(screen.take_clipboard_write(), None);
+
+        screen.feed(b"\x1b]52;c;/w==\x07");
+        assert_eq!(screen.take_clipboard_write(), None);
+
+        screen.feed(b"\x1b]52;c;\x07");
+        assert_eq!(screen.take_clipboard_write().as_deref(), Some(""));
+
+        screen.feed(b"\x1b]52;c;YmxvY2tlZA==\x07");
+        policy.set_enabled(false);
+        assert_eq!(screen.take_clipboard_write(), None);
+        screen.feed(b"\x1b]52;c;ZGVuaWVk\x07");
+        policy.set_enabled(true);
+        assert_eq!(screen.take_clipboard_write(), None);
+
+        screen.feed(b"\x1b]52;c;YWdhaW4=\x07");
+        screen
+            .set_clipboard_write_enabled(false)
+            .expect("disable clipboard writes");
+        assert_eq!(clipboard_write_limit(), 0);
+        assert_eq!(screen.take_clipboard_write(), None);
+    }
+
+    #[test]
+    fn terminal_desktop_notifications_are_bounded_on_utf8_boundaries() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+        let title = format!("{}é", "a".repeat(62));
+        let sequence = format!("\x1b]777;notify;{title};Needs attention\x07");
+
+        screen.feed(sequence.as_bytes());
+
+        let notification = screen
+            .take_desktop_notification()
+            .expect("desktop notification");
+        assert_eq!(notification.title, "a".repeat(62));
+        assert_eq!(notification.body, "Needs attention");
+        assert_eq!(screen.take_desktop_notification(), None);
+    }
+
+    #[test]
+    fn vt_screen_queries_modes_through_terminal_data() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+
+        assert!(!screen.is_bracketed_paste());
+        screen.feed(b"\x1b[?2004h");
+        assert!(screen.is_bracketed_paste());
+        screen.feed(b"\x1b[?2004l");
+        assert!(!screen.is_bracketed_paste());
+    }
+
+    #[test]
+    fn vt_screen_queries_semantic_prompt_state() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+
+        assert_eq!(screen.prompt_state(), crate::TerminalPromptState::default());
+        screen.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(
+            screen.prompt_state(),
+            crate::TerminalPromptState {
+                cursor_at_prompt: true,
+                output_generation: 1,
+            }
+        );
+
+        screen.feed(b"echo test\r\n\x1b]133;C\x07");
+        assert_eq!(
+            screen.prompt_state(),
+            crate::TerminalPromptState {
+                cursor_at_prompt: false,
+                output_generation: 2,
+            }
+        );
+        screen.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+        assert_eq!(
+            screen.prompt_state(),
+            crate::TerminalPromptState {
+                cursor_at_prompt: true,
+                output_generation: 3,
+            }
+        );
+
+        screen.feed(b"\x1b[?1049h");
+        assert_eq!(
+            screen.prompt_state(),
+            crate::TerminalPromptState {
+                cursor_at_prompt: false,
+                output_generation: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn paste_applies_terminal_modes_and_requires_confirmation_for_command_injection() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let output_for_callback = output.clone();
+        let callback_calls = Arc::new(Mutex::new(0_usize));
+        let callback_calls_for_callback = callback_calls.clone();
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(move |bytes, _| {
+                *callback_calls_for_callback.lock() += 1;
+                output_for_callback.lock().extend_from_slice(bytes);
+                Ok(())
+            })),
+        )
+        .expect("create vt screen");
+
+        assert_eq!(
+            screen
+                .paste_text("echo safe", VtPasteSource::Clipboard, false)
+                .expect("safe paste"),
+            VtPasteResult::Accepted
+        );
+        assert_eq!(output.lock().as_slice(), b"echo safe");
+
+        output.lock().clear();
+        let unsafe_text = "echo first\necho second";
+        assert_eq!(
+            screen
+                .paste_text(unsafe_text, VtPasteSource::Clipboard, false)
+                .expect("check unsafe paste"),
+            VtPasteResult::RequiresConfirmation
+        );
+        assert!(output.lock().is_empty(), "rejected paste wrote to the PTY");
+
+        assert_eq!(
+            screen
+                .paste_text(unsafe_text, VtPasteSource::Clipboard, true)
+                .expect("confirmed paste"),
+            VtPasteResult::Accepted
+        );
+        assert_eq!(output.lock().as_slice(), b"echo first\recho second");
+
+        output.lock().clear();
+        *callback_calls.lock() = 0;
+        screen.feed(b"\x1b[?2004h");
+        assert_eq!(
+            screen
+                .paste_text("first\nsecond", VtPasteSource::Clipboard, false)
+                .expect("bracketed paste"),
+            VtPasteResult::Accepted
+        );
+        assert_eq!(output.lock().as_slice(), b"\x1b[200~first\nsecond\x1b[201~");
+        assert_eq!(
+            *callback_calls.lock(),
+            1,
+            "one logical paste must reach the bounded host queue atomically"
+        );
+    }
+
+    #[test]
+    fn kitty_paste_grants_share_the_current_clipboard_without_becoming_reusable() {
+        fn grant_read(event: &[u8]) -> Vec<u8> {
+            let password_prefix = b"\x1b]5522;type=read:status=OK:pw=";
+            assert!(event.starts_with(password_prefix));
+            let password_end = event[password_prefix.len()..]
+                .windows(2)
+                .position(|window| window == b"\x1b\\")
+                .expect("paste event password terminator")
+                + password_prefix.len();
+
+            let mut read = b"\x1b]5522;type=read:pw=".to_vec();
+            read.extend_from_slice(&event[password_prefix.len()..password_end]);
+            read.extend_from_slice(b":name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\");
+            read
+        }
+
+        fn verify_redemption_order(order: [usize; 2]) {
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let output_for_callback = output.clone();
+            let screen = VtScreen::new_with_write_pty(
+                80,
+                24,
+                None,
+                Some(Arc::new(move |bytes, _| {
+                    output_for_callback.lock().extend_from_slice(bytes);
+                    Ok(())
+                })),
+            )
+            .expect("create vt screen");
+            screen.feed(b"\x1b[?5522h");
+
+            assert_eq!(
+                screen
+                    .paste_text("dropped path", VtPasteSource::Text, false)
+                    .expect("text insertion with Kitty paste events enabled"),
+                VtPasteResult::Accepted
+            );
+            assert_eq!(output.lock().as_slice(), b"dropped path");
+
+            let mut reads = Vec::new();
+            for text in ["first clipboard", "current clipboard"] {
+                output.lock().clear();
+                assert_eq!(
+                    screen
+                        .paste_text(text, VtPasteSource::Clipboard, false)
+                        .expect("Kitty paste event"),
+                    VtPasteResult::Accepted
+                );
+                let event = output.lock().clone();
+                assert!(
+                    !event
+                        .windows(text.len())
+                        .any(|window| window == text.as_bytes())
+                );
+                reads.push(grant_read(&event));
+            }
+
+            for index in order {
+                output.lock().clear();
+                screen.feed(&reads[index]);
+                let response = output.lock().clone();
+                assert!(
+                    response
+                        .windows(b"Y3VycmVudCBjbGlwYm9hcmQ=".len())
+                        .any(|window| window == b"Y3VycmVudCBjbGlwYm9hcmQ="),
+                    "valid paste grant did not expose the current clipboard"
+                );
+
+                output.lock().clear();
+                screen.feed(&reads[index]);
+                assert!(
+                    output
+                        .lock()
+                        .windows(b"status=EPERM".len())
+                        .any(|window| window == b"status=EPERM"),
+                    "one-time paste grant was reusable"
+                );
+            }
+
+            assert_eq!(
+                screen
+                    .inner
+                    .lock()
+                    .callback_state
+                    .clipboard_text
+                    .lock()
+                    .as_deref(),
+                Some("current clipboard"),
+                "grant redemption discarded the current clipboard"
+            );
+        }
+
+        verify_redemption_order([0, 1]);
+        verify_redemption_order([1, 0]);
+    }
+
+    #[test]
+    fn terminal_paste_rejects_payloads_over_the_memory_limit() {
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(|_, _| {
+                panic!("oversized paste reached the PTY callback")
+            })),
+        )
+        .expect("create vt screen");
+        let oversized = "x".repeat(TERMINAL_PASTE_LIMIT_BYTES + 1);
+
+        let err = screen
+            .paste_text(&oversized, VtPasteSource::Clipboard, false)
+            .expect_err("oversized paste must be rejected");
+
+        assert!(err.to_string().contains("safety limit"));
+    }
+
+    #[test]
+    fn vt_screen_coalesces_bell_effects_until_the_host_drains_them() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+
+        screen.feed(b"\x1b]2;OSC terminator\x07");
+        assert!(
+            !screen.take_bell(),
+            "an OSC terminator is not a bell effect"
+        );
+
+        screen.feed(b"\x07\x07");
+        assert!(screen.take_bell());
+        assert!(!screen.take_bell());
+    }
+
+    #[test]
+    fn vt_screen_tracks_latest_progress_report() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+
+        screen.feed(b"\x1b]9;4;1;42\x07\x1b]9;4;4;75\x1b\\");
+        assert_eq!(screen.progress(), Some(TerminalProgress::Paused(Some(75))));
+
+        screen.feed(b"\x1b]9;4;2");
+        screen.feed(b";7\x1b\\");
+        assert_eq!(screen.progress(), Some(TerminalProgress::Error(Some(7))));
+
+        screen.feed(b"\x1b]9;4;3\x07");
+        assert_eq!(screen.progress(), Some(TerminalProgress::Indeterminate));
+
+        screen.feed(b"\x1b]9;4;0\x07");
+        assert_eq!(screen.progress(), None);
+    }
+
+    #[test]
+    fn vt_screen_delivers_program_status_prompt_and_reset() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let output_for_callback = output.clone();
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(move |bytes, _| {
+                output_for_callback.lock().extend_from_slice(bytes);
+                Ok(())
+            })),
+        )
+        .expect("create vt screen");
+
+        screen.feed(b"\x1b]7501;?\x07");
+        assert!(
+            output.lock().windows(6).any(|window| window == b"7501;?"),
+            "support query must be answered: {:?}",
+            String::from_utf8_lossy(&output.lock())
+        );
+
+        screen.feed(b"\x1b]7501;state=working:progress=40:id=build\x07");
+        let events = screen.take_program_events();
+        let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(status.records().len(), 1);
+        assert_eq!(status.records()[0].id.path(), "build");
+        assert_eq!(status.records()[0].progress, Some(40));
+
+        screen.feed(b"\x1b]133;A\x07");
+        let events = screen.take_program_events();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if status.records().is_empty() && status.protocol_seen())
+        );
+
+        screen.feed(b"\x1bc");
+        let events = screen.take_program_events();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if status.records().is_empty() && !status.protocol_seen()),
+            "RIS clears records and protocol suppression: {events:?}"
+        );
+    }
+
+    #[test]
+    fn program_status_fragmentation_and_rejected_input_preserve_records() {
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(|_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "queue full",
+                ))
+            })),
+        )
+        .unwrap();
+        screen.feed(b"\x1b]7501;state=do");
+        assert!(screen.take_program_events().is_empty());
+        screen.feed(b"ne:id=job\x07");
+        let events = screen.take_program_events();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if status.records()[0].unseen)
+        );
+        assert!(screen.write_user_input(b"x").is_err());
+        assert!(screen.take_program_events().is_empty());
+        screen.feed(b"\x1b]7501;state=done:id=job\x07");
+        let events = screen.take_program_events();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if status.records()[0].unseen)
+        );
+    }
+
+    #[test]
+    fn program_status_sequence_survives_malformed_input_and_alternate_screen() {
+        let screen =
+            VtScreen::new_with_write_pty(80, 24, None, Some(Arc::new(|_, _| Ok(())))).unwrap();
+        let activity = |screen: &VtScreen| {
+            let events = screen.take_program_events();
+            let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+                panic!("{events:?}");
+            };
+            status
+                .contribution()
+                .attention
+                .map(|attention| attention.state)
+        };
+
+        screen.feed(b"\x1b]7501;state=working:progress=10:id=build\x07");
+        assert_eq!(
+            activity(&screen),
+            Some(con_terminal::program_status::State::Working)
+        );
+
+        screen.feed(b"\x1b]7501;state=blocked:kind=permission:progress=40:id=build\x07");
+        let events = screen.take_program_events();
+        let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(status.records().len(), 1);
+        assert_eq!(
+            status.records()[0].state,
+            con_terminal::program_status::State::Blocked
+        );
+        assert_eq!(
+            status.records()[0].kind,
+            Some(con_terminal::program_status::BlockedKind::Permission)
+        );
+
+        screen.feed(b"\x1b]7501;garbage:=x:state=working:progress=80:id=build\x07");
+        assert_eq!(
+            activity(&screen),
+            Some(con_terminal::program_status::State::Working)
+        );
+
+        screen.feed(b"\x1b]7501;state=done:id=build\x07");
+        assert_eq!(
+            activity(&screen),
+            Some(con_terminal::program_status::State::Done)
+        );
+        screen.write_user_input("ok".as_bytes()).unwrap();
+        let events = screen.take_program_events();
+        let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert!(!status.records()[0].unseen);
+
+        screen.feed(b"\x1b]7501;state=error:id=build\x07");
+        assert_eq!(
+            activity(&screen),
+            Some(con_terminal::program_status::State::Error)
+        );
+
+        let mut oversized = Vec::from(&b"\x1b]7501;state=working:id=build/test:msg="[..]);
+        oversized.extend(std::iter::repeat(b'A').take(5000));
+        oversized.push(0x07);
+        screen.feed(&oversized);
+        assert!(
+            screen.take_program_events().is_empty(),
+            "an oversized report must leave the previous record in place"
+        );
+
+        screen.feed(b"\x1b[?1049h");
+        assert!(
+            screen.take_program_events().is_empty(),
+            "alternate screen must not clear program status"
+        );
+        assert!(screen.is_alternate_screen());
+
+        screen.feed(b"\x1b]133;A\x07");
+        let events = screen.take_program_events();
+        let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert!(
+            status
+                .records()
+                .iter()
+                .any(|record| record.state == con_terminal::program_status::State::Error)
+        );
+        assert!(
+            status
+                .records()
+                .iter()
+                .all(|record| record.state != con_terminal::program_status::State::Working)
+        );
+    }
+
+    #[test]
+    fn program_status_user_text_acknowledges_only_its_own_surface() {
+        let make =
+            || VtScreen::new_with_write_pty(80, 24, None, Some(Arc::new(|_, _| Ok(())))).unwrap();
+        let first = make();
+        let second = make();
+        for screen in [&first, &second] {
+            screen.feed(b"\x1b]7501;state=done:id=job\x07");
+            screen.take_program_events();
+        }
+        first.write_input(b"tool input").unwrap();
+        assert!(first.take_program_events().is_empty());
+        first.write_user_input(b"").unwrap();
+        assert!(first.take_program_events().is_empty());
+        first.write_user_input("中文".as_bytes()).unwrap();
+        let events = first.take_program_events();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if !status.records()[0].unseen)
+        );
+        second.feed(b"\x1b]7501;state=done:id=job\x07");
+        let events = second.take_program_events();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if status.records()[0].unseen)
+        );
+    }
+
+    #[test]
+    fn program_status_queries_and_key_releases_do_not_acknowledge_completion() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let screen = VtScreen::new_with_write_pty(
+            80,
+            24,
+            None,
+            Some(Arc::new(move |bytes, _| {
+                captured.lock().extend_from_slice(bytes);
+                Ok(())
+            })),
+        )
+        .unwrap();
+        screen.feed(b"\x1b]7501;state=done:id=job\x07");
+        screen.take_program_events();
+        for query in [b"\x1b]7501;?\x07".as_slice(), b"\x1b]7501;?\x1b\\"] {
+            output.lock().clear();
+            // A query may be split across arbitrary PTY reads.
+            for byte in query {
+                screen.feed(std::slice::from_ref(byte));
+            }
+            assert_eq!(output.lock().as_slice(), query);
+            assert!(screen.take_program_events().is_empty());
+        }
+
+        screen.feed(b"\x1b[>3u");
+        let mut key = VtKeyEvent {
+            key: "a",
+            text: "a",
+            unshifted_codepoint: Some('a'),
+            action: VtKeyAction::Release,
+            modifiers: VtKeyModifiers::default(),
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        assert!(screen.send_key(&key).unwrap().output_accepted);
+        assert!(screen.take_program_events().is_empty());
+        key.action = VtKeyAction::Press;
+        assert!(screen.send_key(&key).unwrap().output_accepted);
+        let events = screen.take_program_events();
+        let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert!(!status.records()[0].unseen);
+        assert!(status.contribution().attention.is_none());
+    }
+
+    #[test]
+    fn program_status_wire_burst_bounds_records_and_preserves_lifecycle_barriers() {
+        let screen =
+            VtScreen::new_with_write_pty(80, 24, None, Some(Arc::new(|_, _| Ok(())))).unwrap();
+        for index in 0..4096 {
+            screen.feed(
+                format!("\x1b]7501;state=working:id=build/{index}:progress=40\x07").as_bytes(),
+            );
+        }
+        let events = screen.take_program_events();
+        let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        let records = status.records();
+        assert_eq!(records.len(), 256);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.id.path() == "build/4095")
+        );
+        assert!(!records.iter().any(|record| record.id.path() == "build/0"));
+
+        // No UI collection between these barriers and the following reports.
+        screen.feed(b"\x1b]7501;state=clear:id=build\x07");
+        screen.feed(b"\x1b]7501;state=error:id=failed\x07");
+        screen.feed(b"\x1b]7501;state=working:id=running\x07");
+        screen.feed(b"\x1b]133;A\x07");
+        let events = screen.take_program_events();
+        let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(status.records().len(), 1);
+        assert_eq!(status.records()[0].id.path(), "failed");
+        assert!(status.records()[0].unseen);
+
+        screen.feed(b"\x1bc\x1b]7501;state=working:id=next\x07");
+        let events = screen.take_program_events();
+        let [ProgramStatusEvent::Snapshot(status)] = &events[..] else {
+            panic!("{events:?}");
+        };
+        assert_eq!(status.records().len(), 1);
+        assert_eq!(status.records()[0].id.path(), "next");
+    }
+
+    #[test]
+    fn terminal_progress_expires_without_a_fresh_report() {
+        let progress = Some(TerminalProgress::Running(Some(42)));
+        let reported_at = 10;
+        let encoded = encode_timed_terminal_progress(progress, reported_at);
+        let timeout = u64::try_from(TERMINAL_PROGRESS_TIMEOUT.as_millis()).unwrap();
+
+        assert_eq!(
+            decode_timed_terminal_progress(encoded, reported_at + timeout - 1),
+            progress
+        );
+        assert_eq!(
+            decode_timed_terminal_progress(encoded, reported_at + timeout),
+            None
+        );
+    }
+
+    #[test]
+    fn vt_screen_tracks_title_effects_without_a_pty_writer() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+
+        assert_eq!(screen.reported_title(), None);
+        assert_eq!(screen.title(), None);
+
+        screen.feed(b"\x1b]0;first title\x07\x1b]2;final title\x1b\\");
+
+        assert_eq!(
+            screen.reported_title(),
+            Some(Some("final title".to_owned()))
+        );
+        assert_eq!(screen.title().as_deref(), Some("final title"));
+
+        screen.feed(b"\x1b]2;\x07");
+
+        assert_eq!(screen.reported_title(), Some(None));
+        assert_eq!(screen.title(), None);
+    }
 
     #[test]
     fn vt_screen_reports_osc7_current_dir() {
@@ -1907,6 +9191,19 @@ mod tests {
         screen.feed(b"\x1b]7;file:///tmp/con-vt-cwd\x07");
 
         assert_eq!(screen.current_dir().as_deref(), Some("/tmp/con-vt-cwd"));
+    }
+
+    #[test]
+    fn vt_screen_coalesces_and_clears_current_dir_effects_without_a_pty_writer() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+
+        screen.feed(b"\x1b]7;file:///tmp/first\x07\x1b]9;9;/tmp/final\x1b\\");
+
+        assert_eq!(screen.current_dir().as_deref(), Some("/tmp/final"));
+
+        screen.feed(b"\x1b]7;\x07");
+
+        assert_eq!(screen.current_dir(), None);
     }
 
     #[test]
@@ -1945,6 +9242,42 @@ mod tests {
             screen.current_dir().as_deref(),
             Some("/home/me/con terminal")
         );
+    }
+
+    #[test]
+    fn vt_screen_preserves_whitespace_in_bare_current_dir() {
+        let screen = VtScreen::new(80, 24, None).expect("create vt screen");
+
+        screen.feed(b"\x1b]9;9; /tmp/con cwd \x07");
+
+        assert_eq!(screen.current_dir().as_deref(), Some(" /tmp/con cwd "));
+    }
+
+    #[test]
+    fn concealed_cells_preserve_text_but_hide_foreground_for_rendering() {
+        let screen = VtScreen::new(8, 2, None).expect("create vt screen");
+        screen.feed(b"\x1b[31;44;4;9;7;8mX\x1b[28mY\x1b[8mZ\x1b[0mW");
+        let snapshot = screen.snapshot();
+        let cells = &snapshot.cells[..4];
+        assert_eq!(
+            cells.iter().map(|c| c.codepoint).collect::<Vec<_>>(),
+            vec!['X' as u32, 'Y' as u32, 'Z' as u32, 'W' as u32]
+        );
+        for index in [0, 2] {
+            let cell = &cells[index];
+            assert_ne!(cell.attrs & ATTR_INVISIBLE, 0);
+            let rendered = cell.for_render();
+            assert_eq!(rendered.codepoint, 0);
+            assert_eq!(rendered.attrs & (ATTR_UNDERLINE | ATTR_STRIKE), 0);
+            assert_ne!(rendered.attrs & ATTR_INVERSE, 0);
+            assert_eq!((rendered.fg, rendered.bg), (cell.fg, cell.bg));
+        }
+        for index in [1, 3] {
+            assert_eq!(cells[index].attrs & ATTR_INVISIBLE, 0);
+            assert_eq!(cells[index].for_render(), cells[index]);
+        }
+        assert_ne!(cells[1].attrs & ATTR_UNDERLINE, 0);
+        assert_ne!(cells[1].attrs & ATTR_STRIKE, 0);
     }
 
     #[test]

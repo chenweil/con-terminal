@@ -1,13 +1,115 @@
 use super::*;
 
 const AGENT_CLI_DETECT_LOOKBACK_LINES: usize = 80;
+const PROMPT_STABLE_POLLS: u32 = 2;
+const VISIBLE_EXEC_POLL_COUNT: usize = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticPromptState {
+    Unknown,
+    Waiting,
+    AtPrompt,
+}
+
+struct SemanticPromptTracker {
+    observed: bool,
+    left_prompt: bool,
+    pending_prompt: bool,
+}
+
+impl SemanticPromptTracker {
+    fn new(observed: bool) -> Self {
+        Self {
+            observed,
+            left_prompt: false,
+            pending_prompt: false,
+        }
+    }
+
+    fn observe(&mut self, cursor_at_prompt: bool, output_advanced: bool) -> SemanticPromptState {
+        self.observed |= cursor_at_prompt;
+        if !self.observed {
+            return SemanticPromptState::Unknown;
+        }
+        if !cursor_at_prompt || !output_advanced {
+            self.left_prompt |= !cursor_at_prompt;
+            self.pending_prompt = false;
+            return SemanticPromptState::Waiting;
+        }
+        if self.left_prompt || std::mem::replace(&mut self.pending_prompt, true) {
+            SemanticPromptState::AtPrompt
+        } else {
+            SemanticPromptState::Waiting
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibleExecDecision {
+    Waiting,
+    Complete,
+    Unconfirmed,
+}
+
+struct VisibleExecTracker {
+    semantic_prompt: SemanticPromptTracker,
+    last_prompt_snapshot: String,
+    stable_prompt_polls: u32,
+}
+
+impl VisibleExecTracker {
+    fn new(cursor_at_prompt: bool) -> Self {
+        Self {
+            semantic_prompt: SemanticPromptTracker::new(cursor_at_prompt),
+            last_prompt_snapshot: String::new(),
+            stable_prompt_polls: 0,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        cursor_at_prompt: bool,
+        output_advanced: bool,
+        output: &str,
+        prompt_like: bool,
+    ) -> VisibleExecDecision {
+        let semantic_state = self
+            .semantic_prompt
+            .observe(cursor_at_prompt, output_advanced);
+        if semantic_state == SemanticPromptState::AtPrompt {
+            return VisibleExecDecision::Complete;
+        }
+        if !output_advanced || !prompt_like || output.is_empty() {
+            self.last_prompt_snapshot.clear();
+            self.stable_prompt_polls = 0;
+            return VisibleExecDecision::Waiting;
+        }
+
+        if output == self.last_prompt_snapshot {
+            self.stable_prompt_polls += 1;
+        } else {
+            self.last_prompt_snapshot.clear();
+            self.last_prompt_snapshot.push_str(output);
+            self.stable_prompt_polls = 0;
+        }
+        if self.stable_prompt_polls < PROMPT_STABLE_POLLS {
+            return VisibleExecDecision::Waiting;
+        }
+
+        match semantic_state {
+            SemanticPromptState::Unknown => VisibleExecDecision::Complete,
+            SemanticPromptState::Waiting => VisibleExecDecision::Unconfirmed,
+            SemanticPromptState::AtPrompt => VisibleExecDecision::Complete,
+        }
+    }
+}
 
 impl ConWorkspace {
     /// Handle a visible terminal execution request from the agent.
     ///
     /// Writes the command to the focused PTY so the user sees it execute.
-    /// Uses Ghostty's COMMAND_FINISHED signal when available, with a bounded
-    /// recent-output fallback when shell integration is unavailable.
+    /// Uses Ghostty's completion and semantic prompt state when available,
+    /// with a bounded recent-output fallback otherwise.
     pub(super) fn handle_terminal_exec_request_for_tab(
         &mut self,
         tab_idx: usize,
@@ -17,10 +119,9 @@ impl ConWorkspace {
         let resolved = match self.resolve_pane_target_for_tab(tab_idx, req.target) {
             Ok(target) => target,
             Err(err) => {
-                let _ = req.response_tx.send(TerminalExecResponse {
-                    output: err,
-                    exit_code: Some(1),
-                });
+                let _ = req
+                    .response_tx
+                    .send(TerminalExecResponse::completed(err, Some(1)));
                 return;
             }
         };
@@ -29,10 +130,10 @@ impl ConWorkspace {
 
         // Safety: refuse to execute on a dead PTY.
         if !pane.is_alive(cx) {
-            let _ = req.response_tx.send(TerminalExecResponse {
-                output: "Pane PTY process has exited — cannot execute command.".to_string(),
-                exit_code: Some(1),
-            });
+            let _ = req.response_tx.send(TerminalExecResponse::completed(
+                "Pane PTY process has exited — cannot execute command.".to_string(),
+                Some(1),
+            ));
             return;
         }
 
@@ -120,10 +221,9 @@ impl ConWorkspace {
                 notes,
                 suggestion,
             );
-            let _ = req.response_tx.send(TerminalExecResponse {
-                output,
-                exit_code: Some(2),
-            });
+            let _ = req
+                .response_tx
+                .send(TerminalExecResponse::completed(output, Some(2)));
             return;
         }
 
@@ -134,6 +234,10 @@ impl ConWorkspace {
                  Command completion tracking may produce unexpected results."
             );
         }
+
+        let _ = pane.take_command_finished(cx);
+        let initial_prompt_state = pane.prompt_state(cx);
+        let mut visible_exec = VisibleExecTracker::new(initial_prompt_state.cursor_at_prompt);
 
         // Write the command to the PTY — user sees it execute in real time
         let cmd_with_newline = format!("{}\n", req.command);
@@ -159,21 +263,21 @@ impl ConWorkspace {
                     output: String,
                     exit_code: Option<i32>,
                 },
-                Observe {
+                Unconfirmed {
                     output: String,
-                    prompt_like: bool,
                 },
+                Waiting,
             }
 
-            const PROMPT_STABLE_POLLS: u32 = 2;
-            let mut last_prompt_snapshot = String::new();
-            let mut stable_prompt_polls = 0u32;
+            let mut observed_generation = None;
+            let mut observed_output = String::new();
+            let mut observed_prompt_like = false;
 
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(500))
                 .await;
 
-            for _ in 0..29 {
+            for poll_index in 0..VISIBLE_EXEC_POLL_COUNT {
                 let poll = _this
                     .update(cx, |_ws, cx| {
                         if let Some((exit_code, _duration)) =
@@ -185,23 +289,62 @@ impl ConWorkspace {
                             };
                         }
 
-                        let observation = pane_for_fallback.observation_frame(50, cx);
-                        let output = observation
-                            .recent_output
-                            .iter()
-                            .map(|line| line.trim_end())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let prompt_like = observation.screen_hints.iter().any(|hint| {
-                            matches!(
-                                hint.kind,
-                                con_agent::context::PaneObservationHintKind::PromptLikeInput
-                            )
-                        });
+                        let prompt_state = pane_for_fallback.prompt_state(cx);
+                        if observed_generation != Some(prompt_state.output_generation) {
+                            let observation = pane_for_fallback.observation_frame(50, cx);
+                            observed_output = observation
+                                .recent_output
+                                .iter()
+                                .map(|line| line.trim_end())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            observed_prompt_like = observation.screen_hints.iter().any(|hint| {
+                                matches!(
+                                    hint.kind,
+                                    con_agent::context::PaneObservationHintKind::PromptLikeInput
+                                )
+                            });
+                            observed_generation = Some(prompt_state.output_generation);
+                        }
+                        let decision = visible_exec.observe(
+                            prompt_state.cursor_at_prompt,
+                            prompt_state.output_generation
+                                != initial_prompt_state.output_generation,
+                            &observed_output,
+                            observed_prompt_like,
+                        );
 
-                        VisibleExecPoll::Observe {
-                            output,
-                            prompt_like,
+                        match decision {
+                            VisibleExecDecision::Waiting => VisibleExecPoll::Waiting,
+                            VisibleExecDecision::Complete => {
+                                if let Some((exit_code, _duration)) =
+                                    pane_for_fallback.take_command_finished(cx)
+                                {
+                                    return VisibleExecPoll::Finished {
+                                        output: pane_for_fallback.recent_lines(50, cx).join("\n"),
+                                        exit_code,
+                                    };
+                                }
+                                let lines = pane_for_fallback.recent_lines(50, cx);
+                                pane_for_fallback.recover_shell_prompt_state(cx);
+                                VisibleExecPoll::Finished {
+                                    output: lines.join("\n"),
+                                    exit_code: None,
+                                }
+                            }
+                            VisibleExecDecision::Unconfirmed => {
+                                if let Some((exit_code, _duration)) =
+                                    pane_for_fallback.take_command_finished(cx)
+                                {
+                                    return VisibleExecPoll::Finished {
+                                        output: pane_for_fallback.recent_lines(50, cx).join("\n"),
+                                        exit_code,
+                                    };
+                                }
+                                VisibleExecPoll::Unconfirmed {
+                                    output: pane_for_fallback.recent_lines(50, cx).join("\n"),
+                                }
+                            }
                         }
                     })
                     .ok();
@@ -209,55 +352,42 @@ impl ConWorkspace {
                 match poll {
                     Some(VisibleExecPoll::Finished { output, exit_code }) => {
                         let _ = fallback_response_tx
-                            .try_send(TerminalExecResponse { output, exit_code });
+                            .try_send(TerminalExecResponse::completed(output, exit_code));
                         return;
                     }
-                    Some(VisibleExecPoll::Observe {
-                        output,
-                        prompt_like,
-                    }) if prompt_like => {
-                        if !output.is_empty() && output == last_prompt_snapshot {
-                            stable_prompt_polls += 1;
-                        } else {
-                            last_prompt_snapshot = output;
-                            stable_prompt_polls = 0;
-                        }
-
-                        if stable_prompt_polls >= PROMPT_STABLE_POLLS {
-                            let output = _this
-                                .update(cx, |_ws, cx| {
-                                    pane_for_fallback.recover_shell_prompt_state(cx);
-                                    pane_for_fallback.recent_lines(50, cx).join("\n")
-                                })
-                                .unwrap_or_else(|_| last_prompt_snapshot.clone());
-                            let _ = fallback_response_tx.try_send(TerminalExecResponse {
-                                output,
-                                exit_code: None,
-                            });
-                            return;
-                        }
+                    Some(VisibleExecPoll::Unconfirmed { output }) => {
+                        let _ = fallback_response_tx
+                            .try_send(TerminalExecResponse::unconfirmed(output));
+                        return;
                     }
-                    Some(VisibleExecPoll::Observe { output, .. }) => {
-                        last_prompt_snapshot = output;
-                        stable_prompt_polls = 0;
-                    }
+                    Some(VisibleExecPoll::Waiting) => {}
                     None => return,
                 }
 
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(500))
-                    .await;
+                if poll_index + 1 < VISIBLE_EXEC_POLL_COUNT {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(500))
+                        .await;
+                }
             }
 
-            let output = _this
+            let response = _this
                 .update(cx, |_ws, cx| {
-                    pane_for_fallback.recent_lines(50, cx).join("\n")
+                    if let Some((exit_code, _duration)) =
+                        pane_for_fallback.take_command_finished(cx)
+                    {
+                        TerminalExecResponse::completed(
+                            pane_for_fallback.recent_lines(50, cx).join("\n"),
+                            exit_code,
+                        )
+                    } else {
+                        TerminalExecResponse::unconfirmed(
+                            pane_for_fallback.recent_lines(50, cx).join("\n"),
+                        )
+                    }
                 })
-                .unwrap_or_default();
-            let _ = fallback_response_tx.try_send(TerminalExecResponse {
-                output,
-                exit_code: None,
-            });
+                .unwrap_or_else(|_| TerminalExecResponse::unconfirmed(String::new()));
+            let _ = fallback_response_tx.try_send(response);
         })
         .detach();
     }
@@ -301,6 +431,8 @@ impl ConWorkspace {
                             pane_id: pid,
                             title,
                             cwd: observation.cwd.clone(),
+                            foreground_process_group_id: observation.foreground_process_group_id,
+                            tty_name: observation.tty_name.clone(),
                             is_focused: pid == focused_pid,
                             rows,
                             cols,
@@ -760,6 +892,12 @@ impl ConWorkspace {
                                 let lines = this
                                     .update(cx, |_, cx| pane.recent_lines(200, cx))
                                     .unwrap_or_default();
+                                // `!is_busy` can hold before the shell has run the probe.
+                                if !con_agent::shell_probe::shell_probe_output_complete(
+                                    &lines, &nonce,
+                                ) {
+                                    continue;
+                                }
                                 match con_agent::shell_probe::parse_shell_probe_lines(&lines, &nonce)
                                 {
                                     Ok(result) => {
@@ -769,7 +907,7 @@ impl ConWorkspace {
                                                 tab_idx,
                                                 &pane,
                                                 con_agent::context::PaneRuntimeEvent::ShellProbe {
-                                                    result: recorded_result,
+                                                    result: Box::new(recorded_result),
                                                     captured_input_generation: pane.input_generation(cx),
                                                 },
                                             );
@@ -891,7 +1029,7 @@ impl ConWorkspace {
                         // Spawn async task — direct terminal access, no channel overhead
                         cx.spawn(async move |this, cx| {
                         let deadline = std::time::Instant::now()
-                            + std::time::Duration::from_secs(timeout as u64);
+                            + std::time::Duration::from_secs(timeout);
 
                         // Three modes:
                         // 1. Shell integration idle: 100ms polling, check is_busy/command_finished
@@ -1085,5 +1223,99 @@ impl ConWorkspace {
         };
 
         let _ = req.response_tx.send(response);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SemanticPromptState, SemanticPromptTracker, VisibleExecDecision, VisibleExecTracker,
+    };
+
+    #[test]
+    fn semantic_prompt_remains_authoritative_after_being_observed() {
+        let mut prompt = SemanticPromptTracker::new(false);
+
+        assert_eq!(prompt.observe(false, true), SemanticPromptState::Unknown);
+        assert_eq!(prompt.observe(true, true), SemanticPromptState::Waiting);
+        assert_eq!(prompt.observe(true, true), SemanticPromptState::AtPrompt);
+        assert_eq!(prompt.observe(false, true), SemanticPromptState::Waiting);
+        assert_eq!(prompt.observe(true, true), SemanticPromptState::AtPrompt);
+    }
+
+    #[test]
+    fn semantic_prompt_requires_output_after_dispatch() {
+        let mut prompt = SemanticPromptTracker::new(true);
+
+        assert_eq!(prompt.observe(true, false), SemanticPromptState::Waiting);
+        assert_eq!(prompt.observe(true, true), SemanticPromptState::Waiting);
+        assert_eq!(prompt.observe(true, true), SemanticPromptState::AtPrompt);
+    }
+
+    #[test]
+    fn stable_plain_prompt_after_semantic_marker_loss_is_unconfirmed() {
+        let mut exec = VisibleExecTracker::new(true);
+
+        assert_eq!(
+            exec.observe(false, true, "$ ", true),
+            VisibleExecDecision::Waiting
+        );
+        assert_eq!(
+            exec.observe(false, true, "$ ", true),
+            VisibleExecDecision::Waiting
+        );
+        assert_eq!(
+            exec.observe(false, true, "$ ", true),
+            VisibleExecDecision::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn stable_prompt_without_semantic_markers_uses_fallback() {
+        let mut exec = VisibleExecTracker::new(false);
+
+        assert_eq!(
+            exec.observe(false, true, "$ ", true),
+            VisibleExecDecision::Waiting
+        );
+        assert_eq!(
+            exec.observe(false, true, "$ ", true),
+            VisibleExecDecision::Waiting
+        );
+        assert_eq!(
+            exec.observe(false, true, "$ ", true),
+            VisibleExecDecision::Complete
+        );
+    }
+
+    #[test]
+    fn semantic_prompt_return_completes_visible_exec() {
+        let mut exec = VisibleExecTracker::new(true);
+
+        assert_eq!(
+            exec.observe(false, true, "running", false),
+            VisibleExecDecision::Waiting
+        );
+        assert_eq!(
+            exec.observe(true, true, "$ ", true),
+            VisibleExecDecision::Complete
+        );
+    }
+
+    #[test]
+    fn stale_initial_prompt_cannot_end_visible_exec() {
+        let mut semantic_exec = VisibleExecTracker::new(true);
+        let mut fallback_exec = VisibleExecTracker::new(false);
+
+        for _ in 0..3 {
+            assert_eq!(
+                semantic_exec.observe(true, false, "$ ", true),
+                VisibleExecDecision::Waiting
+            );
+            assert_eq!(
+                fallback_exec.observe(false, false, "$ ", true),
+                VisibleExecDecision::Waiting
+            );
+        }
     }
 }

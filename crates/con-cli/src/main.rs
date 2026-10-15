@@ -10,6 +10,13 @@ use con_core::{
 };
 use serde_json::{Value, json};
 
+mod configuration;
+mod handoff;
+mod pty_bridge;
+use pty_bridge::{PtyBridgeArgs, run_pty_bridge};
+mod ssh;
+mod ssh_cache;
+
 #[derive(Parser)]
 #[command(name = "con-cli", about = "CLI control surface for a running con app")]
 struct Cli {
@@ -46,6 +53,17 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Import or export configuration without connecting to a running Con app.
+    Config {
+        #[command(subcommand)]
+        command: configuration::ConfigurationCommand,
+    },
+    /// Hand off a task between installed agents, preserving the current worktree.
+    Handoff {
+        #[command(subcommand)]
+        command: handoff::HandoffCommand,
+    },
+    PtyBridge(PtyBridgeArgs),
 }
 
 #[derive(Subcommand)]
@@ -342,6 +360,13 @@ struct AgentAskArgs {
 }
 
 fn main() -> Result<()> {
+    let raw_args: Vec<_> = std::env::args_os().collect();
+    if raw_args.get(1).is_some_and(|arg| arg == "+ssh-cache") {
+        std::process::exit(ssh_cache::run(&raw_args[2..]));
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == "+ssh") {
+        std::process::exit(ssh::run(&raw_args[2..]));
+    }
     let cli = Cli::parse();
     let socket_path = cli.socket.clone().unwrap_or_else(control_socket_path);
 
@@ -681,6 +706,9 @@ fn main() -> Result<()> {
                 print_result(&result, cli.json, render_pretty_json)?;
             }
         },
+        Command::Config { command } => configuration::run(command)?,
+        Command::Handoff { command } => handoff::run(command, &socket_path, cli.json)?,
+        Command::PtyBridge(args) => run_pty_bridge(args)?,
     }
 
     Ok(())
@@ -929,11 +957,46 @@ fn render_panes_list(value: &Value) -> Result<()> {
         if !title.is_empty() {
             println!("    title: {title}");
         }
+        if let Some(details) = format_pty_details(pane) {
+            println!("    {details}");
+        }
         if !caps.is_empty() {
             println!("    capabilities: {caps}");
         }
     }
     Ok(())
+}
+
+fn format_pty_details(value: &Value) -> Option<String> {
+    let foreground_process_group_id = value
+        .get("foreground_process_group_id")
+        .and_then(Value::as_u64);
+    let tty_name = value.get("tty_name").and_then(Value::as_str);
+    let support = value.get("observation_support");
+    let process_group_id_support = support
+        .and_then(|support| support.get("foreground_process_group_id"))
+        .and_then(Value::as_bool);
+    let tty_name_support = support
+        .and_then(|support| support.get("tty_name"))
+        .and_then(Value::as_bool);
+
+    let mut details = Vec::with_capacity(2);
+    match (process_group_id_support, foreground_process_group_id) {
+        (Some(false), _) => {}
+        (_, Some(process_group_id)) => {
+            details.push(format!("foreground_process_group_id: {process_group_id}"))
+        }
+        (Some(true), None) => details.push("foreground_process_group_id: unavailable".to_string()),
+        (None, None) => {}
+    }
+    match (tty_name_support, tty_name) {
+        (Some(false), _) => {}
+        (_, Some(tty_name)) => details.push(format!("tty: {tty_name}")),
+        (Some(true), None) => details.push("tty: unavailable".to_string()),
+        (None, None) => {}
+    }
+
+    (!details.is_empty()).then(|| details.join("  "))
 }
 
 fn render_tree(value: &Value) -> Result<()> {
@@ -1004,6 +1067,9 @@ fn render_surface_rows(surfaces: &[Value], prefix: &str) {
         if !title.is_empty() {
             println!("{prefix}    title: {title}");
         }
+        if let Some(details) = format_pty_details(surface) {
+            println!("{prefix}    {details}");
+        }
     }
 }
 
@@ -1040,6 +1106,9 @@ fn render_create_result(value: &Value) -> Result<()> {
         value["pane_id"].as_u64().unwrap_or(0),
         value["tab_index"].as_u64().unwrap_or(0)
     );
+    if let Some(details) = format_pty_details(value) {
+        println!("    {details}");
+    }
     Ok(())
 }
 
@@ -1058,6 +1127,9 @@ fn render_surface_created(value: &Value) -> Result<()> {
         value["pane_id"].as_u64().unwrap_or(0),
         value["tab_index"].as_u64().unwrap_or(0)
     );
+    if let Some(details) = format_pty_details(value) {
+        println!("    {details}");
+    }
     Ok(())
 }
 
@@ -1083,6 +1155,9 @@ fn render_surface_wait(value: &Value) -> Result<()> {
         value["has_shell_integration"].as_bool().unwrap_or(false),
         value["is_busy"].as_bool().unwrap_or(false)
     );
+    if let Some(details) = format_pty_details(value) {
+        println!("    {details}");
+    }
     Ok(())
 }
 
@@ -1130,6 +1205,9 @@ fn render_agent_ask(value: &Value) -> Result<()> {
         .and_then(Value::as_str)
         .unwrap_or("");
     print!("{content}");
+    if !content.ends_with('\n') && !content.is_empty() {
+        println!();
+    }
     Ok(())
 }
 
@@ -1149,4 +1227,106 @@ fn render_pretty_json(value: &Value) -> Result<()> {
 
 fn string_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pty_bridge_literal_command_keeps_leading_dash_arguments() {
+        let cli = Cli::try_parse_from([
+            "con-cli",
+            "pty-bridge",
+            "--socket",
+            "/tmp/con bridge.sock",
+            "--program",
+            "/bin/sh",
+            "--literal-command",
+            "--",
+            "-c",
+            "printf '%s' ready",
+        ])
+        .expect("parse literal PTY bridge command");
+
+        let Command::PtyBridge(args) = cli.command else {
+            panic!("expected PTY bridge command");
+        };
+        assert!(args.literal_command);
+        assert_eq!(
+            args.program.as_deref(),
+            Some(std::ffi::OsStr::new("/bin/sh"))
+        );
+        assert_eq!(
+            args.args,
+            [
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from("printf '%s' ready"),
+            ]
+        );
+    }
+
+    #[test]
+    fn pty_bridge_accepts_hyphen_prefixed_cwd_and_program() {
+        let cli = Cli::try_parse_from([
+            "con-cli",
+            "pty-bridge",
+            "--socket",
+            "/tmp/con.sock",
+            "--cwd",
+            "-workspace",
+            "--program",
+            "-tool",
+            "--literal-command",
+        ])
+        .expect("parse hyphen-prefixed PTY bridge operands");
+
+        let Command::PtyBridge(args) = cli.command else {
+            panic!("expected PTY bridge command");
+        };
+        assert_eq!(args.cwd, Some(PathBuf::from("-workspace")));
+        assert_eq!(args.program, Some(std::ffi::OsString::from("-tool")));
+    }
+
+    #[test]
+    fn pty_details_render_values_capabilities_and_legacy_responses() {
+        assert_eq!(
+            format_pty_details(&json!({
+                "foreground_process_group_id": 42,
+                "tty_name": "/dev/ttys001",
+                "observation_support": {
+                    "foreground_process_group_id": true,
+                    "tty_name": true,
+                },
+            }))
+            .as_deref(),
+            Some("foreground_process_group_id: 42  tty: /dev/ttys001")
+        );
+        assert_eq!(
+            format_pty_details(&json!({ "tty_name": "/dev/ttys001" })).as_deref(),
+            Some("tty: /dev/ttys001")
+        );
+        assert_eq!(
+            format_pty_details(&json!({
+                "observation_support": {
+                    "foreground_process_group_id": true,
+                    "tty_name": true,
+                },
+            }))
+            .as_deref(),
+            Some("foreground_process_group_id: unavailable  tty: unavailable")
+        );
+        assert_eq!(
+            format_pty_details(&json!({
+                "foreground_process_group_id": 42,
+                "tty_name": "/dev/ttys001",
+                "observation_support": {
+                    "foreground_process_group_id": false,
+                    "tty_name": false,
+                },
+            })),
+            None
+        );
+        assert_eq!(format_pty_details(&json!({})), None);
+    }
 }

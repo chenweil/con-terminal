@@ -10,21 +10,19 @@ use super::{
 use super::{
     ConWorkspace, SPLIT_PREVIEW_SEAM_THICKNESS, SplitDirection, SplitPlacement,
     TabRenameStateSnapshot, centered_drag_preview_origin, clamp_preview_origin_to_tab_bar,
-    clear_pane_tab_promotion_drag_state, horizontal_tab_slot_from_drag,
-    horizontal_tab_slot_from_position, is_dragged_tab_source, is_tab_strip_preview_active,
+    clear_pane_tab_promotion_drag_state, is_dragged_tab_source, is_tab_strip_preview_active,
     normalize_tab_user_label, pane_drag_floating_preview_origin,
     pane_split_drop_target_from_position, pane_title_drag_tab_slot, pane_title_drag_to_tab_active,
-    rebase_active_tab_for_insert, remap_drop_slot_for_current_order,
-    remap_tab_rename_state_after_close, remap_tab_rename_state_after_reorder,
-    split_preview_local_rect, split_preview_regions, tab_drag_overlay_probe_position,
-    tab_drag_preview_origin, tab_like_drag_preview_size, tab_rename_commit_label,
-    tab_rename_initial_label, trailing_drop_slot_from_position,
+    rebase_active_tab_for_insert, remap_tab_rename_state_after_close,
+    remap_tab_rename_state_after_reorder, split_preview_local_rect, split_preview_regions,
+    tab_drag_overlay_probe_position, tab_drag_preview_origin, tab_like_drag_preview_size,
+    tab_rename_commit_label, tab_rename_initial_label,
 };
 use crate::activity_bar::ActivitySlot;
 use crate::sidebar::{
     DraggedTabPreviewConstraint, constrained_drag_preview_x_shift, constrained_drag_preview_y_shift,
 };
-use gpui::{Bounds, MouseButton, Point, Size, px};
+use gpui::{Bounds, MouseButton, Pixels, Point, Size, point, px, size};
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -314,6 +312,8 @@ fn horizontal_tab_reorder_probe_uses_locked_overlay_center_not_mouse_y() {
         icon: "phosphor/terminal.svg",
         source_top: px(6.0),
         cursor_offset_x: px(40.0),
+        size: size(px(180.0), px(28.0)),
+        source_visual_index: 0,
     };
     let probe = tab_drag_overlay_probe_position(
         Point {
@@ -378,7 +378,7 @@ fn tab_drag_preview_uses_tab_like_size() {
         tab_like_drag_preview_size(),
         Size {
             width: px(180.0),
-            height: px(28.0)
+            height: px(super::TOP_BAR_TAB_HEIGHT - 4.0)
         }
     );
 }
@@ -572,10 +572,12 @@ fn tab_rename_initial_label_prefers_rendered_presentation_over_raw_title() {
             None,
             None,
             None,
+            None,
             Some("prod-1.example.com"),
             Some("ssh prod-1.example.com"),
             Some("/Users/sundy/src/con-terminal"),
             0,
+            false,
         ),
         "prod-1.example.com"
     );
@@ -586,9 +588,11 @@ fn tab_rename_initial_label_prefers_rendered_presentation_over_raw_title() {
             Some("Deploy"),
             Some("phosphor/rocket.svg"),
             None,
+            None,
             Some("zsh"),
             Some("/Users/sundy/src/con-terminal"),
             0,
+            false,
         ),
         "Deploy"
     );
@@ -812,278 +816,92 @@ fn pane_split_drop_target_ignores_source_pane() {
     );
 }
 
-#[test]
-fn trailing_drop_slot_uses_real_bounds() {
-    let bounds = Bounds {
-        origin: Point {
-            x: px(340.0),
-            y: px(20.0),
-        },
-        size: Size {
-            width: px(88.0),
-            height: px(30.0),
-        },
-    };
-
-    assert_eq!(
-        trailing_drop_slot_from_position(
-            Point {
-                x: px(400.0),
-                y: px(25.0)
-            },
-            bounds,
-            5,
-        ),
-        Some(5)
-    );
-    assert_eq!(
-        trailing_drop_slot_from_position(
-            Point {
-                x: px(429.0),
-                y: px(25.0)
-            },
-            bounds,
-            5,
-        ),
-        None
-    );
+fn preview_tab_bounds(widths: &[f32], source: usize, slot: usize) -> (Vec<Bounds<Pixels>>, usize) {
+    let mut order: Vec<usize> = (0..widths.len()).collect();
+    order.remove(source);
+    let destination = super::tab_reorder_destination(source, slot, widths.len());
+    order.insert(destination, source);
+    let mut left = 0.0;
+    let bounds = order
+        .into_iter()
+        .map(|index| {
+            let bounds = Bounds::new(point(px(left), px(0.0)), size(px(widths[index]), px(24.0)));
+            left += widths[index];
+            bounds
+        })
+        .collect();
+    (bounds, destination)
 }
 
 #[test]
-fn horizontal_tab_slot_ignores_cursor_outside_bounds() {
-    let bounds = Bounds {
-        origin: Point {
-            x: px(100.0),
-            y: px(20.0),
-        },
-        size: Size {
-            width: px(80.0),
-            height: px(30.0),
-        },
-    };
-    assert_eq!(
-        horizontal_tab_slot_from_position(
-            Point {
-                x: px(90.0),
-                y: px(25.0)
-            },
-            bounds,
-            3
-        ),
-        None
-    );
-    assert_eq!(
-        horizontal_tab_slot_from_position(
-            Point {
-                x: px(181.0),
-                y: px(25.0)
-            },
-            bounds,
-            3
-        ),
-        None
-    );
-    assert_eq!(
-        horizontal_tab_slot_from_position(
-            Point {
-                x: px(120.0),
-                y: px(10.0)
-            },
-            bounds,
-            3
-        ),
-        None
-    );
-    assert_eq!(
-        horizontal_tab_slot_from_position(
-            Point {
-                x: px(120.0),
-                y: px(51.0)
-            },
-            bounds,
-            3
-        ),
-        None
-    );
-}
-
-#[test]
-fn horizontal_tab_slot_uses_left_and_right_halves() {
-    let bounds = Bounds {
-        origin: Point {
-            x: px(100.0),
-            y: px(20.0),
-        },
-        size: Size {
-            width: px(80.0),
-            height: px(30.0),
-        },
-    };
-    assert_eq!(
-        horizontal_tab_slot_from_position(
-            Point {
-                x: px(110.0),
-                y: px(25.0)
-            },
-            bounds,
-            3
-        ),
-        Some(3)
-    );
-    assert_eq!(
-        horizontal_tab_slot_from_position(
-            Point {
-                x: px(150.0),
-                y: px(25.0)
-            },
-            bounds,
-            3
-        ),
-        Some(4)
-    );
-}
-
-#[test]
-fn horizontal_tab_drag_waits_until_crossing_neighbor_midpoint() {
-    let bounds = Bounds {
-        origin: Point {
-            x: px(200.0),
-            y: px(20.0),
-        },
-        size: Size {
-            width: px(100.0),
-            height: px(30.0),
-        },
-    };
-
-    // Chrome-style: swap fires as soon as cursor enters the neighbour tab,
-    // regardless of which half of the tab the cursor is in.
-    assert_eq!(
-        horizontal_tab_slot_from_drag(
-            Point {
-                x: px(220.0),
-                y: px(25.0)
-            },
-            bounds,
-            2,
-            Some(1)
-        ),
-        Some(3),
-        "dragging tab 1 right into tab 2 should swap immediately"
-    );
-    assert_eq!(
-        horizontal_tab_slot_from_drag(
-            Point {
-                x: px(280.0),
-                y: px(25.0)
-            },
-            bounds,
-            2,
-            Some(1)
-        ),
-        Some(3),
-        "dragging tab 1 right over tab 2 right half should also swap"
-    );
-
-    let left_neighbor = Bounds {
-        origin: Point {
-            x: px(100.0),
-            y: px(20.0),
-        },
-        size: Size {
-            width: px(100.0),
-            height: px(30.0),
-        },
-    };
-    assert_eq!(
-        horizontal_tab_slot_from_drag(
-            Point {
-                x: px(180.0),
-                y: px(25.0)
-            },
-            left_neighbor,
-            1,
-            Some(2)
-        ),
-        Some(1),
-        "dragging tab 2 left into tab 1 should swap immediately"
-    );
-    assert_eq!(
-        horizontal_tab_slot_from_drag(
-            Point {
-                x: px(120.0),
-                y: px(25.0)
-            },
-            left_neighbor,
-            1,
-            Some(2)
-        ),
-        Some(1),
-        "dragging tab 2 left over tab 1 left half should also swap"
-    );
-
-    // Cursor on the source tab itself — no swap.
-    let source_bounds = Bounds {
-        origin: Point {
-            x: px(300.0),
-            y: px(20.0),
-        },
-        size: Size {
-            width: px(100.0),
-            height: px(30.0),
-        },
-    };
-    assert_eq!(
-        horizontal_tab_slot_from_drag(
-            Point {
-                x: px(350.0),
-                y: px(25.0)
-            },
-            source_bounds,
-            3,
+fn horizontal_tab_reorder_ignores_its_own_preview_gap() {
+    let (bounds, visual_source) = preview_tab_bounds(&[210.0, 80.0, 140.0], 0, 3);
+    // The probe is inside the dragged tab's gap, before its midpoint. It must
+    // stay at the end, not move back ahead of the preceding real tab.
+    for x in [230.0, 260.0, 430.0, 435.0, 260.0] {
+        assert_eq!(
+            super::horizontal_tab_slot_from_bounds(
+                point(px(x), px(12.0)),
+                &bounds,
+                3,
+                0,
+                visual_source,
+            ),
             Some(3)
-        ),
-        None,
-        "cursor on source tab should not trigger swap"
-    );
+        );
+    }
 }
 
 #[test]
-fn horizontal_tab_drag_without_source_still_uses_half_slots() {
-    let bounds = Bounds {
-        origin: Point {
-            x: px(100.0),
-            y: px(20.0),
-        },
-        size: Size {
-            width: px(80.0),
-            height: px(30.0),
-        },
-    };
+fn horizontal_tab_reorder_is_stable_across_repaints_and_unequal_widths() {
+    for widths in [[80.0, 140.0, 210.0], [210.0, 60.0, 90.0]] {
+        for source in 0..widths.len() {
+            for x in [-10.0, 0.0, 35.0, 85.0, 150.0, 215.0, 265.0, 350.0, 435.0] {
+                let mut slot = source;
+                let mut settled_destination = None;
+                for _ in 0..6 {
+                    let (bounds, visual_source) = preview_tab_bounds(&widths, source, slot);
+                    slot = super::horizontal_tab_slot_from_bounds(
+                        point(px(x), px(12.0)),
+                        &bounds,
+                        widths.len(),
+                        source,
+                        visual_source,
+                    )
+                    .unwrap();
+                    let destination = super::tab_reorder_destination(source, slot, widths.len());
+                    if let Some(settled) = settled_destination {
+                        assert_eq!(
+                            destination, settled,
+                            "widths={widths:?}, source={source}, x={x}"
+                        );
+                    }
+                    settled_destination = Some(destination);
+                }
+            }
+        }
+    }
+}
 
+#[test]
+fn horizontal_tab_reorder_rejects_missing_or_partial_layout_snapshots() {
+    let probe = point(px(20.0), px(12.0));
     assert_eq!(
-        horizontal_tab_slot_from_drag(
-            Point {
-                x: px(110.0),
-                y: px(25.0)
-            },
-            bounds,
-            3,
-            None
-        ),
-        Some(3)
+        super::horizontal_tab_slot_from_bounds(probe, &[], 3, 0, 0),
+        None
+    );
+    let (bounds, _) = preview_tab_bounds(&[80.0, 140.0, 210.0], 0, 0);
+    assert_eq!(
+        super::horizontal_tab_slot_from_bounds(probe, &bounds[..2], 3, 0, 0),
+        None
     );
     assert_eq!(
-        horizontal_tab_slot_from_drag(
-            Point {
-                x: px(150.0),
-                y: px(25.0)
-            },
-            bounds,
-            3,
-            None
-        ),
-        Some(4)
+        super::horizontal_tab_slot_from_bounds(probe, &bounds, 3, 3, 0),
+        None
+    );
+    assert_eq!(
+        super::horizontal_tab_slot_from_bounds(probe, &bounds, 3, 0, 3),
+        None
     );
 }
 
@@ -1169,39 +987,32 @@ fn pane_title_drag_tab_slot_uses_midpoint_of_each_tab() {
 }
 
 #[test]
-fn remap_drop_slot_preserves_current_order_for_live_drag_preview() {
-    assert_eq!(remap_drop_slot_for_current_order(1, 2), 3);
-    assert_eq!(remap_drop_slot_for_current_order(2, 1), 1);
-}
-
-#[test]
 fn top_bar_clickables_explicitly_consume_left_mouse_down() {
-    let source = concat!(
-        include_str!("render.rs"),
-        "\n",
-        include_str!("render/top_bar.rs")
-    );
+    let source = include_str!("render/top_bar.rs");
+    let constructor = source
+        .split("fn chrome_button(")
+        .nth(1)
+        .expect("shared chrome button constructor")
+        .split("impl ConWorkspace")
+        .next()
+        .unwrap();
+    let normalized = constructor.split_whitespace().collect::<String>();
+    assert!(normalized.contains(".occlude()"));
+    assert!(normalized.contains(".on_mouse_down(MouseButton::Left,|_,_,cx|cx.stop_propagation())"));
     for control_id in [
+        "handoff-agent",
         "tab-new",
         "toggle-left-sidebar",
         "toggle-input-bar",
         "toggle-agent-panel",
         "toggle-settings",
     ] {
-        let marker = format!(".id(\"{control_id}\")");
-        let start = source
-            .find(&marker)
-            .unwrap_or_else(|| panic!("missing top bar control {control_id}"));
-        let snippet = &source[start..source.len().min(start + 1200)];
-        let normalized = snippet.split_whitespace().collect::<String>();
-        let has_mouse_down_handler = normalized
-            .contains(".on_mouse_down(MouseButton::Left,|_,_,cx|{")
-            || normalized.contains(".on_mouse_down(MouseButton::Left,cx.listener(");
-        let consumes_mouse_down =
-            has_mouse_down_handler && normalized.contains("cx.stop_propagation();");
         assert!(
-            consumes_mouse_down,
-            "top bar control {control_id} must consume left mouse-down before parent drag"
+            source
+                .split_whitespace()
+                .collect::<String>()
+                .contains(&format!("chrome_button(\"{control_id}\",")),
+            "top bar control {control_id} must use the drag-safe shared button"
         );
     }
 }
@@ -1255,5 +1066,16 @@ fn new_tab_reveals_hidden_vertical_tab_rail_only() {
 
 #[test]
 fn promoting_single_tab_to_tab_strip_requires_deferred_top_chrome_refresh() {
-    assert!(ConWorkspace::should_defer_top_chrome_refresh_when_tab_strip_appears_for_tests());
+    assert_eq!(
+        ConWorkspace::should_defer_top_chrome_refresh_when_tab_strip_appears_for_tests(),
+        cfg!(not(target_os = "macos")),
+    );
+}
+
+#[test]
+fn macos_tab_count_does_not_resize_the_native_terminal() {
+    #[cfg(target_os = "macos")]
+    assert_eq!(super::TOP_BAR_COMPACT_HEIGHT, super::TOP_BAR_TABS_HEIGHT);
+    #[cfg(not(target_os = "macos"))]
+    assert!(super::TOP_BAR_TABS_HEIGHT > super::TOP_BAR_COMPACT_HEIGHT);
 }

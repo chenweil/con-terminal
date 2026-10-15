@@ -1,5 +1,29 @@
 # Implementation: Build System
 
+## macOS Release Handoff
+
+Dependency setup reuses the runner's installed CMake and logs its version.
+If it is absent, Homebrew must supply a bottle without auto-update or incidental
+upgrade. An unavailable bottle fails rather than compiling CMake from source.
+Zig remains explicitly pinned to the project version.
+
+The release workflow compiles ARM and Intel app bundles on their respective
+native runners. Signing, notarization, stapling and DMG creation run in separate
+ARM jobs. Intel binaries are not cross-compiled; Rosetta is used only to execute
+the packaged Intel companion CLI's smoke check.
+
+`scripts/macos/release.sh` normally builds locally as before. CI supplies
+`CON_PREBUILT_APP_ARCHIVE`, a same-workflow native bundle archive. Preparation
+checks channel, bundle ID, marketing/build version, both binary architectures,
+CLI compatibility symlink and Sparkle presence before replacing the destination.
+Signing and all release gates remain required. Internal archives never become
+GitHub release assets. Packaging can be retried independently while its native
+bundle artifact is retained.
+
+The split follows repeated Intel-runner ticket-download failures despite
+accepted notarization; it does not establish the cause of the network fault.
+See [the incident report](../../postmortem/2026-10-14-macos-packaging-handoff.md).
+
 ## Overview
 
 con is a Cargo workspace with platform terminal backends:
@@ -49,9 +73,9 @@ members = [
 
 | Dependency | Purpose |
 |------------|---------|
-| `gpui` | native GPU UI framework (upstream Zed git source) |
-| `gpui-component` | reusable UI controls (upstream Longbridge git source) |
-| `rig-core` | multi-provider agent runtime (pinned fork revision) |
+| `gpui` | native GPU UI framework (Zed's GPUI via exact-pinned `gpui-pre` crates.io snapshots) |
+| `gpui-component` | reusable UI controls (Longbridge, crates.io, pinned together with `gpui-pre`) |
+| `rig-core` | multi-provider agent runtime (crates.io) |
 | `tokio` | async runtime for agent work |
 | `crossbeam-channel` | UI and harness event routing |
 | `reqwest` | live model list fetch from models.dev |
@@ -62,6 +86,16 @@ members = [
 
 - `3pp/` is read-only reference material only.
 - Cargo dependencies resolve from crates.io or explicit git sources in the workspace manifest.
+- GPUI follows gpui-component's releases: an unreleased Zed fix cannot be picked
+  up by moving a git rev, and `[patch]` from Zed's repo does not apply because the
+  crate there is named `gpui`, not `gpui-pre`. Wait for a `gpui-pre` snapshot with a
+  matching gpui-component release, or move both back to git sources together.
+- The maintainer approved a temporary exception for native macOS presentation
+  on 2026-10-10. Three `gpui-pre` 0.3.7 packages resolve together from one public,
+  immutable Git revision; the copied registry manifests preserve the existing
+  component/type graph. This is not a general permission to fork dependencies.
+  [Provenance and removal criteria](../design/native-terminal-presentation.md)
+  track the upstream submission and compatible official replacement.
 - Ghostty source is fetched by `con-ghostty/build.rs` when needed, unless an override source directory is provided for local development.
 
 ## Platform boundary

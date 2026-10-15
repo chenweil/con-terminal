@@ -111,15 +111,6 @@ impl ConWorkspace {
     }
 
     #[cfg(target_os = "macos")]
-    pub(super) fn arm_chrome_transition_underlay(&mut self, duration: Duration) {
-        let until = Instant::now() + duration;
-        self.chrome_transition_underlay_until = Some(
-            self.chrome_transition_underlay_until
-                .map_or(until, |prev| prev.max(until)),
-        );
-    }
-
-    #[cfg(target_os = "macos")]
     pub(super) fn extend_guard(until: &mut Option<Instant>, duration: Duration) {
         let next = Instant::now() + duration;
         *until = Some(until.map_or(next, |prev| prev.max(next)));
@@ -129,24 +120,6 @@ impl ConWorkspace {
     pub(super) fn arm_agent_panel_snap_guard(&mut self, cx: &mut App) {
         Self::extend_guard(
             &mut self.agent_panel_snap_guard_until,
-            Duration::from_millis(CHROME_SNAP_GUARD_MS),
-        );
-        self.mark_active_tab_terminal_native_layout_pending(cx);
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn arm_input_bar_snap_guard(&mut self, cx: &mut App) {
-        Self::extend_guard(
-            &mut self.input_bar_snap_guard_until,
-            Duration::from_millis(CHROME_SNAP_GUARD_MS),
-        );
-        self.mark_active_tab_terminal_native_layout_pending(cx);
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn arm_top_chrome_snap_guard(&mut self, cx: &mut App) {
-        Self::extend_guard(
-            &mut self.top_chrome_snap_guard_until,
             Duration::from_millis(CHROME_SNAP_GUARD_MS),
         );
         self.mark_active_tab_terminal_native_layout_pending(cx);

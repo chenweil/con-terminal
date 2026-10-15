@@ -79,6 +79,10 @@ If you want the cleanest possible terminal surface, hide pane title bars from
 Settings -> Appearance. The shortcuts and terminal context menu still expose the
 same pane actions.
 
+When editing an HTML file (`.html` or `.htm`), choose **Open in browser** in
+its tab bar to view the saved file in your default browser. Save your edits
+first if you want to see them; this action does not save the editor buffer.
+
 ## The input bar
 
 The input bar is one surface with three modes:
@@ -145,6 +149,13 @@ Use the platform modifier to open links from terminal output:
 
 - macOS: hold <kbd>⌘</kbd>, then click a URL.
 - Windows and Linux: hold <kbd>⌃</kbd>, then click a URL.
+
+In a mouse-aware TUI, an ordinary click still belongs to the app. Hold the
+modifier to open a terminal link instead.
+
+On macOS, hover a terminal link and press <kbd>⌘</kbd><kbd>C</kbd> to copy its
+complete address, even if it wraps across several lines. A text selection
+takes priority over the hovered link.
 
 Paste text normally. Dragging files into the terminal sends their paths. When a
 TUI supports image/file paste protocols, con forwards compatible clipboard and

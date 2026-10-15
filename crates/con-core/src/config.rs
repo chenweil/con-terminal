@@ -1,8 +1,11 @@
-use anyhow::Result;
-use con_agent::AgentConfig;
+use anyhow::{Context as _, Result};
+use con_agent::{AgentConfig, ProviderKind};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+pub mod ghostty;
+pub mod transfer;
 
 pub const MIN_UI_FONT_SIZE: f32 = 12.0;
 pub const MAX_UI_FONT_SIZE: f32 = 24.0;
@@ -67,6 +70,13 @@ pub fn is_gpui_pseudo_font_family(name: &str) -> bool {
     name.trim_start().starts_with('.')
 }
 
+pub fn is_bundled_terminal_font_family(name: &str) -> bool {
+    name.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .eq_ignore_ascii_case("IoskeleyMono")
+}
+
 pub fn sanitize_terminal_font_family(name: &str) -> String {
     let trimmed = name.trim();
     if trimmed.is_empty() || is_gpui_pseudo_font_family(trimmed) {
@@ -76,22 +86,55 @@ pub fn sanitize_terminal_font_family(name: &str) -> String {
     }
 }
 
+pub fn sanitize_terminal_font_fallback(fonts: &[String], primary: &str) -> Vec<String> {
+    let primary = sanitize_terminal_font_family(primary);
+    let mut sanitized = Vec::new();
+    for font in fonts {
+        let font = font.trim();
+        if font.is_empty()
+            || is_gpui_pseudo_font_family(font)
+            || is_bundled_terminal_font_family(font)
+            || font.eq_ignore_ascii_case(&primary)
+            || sanitized
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(font))
+        {
+            continue;
+        }
+        sanitized.push(font.to_string());
+    }
+    sanitized
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
+    /// Shell command used for newly created terminal panes. When unset, Con
+    /// follows the platform default (for example the Windows Terminal default
+    /// profile or `$SHELL` on Unix).
+    pub shell: Option<String>,
     pub font_family: String,
+    /// Ordered preferred fallback families. Con's bundled icon font and the
+    /// platform/system cascade are appended after this list.
+    pub font_fallback: Vec<String>,
     pub font_size: f32,
     pub theme: String,
     pub cursor_style: String,
+    /// Allow terminal programs to copy plain text, matching Ghostty's default.
+    /// This does not grant clipboard read access.
+    pub clipboard_write: bool,
 }
 
 impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
+            shell: None,
             font_family: default_font_family(),
+            font_fallback: Vec::new(),
             font_size: default_font_size(),
             theme: default_theme(),
             cursor_style: default_cursor_style(),
+            clipboard_write: true,
         }
     }
 }
@@ -101,6 +144,8 @@ impl Default for TerminalConfig {
 pub struct AppearanceConfig {
     pub terminal_opacity: f32,
     pub terminal_blur: bool,
+    /// Independent panel/popup opacity. Terminal-adjacent base surfaces follow
+    /// the terminal's effective background-opacity instead.
     pub ui_opacity: f32,
     pub ui_font_family: String,
     pub ui_font_size: f32,
@@ -123,6 +168,15 @@ pub struct AppearanceConfig {
     /// Workspace tab presentation. Vertical is the default; horizontal remains
     /// available for users who prefer a top tab strip.
     pub tabs_orientation: TabsOrientation,
+    /// When `true` (default), closing the last tab closes the window (and
+    /// quits the app on Windows/Linux). When `false`, closing the last tab
+    /// opens a fresh tab instead so the window stays open.
+    pub close_to_quit: bool,
+    /// Selectable app icon id from [`APP_ICONS`]. Unknown values fall back to
+    /// [`DEFAULT_APP_ICON`].
+    pub app_icon: String,
+    /// Avatar shown beside replies from Con's built-in agent.
+    pub agent_avatar: String,
 }
 
 impl Default for AppearanceConfig {
@@ -143,6 +197,9 @@ impl Default for AppearanceConfig {
             restore_terminal_text: default_restore_terminal_text(),
             hide_pane_title_bar: false,
             tabs_orientation: TabsOrientation::Vertical,
+            close_to_quit: true,
+            app_icon: default_app_icon(),
+            agent_avatar: default_agent_avatar(),
         }
     }
 }
@@ -178,7 +235,213 @@ impl AppearanceConfig {
             Self::MAX_TAB_ACCENT_INACTIVE_HOVER_ALPHA,
         )
         .max(self.tab_accent_inactive_alpha);
+        self.app_icon = sanitize_app_icon(&self.app_icon);
+        self.agent_avatar = sanitize_agent_avatar(&self.agent_avatar);
     }
+}
+
+pub const DEFAULT_AGENT_AVATAR: &str = "raccoon";
+pub const DEFAULT_AGENT_AVATAR_ASSET: &str = "con-agent-avatar.png";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentAvatarChoice {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub asset: &'static str,
+}
+
+pub const AGENT_AVATARS: &[AgentAvatarChoice] = &[
+    AgentAvatarChoice {
+        id: DEFAULT_AGENT_AVATAR,
+        label: "Raccoon",
+        asset: DEFAULT_AGENT_AVATAR_ASSET,
+    },
+    AgentAvatarChoice {
+        id: "raccoon-girl",
+        label: "Raccoon Girl",
+        asset: "con-agent-avatar-girl.png",
+    },
+    AgentAvatarChoice {
+        id: "raccoon-girl-longhair",
+        label: "Raccoon Girl II",
+        asset: "con-agent-avatar-girl-longhair.png",
+    },
+];
+
+fn default_agent_avatar() -> String {
+    DEFAULT_AGENT_AVATAR.to_string()
+}
+
+pub fn agent_avatar_by_id(id: &str) -> Option<&'static AgentAvatarChoice> {
+    AGENT_AVATARS.iter().find(|avatar| avatar.id == id)
+}
+
+pub fn sanitize_agent_avatar(id: &str) -> String {
+    let trimmed = id.trim();
+    if agent_avatar_by_id(trimmed).is_some() {
+        trimmed.to_string()
+    } else {
+        DEFAULT_AGENT_AVATAR.to_string()
+    }
+}
+
+pub fn agent_avatar_asset(id: &str) -> &'static str {
+    agent_avatar_by_id(id)
+        .map(|avatar| avatar.asset)
+        .unwrap_or(DEFAULT_AGENT_AVATAR_ASSET)
+}
+
+pub const DEFAULT_APP_ICON: &str = "raccoon-tail-a6";
+pub const DEFAULT_APP_ICON_ASSET: &str = "app-icons/con-raccoon-tail-A6.png";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppIconChoice {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub group: &'static str,
+    pub asset: &'static str,
+}
+
+pub const APP_ICON_GROUPS: &[&str] = &["Classic", "Peek", "Suit", "Tail"];
+
+pub const APP_ICONS: &[AppIconChoice] = &[
+    AppIconChoice {
+        id: "default",
+        label: "Classic",
+        group: "Classic",
+        asset: "Con-macOS-Dark-256x256@2x.png",
+    },
+    AppIconChoice {
+        id: "raccoon-a1",
+        label: "A1",
+        group: "Peek",
+        asset: "app-icons/con-raccoon-A1.png",
+    },
+    AppIconChoice {
+        id: "raccoon-a2",
+        label: "A2",
+        group: "Peek",
+        asset: "app-icons/con-raccoon-A2.png",
+    },
+    AppIconChoice {
+        id: "raccoon-b1",
+        label: "B1",
+        group: "Peek",
+        asset: "app-icons/con-raccoon-B1.png",
+    },
+    AppIconChoice {
+        id: "raccoon-b2",
+        label: "B2",
+        group: "Peek",
+        asset: "app-icons/con-raccoon-B2.png",
+    },
+    AppIconChoice {
+        id: "raccoon-c1",
+        label: "C1",
+        group: "Peek",
+        asset: "app-icons/con-raccoon-C1.png",
+    },
+    AppIconChoice {
+        id: "raccoon-c2",
+        label: "C2",
+        group: "Peek",
+        asset: "app-icons/con-raccoon-C2.png",
+    },
+    AppIconChoice {
+        id: "raccoon-suit-a1",
+        label: "A1",
+        group: "Suit",
+        asset: "app-icons/con-raccoon-suit-A1.png",
+    },
+    AppIconChoice {
+        id: "raccoon-suit-a2",
+        label: "A2",
+        group: "Suit",
+        asset: "app-icons/con-raccoon-suit-A2.png",
+    },
+    AppIconChoice {
+        id: "raccoon-suit-a3",
+        label: "A3",
+        group: "Suit",
+        asset: "app-icons/con-raccoon-suit-A3.png",
+    },
+    AppIconChoice {
+        id: "raccoon-suit-a4",
+        label: "A4",
+        group: "Suit",
+        asset: "app-icons/con-raccoon-suit-A4.png",
+    },
+    AppIconChoice {
+        id: "raccoon-suit-a5",
+        label: "A5",
+        group: "Suit",
+        asset: "app-icons/con-raccoon-suit-A5.png",
+    },
+    AppIconChoice {
+        id: "raccoon-suit-a6",
+        label: "A6",
+        group: "Suit",
+        asset: "app-icons/con-raccoon-suit-A6.png",
+    },
+    AppIconChoice {
+        id: "raccoon-tail-a1",
+        label: "A1",
+        group: "Tail",
+        asset: "app-icons/con-raccoon-tail-A1.png",
+    },
+    AppIconChoice {
+        id: "raccoon-tail-a2",
+        label: "A2",
+        group: "Tail",
+        asset: "app-icons/con-raccoon-tail-A2.png",
+    },
+    AppIconChoice {
+        id: "raccoon-tail-a3",
+        label: "A3",
+        group: "Tail",
+        asset: "app-icons/con-raccoon-tail-A3.png",
+    },
+    AppIconChoice {
+        id: "raccoon-tail-a4",
+        label: "A4",
+        group: "Tail",
+        asset: "app-icons/con-raccoon-tail-A4.png",
+    },
+    AppIconChoice {
+        id: "raccoon-tail-a5",
+        label: "A5",
+        group: "Tail",
+        asset: "app-icons/con-raccoon-tail-A5.png",
+    },
+    AppIconChoice {
+        id: "raccoon-tail-a6",
+        label: "A6",
+        group: "Tail",
+        asset: "app-icons/con-raccoon-tail-A6.png",
+    },
+];
+
+fn default_app_icon() -> String {
+    DEFAULT_APP_ICON.to_string()
+}
+
+pub fn app_icon_by_id(id: &str) -> Option<&'static AppIconChoice> {
+    APP_ICONS.iter().find(|icon| icon.id == id)
+}
+
+pub fn sanitize_app_icon(id: &str) -> String {
+    let trimmed = id.trim();
+    if app_icon_by_id(trimmed).is_some() {
+        trimmed.to_string()
+    } else {
+        DEFAULT_APP_ICON.to_string()
+    }
+}
+
+pub fn app_icon_asset(id: &str) -> &'static str {
+    app_icon_by_id(id)
+        .map(|icon| icon.asset)
+        .unwrap_or(DEFAULT_APP_ICON_ASSET)
 }
 
 // Default keybindings are chosen per platform. On macOS the `secondary-`
@@ -218,6 +481,14 @@ fn default_focus_files() -> String {
 fn default_search_files() -> String {
     // Matches the common editor convention: Cmd/Ctrl+Shift+F.
     "secondary-shift-f".into()
+}
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn default_find_in_terminal() -> String {
+    "secondary-f".into()
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn default_find_in_terminal() -> String {
+    String::new()
 }
 
 #[cfg(target_os = "macos")]
@@ -317,6 +588,20 @@ fn default_focus_input() -> String {
 fn default_focus_input() -> String {
     // Ctrl+I is the Tab character (0x09). Ctrl+Shift+I stays free.
     "ctrl-shift-i".into()
+}
+
+#[cfg(target_os = "macos")]
+fn default_ask_ai() -> String {
+    // Pairs with Cmd+L (toggle agent): Cmd+Shift+L sends the current
+    // terminal selection to the agent input, matching the editor
+    // convention of "add selection to chat".
+    "secondary-shift-l".into()
+}
+#[cfg(not(target_os = "macos"))]
+fn default_ask_ai() -> String {
+    // Ctrl+Shift+L is taken by toggle-agent off macOS; Ctrl+Shift+A
+    // ("Ask") stays free of terminal control characters.
+    "ctrl-shift-a".into()
 }
 
 fn default_toggle_input_bar() -> String {
@@ -442,6 +727,7 @@ pub struct KeybindingConfig {
     pub split_right: String,
     pub split_down: String,
     pub focus_input: String,
+    pub ask_ai: String,
     pub cycle_input_mode: String,
     pub toggle_input_bar: String,
     pub toggle_pane_scope: String,
@@ -449,6 +735,7 @@ pub struct KeybindingConfig {
     pub toggle_left_panel: String,
     pub focus_files: String,
     pub search_files: String,
+    pub find_in_terminal: String,
     pub collapse_sidebar: String,
     pub new_surface: String,
     pub new_surface_split_right: String,
@@ -501,6 +788,7 @@ impl KeybindingConfig {
             ("Toggle Agent", self.toggle_agent.as_str()),
             ("Toggle Input Bar", self.toggle_input_bar.as_str()),
             ("Toggle Input / Terminal", self.focus_input.as_str()),
+            ("Ask AI About Selection", self.ask_ai.as_str()),
             ("Cycle Input Mode", self.cycle_input_mode.as_str()),
             ("Split Right", self.split_right.as_str()),
             ("Split Down", self.split_down.as_str()),
@@ -508,6 +796,8 @@ impl KeybindingConfig {
             ("Toggle Left Sidebar", self.toggle_left_panel.as_str()),
             ("Focus Files", self.focus_files.as_str()),
             ("Search Files", self.search_files.as_str()),
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            ("Find in Terminal", self.find_in_terminal.as_str()),
             ("Collapse/Expand Sidebar", self.collapse_sidebar.as_str()),
             ("New Surface Tab", self.new_surface.as_str()),
             (
@@ -585,12 +875,14 @@ impl Default for KeybindingConfig {
             split_right: default_split_right(),
             split_down: default_split_down(),
             focus_input: default_focus_input(),
+            ask_ai: default_ask_ai(),
             cycle_input_mode: default_cycle_input_mode(),
             toggle_input_bar: default_toggle_input_bar(),
             toggle_pane_scope: default_toggle_pane_scope(),
             toggle_left_panel: default_toggle_left_panel(),
             focus_files: default_focus_files(),
             search_files: default_search_files(),
+            find_in_terminal: default_find_in_terminal(),
             collapse_sidebar: default_collapse_sidebar(),
             new_surface: default_new_surface(),
             new_surface_split_right: default_new_surface_split_right(),
@@ -718,20 +1010,41 @@ impl NetworkConfig {
     /// # Safety
     /// Same as `apply_to_env` — must be called single-threaded.
     unsafe fn apply_one(upper: &str, lower: &str, value: Option<&str>) {
-        if let Some(v) = value {
-            if !v.is_empty() {
-                unsafe {
-                    std::env::set_var(upper, v);
-                    std::env::set_var(lower, v);
-                }
-                log::info!("network: {upper} set from config");
+        if let Some(v) = value
+            && !v.is_empty()
+        {
+            unsafe {
+                std::env::set_var(upper, v);
+                std::env::set_var(lower, v);
             }
+            log::info!("network: {upper} set from config");
         }
         // None or empty string → leave the environment untouched.
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Experimental features guarded by individual switches.
+///
+/// # Example
+/// ```toml
+/// [experimental]
+/// handoff = true
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExperimentalConfig {
+    /// Agent Handoff: hand a running agent session off to another agent tab.
+    /// Ships as an experimental feature; disable to hide all entry points.
+    pub handoff: bool,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self { handoff: true }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub terminal: TerminalConfig,
@@ -740,6 +1053,30 @@ pub struct Config {
     pub keybindings: KeybindingConfig,
     pub skills: SkillsConfig,
     pub network: NetworkConfig,
+    pub experimental: ExperimentalConfig,
+    /// Authored source/provenance used for lossless, collision-safe saves.
+    #[serde(skip)]
+    source: std::sync::Mutex<ghostty::SourceState>,
+}
+
+impl Clone for Config {
+    fn clone(&self) -> Self {
+        Self {
+            terminal: self.terminal.clone(),
+            appearance: self.appearance.clone(),
+            agent: self.agent.clone(),
+            keybindings: self.keybindings.clone(),
+            skills: self.skills.clone(),
+            network: self.network.clone(),
+            experimental: self.experimental.clone(),
+            source: std::sync::Mutex::new(
+                self.source
+                    .lock()
+                    .expect("config source mutex poisoned")
+                    .clone(),
+            ),
+        }
+    }
 }
 
 /// Configuration for skill discovery paths.
@@ -796,16 +1133,9 @@ impl SkillsConfig {
         let home = dirs::home_dir();
         self.global_paths
             .iter()
-            .map(|p| {
-                if p.starts_with("~/") {
-                    if let Some(ref h) = home {
-                        h.join(&p[2..])
-                    } else {
-                        PathBuf::from(p)
-                    }
-                } else {
-                    PathBuf::from(p)
-                }
+            .map(|p| match (p.strip_prefix("~/"), &home) {
+                (Some(rest), Some(home)) => home.join(rest),
+                _ => PathBuf::from(p),
             })
             .collect()
     }
@@ -818,22 +1148,173 @@ impl SkillsConfig {
 
 impl Config {
     pub fn normalize(&mut self) {
+        self.terminal.shell = self
+            .terminal
+            .shell
+            .take()
+            .map(|shell| shell.trim().to_string())
+            .filter(|shell| !shell.is_empty());
+        self.terminal.font_family = sanitize_terminal_font_family(&self.terminal.font_family);
+        self.terminal.font_fallback = sanitize_terminal_font_fallback(
+            &self.terminal.font_fallback,
+            &self.terminal.font_family,
+        );
         self.appearance.normalize();
         self.keybindings.normalize();
     }
 
     pub fn load() -> Result<Self> {
-        let config_path = Self::config_path();
-        if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            let mut config: Config = toml::from_str(&content)?;
-            config.normalize();
-            config.agent.migrate_legacy();
-            Ok(config)
-        } else {
-            let mut config = Config::default();
-            config.normalize();
-            Ok(config)
+        let mut config =
+            Self::load_from_paths(Self::config_path(), con_paths::legacy_config_file())?;
+        config.apply_zero_touch_chatgpt_default();
+        Ok(config)
+    }
+
+    /// Pure load/parse entry point. It never performs credential discovery.
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !config_path_exists(path)? {
+            let config = Self::default();
+            config
+                .source
+                .lock()
+                .expect("config source mutex poisoned")
+                .path = Some(path.to_owned());
+            return Ok(config);
+        }
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read configuration `{}`", path.display()))?;
+        ghostty::parse(&content, Some(path.to_owned()))
+    }
+
+    /// Parse in-memory Ghostty syntax without resolving includes or auth state.
+    pub fn parse_ghostty(source: &str) -> Result<Self> {
+        ghostty::parse(source, None)
+    }
+
+    /// Load the primary file, or migrate an older sibling without modifying it.
+    pub fn load_from_paths(path: impl AsRef<Path>, legacy: impl AsRef<Path>) -> Result<Self> {
+        let (path, legacy) = (path.as_ref(), legacy.as_ref());
+        if config_path_exists(path)? {
+            return Self::load_from_path(path);
+        }
+        let previous = path.with_file_name("config.ghostty");
+        if previous != path && config_path_exists(&previous)? {
+            let content = std::fs::read_to_string(&previous)
+                .with_context(|| format!("cannot read configuration `{}`", previous.display()))?;
+            // The directory does not change, so relative includes and resources
+            // keep their meaning. Preserve comments and native syntax verbatim.
+            ghostty::parse(&content, Some(path.to_owned()))?;
+            write_private_atomic_no_clobber(path, content.as_bytes())?;
+            return Self::load_from_path(path);
+        }
+        if !config_path_exists(legacy)? {
+            return Self::load_from_path(path);
+        }
+        let content = std::fs::read_to_string(legacy)
+            .with_context(|| format!("cannot read configuration `{}`", legacy.display()))?;
+        let document: toml::Value = toml::from_str(&content).map_err(|_| {
+            anyhow::anyhow!("invalid legacy TOML configuration; original file was not modified")
+        })?;
+        let provenance = config_declares_agent_provider_provenance(&document);
+        let mut config: Config = document.try_into().map_err(|_| {
+            anyhow::anyhow!(
+                "invalid legacy configuration value type; original file was not modified"
+            )
+        })?;
+        config.agent.migrate_legacy();
+        migrate_agent_provider_provenance(&mut config, provenance);
+        config.normalize();
+        config
+            .source
+            .lock()
+            .expect("config source mutex poisoned")
+            .path = Some(path.to_owned());
+        let rendered = ghostty::render(&config)?;
+        // Validate the exact generated representation before publishing it.
+        ghostty::parse(&rendered, Some(path.to_owned()))?;
+        write_private_atomic_no_clobber(path, rendered.as_bytes())?;
+        ghostty::parse(&rendered, Some(path.to_owned()))
+    }
+
+    pub fn native_entries(&self) -> Vec<ghostty::NativeEntry> {
+        self.source
+            .lock()
+            .expect("config source mutex poisoned")
+            .native
+            .clone()
+    }
+
+    /// Original native Ghostty text with all `con.*` settings excluded.
+    pub fn native_config_text(&self) -> Result<String> {
+        Ok(ghostty::native_text_from_str(&ghostty::render(self)?))
+    }
+
+    pub fn base_path(&self) -> Option<PathBuf> {
+        self.source
+            .lock()
+            .expect("config source mutex poisoned")
+            .path
+            .clone()
+    }
+
+    /// Explicit keys present in the authored document.
+    pub fn authored_keys(&self) -> Vec<String> {
+        let source = self.source.lock().expect("config source mutex poisoned");
+        source
+            .source
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let (key, _) = line.split_once('=')?;
+                Some(key.trim().to_owned())
+            })
+            .collect()
+    }
+
+    /// Keys whose typed values differ from the last loaded or saved snapshot.
+    pub fn changed_keys(&self) -> Result<Vec<String>> {
+        ghostty::changed_keys(self)
+    }
+
+    /// Zero-touch ChatGPT Subscription sign-in applied on every config load.
+    ///
+    /// 1. Sync the ChatGPT OAuth cache from Codex's `~/.codex/auth.json` (cheap
+    ///    and idempotent — a fingerprint check short-circuits when nothing
+    ///    changed), so a user already signed in to Codex never has to do a
+    ///    manual device login.
+    /// 2. Recompute an automatic provider choice from current credentials:
+    ///    configured Anthropic wins; otherwise ChatGPT is used while an API-key
+    ///    override or its OAuth cache is ready. Explicit choices are never
+    ///    changed.
+    ///
+    /// Best-effort: failures are logged, never fatal. Conservative: a user who
+    /// configured Anthropic or picked another provider is never redirected
+    /// (see [`con_agent::preferred_default_provider`]).
+    fn apply_zero_touch_chatgpt_default(&mut self) {
+        match con_agent::ensure_chatgpt_oauth_synced_from_codex() {
+            Ok(true) => log::info!("[config] Synced ChatGPT OAuth cache from Codex"),
+            Ok(false) => {}
+            Err(err) => {
+                log::warn!("[config] Failed to sync ChatGPT OAuth cache from Codex: {err}")
+            }
+        }
+        if let Some(provider) = con_agent::preferred_default_provider(&self.agent) {
+            log::info!(
+                "[config] Recomputed automatic agent provider as {provider} from credential readiness"
+            );
+            self.agent.provider = provider;
+            if !self.agent.provider_is_explicit
+                && let Some(authored) = self
+                    .source
+                    .lock()
+                    .expect("config source mutex poisoned")
+                    .authored
+                    .as_mut()
+            {
+                authored["agent"]["provider"] = serde_json::to_value(&self.agent.provider)
+                    .expect("provider serialization cannot fail");
+            }
         }
     }
 
@@ -842,13 +1323,117 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::config_path();
-        let content = toml::to_string_pretty(self)?;
-        write_private_atomic(&path, content.as_bytes())
+        self.save_to_path(Self::config_path())
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            anyhow::bail!(
+                "TOML configuration is read-only; save as {}",
+                con_paths::CONFIG_FILE_NAME
+            );
+        }
+        let rendered = ghostty::render(self)?;
+        // Validate before touching the user's file.
+        let reparsed = ghostty::parse(&rendered, Some(path.to_owned()))?;
+        {
+            let source = self.source.lock().expect("config source mutex poisoned");
+            if source.path.as_deref() == Some(path) {
+                if path.exists() {
+                    let disk = std::fs::read_to_string(path)?;
+                    if disk != source.source && disk != rendered {
+                        anyhow::bail!("configuration changed on disk; reload before saving");
+                    }
+                } else if !source.source.is_empty() {
+                    anyhow::bail!("configuration was removed on disk; reload before saving");
+                }
+            } else if path.exists() {
+                anyhow::bail!("destination already exists; load it before saving");
+            }
+        }
+        write_private_atomic(path, rendered.as_bytes())?;
+        let new_source = reparsed
+            .source
+            .lock()
+            .expect("config source mutex poisoned")
+            .clone();
+        *self.source.lock().expect("config source mutex poisoned") = new_source;
+        Ok(())
     }
 }
 
-fn write_private_atomic(path: &Path, content: &[u8]) -> Result<()> {
+// A dangling dotfile symlink is an existing configuration, not permission to
+// fall back to defaults or a lower-priority file. Propagate lookup errors too.
+fn config_path_exists(path: &Path) -> std::io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_private_atomic_no_clobber(path: &Path, content: &[u8]) -> Result<()> {
+    if config_path_exists(path)? {
+        anyhow::bail!("configuration appeared during migration");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let tmp = path.with_extension(format!("tmp.{}.{}.migration", std::process::id(), unique));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut f = options.open(&tmp)?;
+        f.write_all(content)?;
+        f.sync_all()?;
+        std::fs::hard_link(&tmp, path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+fn config_declares_agent_provider_provenance(document: &toml::Value) -> bool {
+    document
+        .get("agent")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|agent| agent.contains_key("provider_is_explicit"))
+}
+
+fn migrate_agent_provider_provenance(config: &mut Config, provenance_is_present: bool) {
+    if !provenance_is_present && config.agent.provider != ProviderKind::default() {
+        config.agent.provider_is_explicit = true;
+    }
+}
+
+pub(crate) fn write_private_atomic(path: &Path, content: &[u8]) -> Result<()> {
+    // Preserve dotfile-manager links. Renaming over a symlink would replace the
+    // link itself, silently disconnecting the user's managed configuration.
+    // Resolve only an existing symlink; ordinary paths keep their authored
+    // location and dangling links remain errors.
+    let destination = match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve configuration link `{}`", path.display()))?,
+        Ok(_) => path.to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    let path = destination.as_path();
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -921,9 +1506,216 @@ fn replace_file(tmp_path: &Path, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_TERMINAL_FONT_FAMILY, NetworkConfig, SkillsConfig, TabsOrientation,
-        sanitize_terminal_font_family,
+        AGENT_AVATARS, APP_ICONS, Config, DEFAULT_AGENT_AVATAR, DEFAULT_AGENT_AVATAR_ASSET,
+        DEFAULT_APP_ICON, DEFAULT_APP_ICON_ASSET, DEFAULT_TERMINAL_FONT_FAMILY, NetworkConfig,
+        SkillsConfig, TabsOrientation, agent_avatar_asset, app_icon_asset,
+        config_declares_agent_provider_provenance, migrate_agent_provider_provenance,
+        sanitize_terminal_font_fallback, sanitize_terminal_font_family,
     };
+    use con_agent::ProviderKind;
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_config_links_never_trigger_defaults_or_legacy_fallback() {
+        for name in ["config.ghostty", con_paths::CONFIG_FILE_NAME, "config.toml"] {
+            let root = std::env::temp_dir().join(format!("con-config-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let target = root.join(con_paths::CONFIG_FILE_NAME);
+            let legacy = root.join("config.toml");
+            let link = root.join(name);
+            let dotfile = root.join("dotfile");
+            if name != "config.toml" {
+                std::fs::write(&legacy, "[terminal]\nfont_size = 11\n").unwrap();
+            }
+            std::os::unix::fs::symlink(&dotfile, &link).unwrap();
+            assert!(Config::load_from_paths(&target, &legacy).is_err(), "{name}");
+            assert!(!target.exists(), "must not publish a fallback for {name}");
+            if name == con_paths::CONFIG_FILE_NAME {
+                assert!(Config::load_from_path(&target).is_err());
+            }
+            // Valid dotfile symlinks still load and migrate normally.
+            std::fs::write(
+                &dotfile,
+                if name == "config.toml" {
+                    "[terminal]\nfont_size = 19\n"
+                } else {
+                    "font-size = 19\n"
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                Config::load_from_paths(&target, &legacy)
+                    .unwrap()
+                    .terminal
+                    .font_size,
+                19.0
+            );
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_config_link_preserves_the_link() {
+        let root = std::env::temp_dir().join(format!("con-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let dotfile = root.join("managed.conf");
+        let link = root.join(con_paths::CONFIG_FILE_NAME);
+        std::fs::write(&dotfile, "font-size = 12\n").unwrap();
+        std::os::unix::fs::symlink(&dotfile, &link).unwrap();
+
+        let mut config = Config::load_from_path(&link).unwrap();
+        config.terminal.font_size = 18.0;
+        config.save_to_path(&link).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::read_to_string(&dotfile)
+                .unwrap()
+                .contains("font-size = 18")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_preserves_native_bytes_and_prefers_native_over_toml() {
+        let root = std::env::temp_dir().join(format!("con-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join(con_paths::CONFIG_FILE_NAME);
+        let previous = root.join("config.ghostty");
+        let toml = root.join("config.toml");
+        let source =
+            "# keep comment\nfont-size = 19\nconfig-file = colors.conf\ncon.agent.max_turns = 7\n";
+        std::fs::write(&previous, source).unwrap();
+        std::fs::write(&toml, "[terminal]\nfont_size = 11\n").unwrap();
+        std::fs::write(root.join("colors.conf"), "background = 123456\n").unwrap();
+        let config = Config::load_from_paths(&target, &toml).unwrap();
+        assert_eq!(config.terminal.font_size, 19.0);
+        assert_eq!(config.agent.max_turns, 7);
+        assert_eq!(config.source.lock().unwrap().path.as_ref(), Some(&target));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), source);
+        assert_eq!(std::fs::read_to_string(&previous).unwrap(), source);
+        assert!(
+            config
+                .native_entries()
+                .iter()
+                .any(|entry| entry.key == "config-file" && entry.value == "colors.conf")
+        );
+        std::fs::write(&target, "font-size = 23\n").unwrap();
+        assert_eq!(
+            Config::load_from_paths(&target, &toml)
+                .unwrap()
+                .terminal
+                .font_size,
+            23.0
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_higher_priority_config_never_falls_back() {
+        let root = std::env::temp_dir().join(format!("con-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join(con_paths::CONFIG_FILE_NAME);
+        let previous = root.join("config.ghostty");
+        let toml = root.join("config.toml");
+        std::fs::write(&toml, "[terminal]\nfont_size = 11\n").unwrap();
+        std::fs::write(&previous, "con.agent.max_turns = invalid\n").unwrap();
+        assert!(Config::load_from_paths(&target, &toml).is_err());
+        assert!(!target.exists());
+        std::fs::write(&previous, "font-size = 19\n").unwrap();
+        std::fs::write(&target, "con.agent.max_turns = invalid\n").unwrap();
+        assert!(Config::load_from_paths(&target, &toml).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "con.agent.max_turns = invalid\n"
+        );
+        std::fs::remove_file(&target).unwrap();
+        std::fs::remove_file(&previous).unwrap();
+        assert_eq!(
+            Config::load_from_paths(&target, &toml)
+                .unwrap()
+                .terminal
+                .font_size,
+            11.0
+        );
+        assert!(toml.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clipboard_writes_default_to_allowed_but_preserve_explicit_policy() {
+        assert!(Config::default().terminal.clipboard_write);
+        for source in ["", "[terminal]\nfont_size = 16.0"] {
+            let config: Config = toml::from_str(source).unwrap();
+            assert!(config.terminal.clipboard_write);
+        }
+        for enabled in [false, true] {
+            let source = format!("[terminal]\nclipboard_write = {enabled}");
+            let config: Config = toml::from_str(&source).unwrap();
+            assert_eq!(config.terminal.clipboard_write, enabled);
+            let encoded = toml::to_string(&config).unwrap();
+            let decoded: Config = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.terminal.clipboard_write, enabled);
+        }
+    }
+
+    #[test]
+    fn explicit_agent_provider_choice_round_trips_with_provenance() {
+        let mut config = Config::default();
+        config.agent.select_provider(ProviderKind::Anthropic);
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+
+        assert!(encoded.contains("provider_is_explicit = true"));
+        assert!(decoded.agent.provider_is_explicit);
+    }
+
+    #[test]
+    fn legacy_serialized_default_provider_remains_implicit() {
+        let document: toml::Value = toml::from_str("[agent]\nprovider = \"anthropic\"").unwrap();
+        let provenance_is_present = config_declares_agent_provider_provenance(&document);
+        let mut config: Config = document.try_into().unwrap();
+        migrate_agent_provider_provenance(&mut config, provenance_is_present);
+
+        assert_eq!(config.agent.provider, ProviderKind::Anthropic);
+        assert!(!config.agent.provider_is_explicit);
+    }
+
+    #[test]
+    fn legacy_non_default_provider_is_migrated_as_explicit() {
+        let document: toml::Value = toml::from_str("[agent]\nprovider = \"chatgpt\"").unwrap();
+        let provenance_is_present = config_declares_agent_provider_provenance(&document);
+        let mut config: Config = document.try_into().unwrap();
+        migrate_agent_provider_provenance(&mut config, provenance_is_present);
+
+        assert!(config.agent.provider_is_explicit);
+    }
+
+    #[test]
+    fn serialized_automatic_provider_remains_automatic() {
+        let mut config = Config::default();
+        config.agent.provider = ProviderKind::ChatGPT;
+        let encoded = toml::to_string(&config).unwrap();
+        let document: toml::Value = toml::from_str(&encoded).unwrap();
+        let provenance_is_present = config_declares_agent_provider_provenance(&document);
+        let mut decoded: Config = document.try_into().unwrap();
+        migrate_agent_provider_provenance(&mut decoded, provenance_is_present);
+
+        assert!(encoded.contains("provider_is_explicit = false"));
+        assert!(!decoded.agent.provider_is_explicit);
+    }
 
     #[test]
     fn default_skill_path_uses_shared_app_path_policy() {
@@ -951,6 +1743,80 @@ mod tests {
         assert_eq!(
             sanitize_terminal_font_family("JetBrains Mono"),
             "JetBrains Mono"
+        );
+    }
+
+    #[test]
+    fn terminal_shell_trims_and_empty_values_restore_platform_default() {
+        let mut configured: Config = toml::from_str(
+            r#"
+[terminal]
+shell = "  pwsh.exe -NoLogo  "
+"#,
+        )
+        .unwrap();
+        configured.normalize();
+        assert_eq!(
+            configured.terminal.shell.as_deref(),
+            Some("pwsh.exe -NoLogo")
+        );
+
+        configured.terminal.shell = Some("   ".to_string());
+        configured.normalize();
+        assert!(configured.terminal.shell.is_none());
+    }
+
+    #[test]
+    fn terminal_font_fallback_sanitizer_preserves_order_and_removes_invalid_entries() {
+        let fonts = vec![
+            " Sarasa Mono SC ".to_string(),
+            "jetbrains mono".to_string(),
+            ".SystemUIFont".to_string(),
+            "IoskeleyMono".to_string(),
+            "SARASA MONO SC".to_string(),
+            "Segoe UI Emoji".to_string(),
+        ];
+        assert_eq!(
+            sanitize_terminal_font_fallback(&fonts, "JetBrains Mono"),
+            vec!["Sarasa Mono SC", "Segoe UI Emoji"]
+        );
+    }
+
+    #[test]
+    fn legacy_terminal_config_defaults_to_no_preferred_fallbacks() {
+        let config: Config = toml::from_str(
+            r#"
+[terminal]
+font_family = "JetBrains Mono"
+font_size = 15.0
+"#,
+        )
+        .unwrap();
+        assert!(config.terminal.font_fallback.is_empty());
+    }
+
+    #[test]
+    fn terminal_font_fallback_round_trips_in_order_and_normalizes() {
+        let mut config: Config = toml::from_str(
+            r#"
+[terminal]
+font_family = " JetBrains Mono "
+font_fallback = [" Sarasa Mono SC ", "Segoe UI Emoji", "sarasa mono sc", ".SystemUIFont"]
+"#,
+        )
+        .unwrap();
+        config.normalize();
+        assert_eq!(config.terminal.font_family, "JetBrains Mono");
+        assert_eq!(
+            config.terminal.font_fallback,
+            vec!["Sarasa Mono SC", "Segoe UI Emoji"]
+        );
+
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.terminal.font_fallback,
+            config.terminal.font_fallback
         );
     }
 
@@ -1003,6 +1869,28 @@ restore_terminal_text = false
         let shortcuts = config.keybindings.active_shortcuts();
         assert!(shortcuts.contains(&("Focus Files", expected_focus)));
         assert!(shortcuts.contains(&("Search Files", "secondary-shift-f")));
+    }
+
+    #[test]
+    fn default_keybindings_enable_terminal_find_on_supported_platforms() {
+        let config = Config::default();
+        let shortcuts = config.keybindings.active_shortcuts();
+
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
+            assert_eq!(config.keybindings.find_in_terminal, "secondary-f");
+            assert!(shortcuts.contains(&("Find in Terminal", "secondary-f")));
+        } else {
+            assert!(config.keybindings.find_in_terminal.is_empty());
+            assert!(
+                !shortcuts
+                    .iter()
+                    .any(|(label, _)| *label == "Find in Terminal")
+            );
+        }
     }
 
     #[test]
@@ -1070,6 +1958,18 @@ command_palette = "secondary-shift-p"
 
         assert_eq!(config.keybindings.focus_files, expected_focus);
         assert_eq!(config.keybindings.search_files, "secondary-shift-f");
+        assert_eq!(
+            config.keybindings.find_in_terminal,
+            if cfg!(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            )) {
+                "secondary-f"
+            } else {
+                ""
+            }
+        );
     }
 
     #[test]
@@ -1142,6 +2042,123 @@ tabs_orientation = "horizontal"
             config.appearance.tabs_orientation,
             TabsOrientation::Horizontal
         );
+    }
+
+    #[test]
+    fn close_to_quit_defaults_to_true() {
+        let config = Config::default();
+        assert!(config.appearance.close_to_quit);
+    }
+
+    #[test]
+    fn omitted_close_to_quit_defaults_to_true() {
+        let content = r#"
+[appearance]
+terminal_opacity = 0.8
+"#;
+        let config: Config = toml::from_str(content).unwrap();
+        assert!(config.appearance.close_to_quit);
+    }
+
+    #[test]
+    fn close_to_quit_is_preserved_when_set_false() {
+        let content = r#"
+[appearance]
+close_to_quit = false
+"#;
+        let config: Config = toml::from_str(content).unwrap();
+        assert!(!config.appearance.close_to_quit);
+
+        // Round-trip through serialization.
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("close_to_quit = false"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(!reparsed.appearance.close_to_quit);
+    }
+
+    #[test]
+    fn new_configs_use_tail_a6_app_icon_by_default() {
+        assert_eq!(Config::default().appearance.app_icon, DEFAULT_APP_ICON);
+        assert_eq!(DEFAULT_APP_ICON, "raccoon-tail-a6");
+    }
+
+    #[test]
+    fn loaded_legacy_configs_inherit_tail_a6_app_icon_default() {
+        let content = r#"
+[appearance]
+terminal_opacity = 0.8
+"#;
+        let mut config: Config = toml::from_str(content).unwrap();
+        config.normalize();
+
+        assert_eq!(config.appearance.app_icon, DEFAULT_APP_ICON);
+    }
+
+    #[test]
+    fn loaded_configs_preserve_explicit_app_icon() {
+        let content = r#"
+[appearance]
+app_icon = "raccoon-suit-a1"
+"#;
+        let mut config: Config = toml::from_str(content).unwrap();
+        config.normalize();
+
+        assert_eq!(config.appearance.app_icon, "raccoon-suit-a1");
+    }
+
+    #[test]
+    fn normalize_falls_back_to_tail_a6_app_icon_for_unknown_ids() {
+        let mut config = Config::default();
+        config.appearance.app_icon = "not-a-real-raccoon".into();
+        config.normalize();
+
+        assert_eq!(config.appearance.app_icon, DEFAULT_APP_ICON);
+    }
+
+    #[test]
+    fn app_icon_catalog_covers_every_choice_asset_path() {
+        assert!(APP_ICONS.iter().any(|icon| icon.id == DEFAULT_APP_ICON));
+        assert_eq!(APP_ICONS.len(), 19);
+        for icon in APP_ICONS {
+            assert!(!icon.asset.is_empty());
+            assert_eq!(app_icon_asset(icon.id), icon.asset);
+        }
+        assert_eq!(app_icon_asset("missing"), DEFAULT_APP_ICON_ASSET);
+    }
+
+    #[test]
+    fn explicit_classic_choice_keeps_its_original_artwork() {
+        let mut config: Config = toml::from_str("[appearance]\napp_icon = \"default\"\n").unwrap();
+        config.normalize();
+        assert_eq!(config.appearance.app_icon, "default");
+        assert_eq!(app_icon_asset("default"), "Con-macOS-Dark-256x256@2x.png");
+        assert_ne!(app_icon_asset("default"), DEFAULT_APP_ICON_ASSET);
+    }
+
+    #[test]
+    fn agent_avatar_defaults_and_unknown_ids_are_safe() {
+        let default = Config::default();
+        assert_eq!(default.appearance.agent_avatar, DEFAULT_AGENT_AVATAR);
+        assert_eq!(
+            agent_avatar_asset(DEFAULT_AGENT_AVATAR),
+            DEFAULT_AGENT_AVATAR_ASSET
+        );
+
+        let mut configured: Config = toml::from_str(
+            r#"
+[appearance]
+agent_avatar = "raccoon-girl"
+"#,
+        )
+        .unwrap();
+        configured.normalize();
+        assert_eq!(configured.appearance.agent_avatar, "raccoon-girl");
+
+        configured.appearance.agent_avatar = "future-avatar".into();
+        configured.normalize();
+        assert_eq!(configured.appearance.agent_avatar, DEFAULT_AGENT_AVATAR);
+        assert_eq!(agent_avatar_asset("missing"), DEFAULT_AGENT_AVATAR_ASSET);
+        assert_eq!(AGENT_AVATARS.len(), 3);
     }
 
     #[test]

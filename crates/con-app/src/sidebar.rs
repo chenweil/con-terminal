@@ -5,7 +5,7 @@
 //!
 //! Visual rules
 //! ---
-//! - Active row: elevated pill bg + foreground text. **No accent
+//! - Active row: low-opacity selection fill + foreground text. **No accent
 //!   bar.** A single, unambiguous selection cue is enough; tab accent
 //!   colors render as the row surface itself at active/inactive alpha.
 //! - Action affordances (rename pencil, close X) are hover-only on
@@ -15,21 +15,23 @@
 //!   blended into background at small intensities), not borders.
 
 use crate::activity_bar::ActivitySlot;
-use crate::motion::MotionValue;
+use crate::motion::SidebarMotion;
+use crate::ui_scale::{ui_icon_px, ui_px};
+use con_core::terminal_status::Status;
 use gpui::{
     AnyElement, App, Bounds, Context, Div, Entity, EventEmitter, FontWeight, Hsla,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
     Render, SharedString, Size, Stateful, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    div, point, prelude::*, px, svg,
+    anchored, div, point, prelude::*, px, svg,
 };
 use gpui_component::{
     ActiveTheme, ElementExt, InteractiveElementExt, Sizable,
     input::{Escape as InputEscape, Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenu},
+    tooltip::Tooltip,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
 
 /// Width of the always-visible icon rail in collapsed mode.
 pub const RAIL_WIDTH: f32 = 44.0;
@@ -43,20 +45,24 @@ pub const PANEL_MAX_WIDTH: f32 = 360.0;
 #[allow(dead_code)]
 const HOVER_CARD_WIDTH: f32 = 240.0;
 /// Per-row height in pinned mode (two-line layout — name + subtitle).
-const ROW_HEIGHT: f32 = 44.0;
-/// Per-icon size in the rail.
-const RAIL_ICON_SIZE: f32 = 32.0;
+const ROW_HEIGHT: f32 = 40.0;
+/// Square session tile size, leaving 2px on each side of the rail.
+const RAIL_ICON_SIZE: f32 = RAIL_WIDTH - 4.0;
+/// Selection is inset from the hit target; dragging still uses the full tile.
+const RAIL_SELECTION_SIZE: f32 = 32.0;
 /// Vertical gap between rail icons. Used to compute the icon's
 /// y-center for hover-card anchoring.
 const RAIL_ICON_GAP: f32 = 2.0;
-const RAIL_TOP_CONTROLS_HEIGHT: f32 =
-    28.0 + RAIL_ICON_GAP + 28.0 + RAIL_ICON_GAP + 5.0 + RAIL_ICON_GAP;
-
-/// Cubic ease-out feel for the panel width animation.
-#[cfg(not(target_os = "macos"))]
-const PANEL_TWEEN: Duration = Duration::from_millis(220);
-#[cfg(target_os = "macos")]
-const PANEL_TWEEN: Duration = Duration::ZERO;
+const RAIL_BUTTON_SIZE: f32 = 28.0;
+const RAIL_DIVIDER_HEIGHT: f32 = 5.0;
+const RAIL_SESSIONS_GAP: f32 = 12.0;
+const RAIL_TOP_CONTROL_COUNT: f32 = 4.0;
+const RAIL_TOP_DIVIDER_COUNT: f32 = 2.0;
+const RAIL_TOP_GAP_COUNT_BEFORE_SESSIONS: f32 = 7.0;
+const RAIL_TOP_CONTROLS_HEIGHT: f32 = RAIL_BUTTON_SIZE * RAIL_TOP_CONTROL_COUNT
+    + RAIL_DIVIDER_HEIGHT * RAIL_TOP_DIVIDER_COUNT
+    + RAIL_ICON_GAP * RAIL_TOP_GAP_COUNT_BEFORE_SESSIONS
+    + RAIL_SESSIONS_GAP;
 
 /// One row in the tab sidebar panel.
 pub struct SessionEntry {
@@ -65,6 +71,11 @@ pub struct SessionEntry {
     pub subtitle: Option<String>,
     pub is_ssh: bool,
     pub needs_attention: bool,
+    pub status: Option<Status>,
+    /// Plain text for the program-status record that owns `status`.
+    /// Empty when the indicator comes from a heuristic.
+    pub status_detail: Option<String>,
+    pub terminal_titles: Vec<String>,
     pub icon: &'static str,
     pub has_user_label: bool,
     /// How many panes the tab contains (split count). Surfaced in
@@ -198,13 +209,14 @@ impl Render for DraggedTab {
             .px(px(8.0))
             .rounded(px(4.0))
             .bg(theme.title_bar.opacity(0.92))
-            .text_color(theme.foreground.opacity(0.82))
+            .text_color(theme.foreground)
             .text_size(px(12.0))
             .font_family(theme.font_family.clone())
             .child(
                 svg()
                     .path(self.icon)
-                    .size(px(12.0))
+                    .size(ui_icon_px(theme, 12.0))
+                    .flex_shrink_0()
                     .text_color(theme.foreground),
             )
             .child(div().truncate().child(self.label.clone()))
@@ -215,10 +227,11 @@ impl Render for DraggedTab {
 pub struct SessionSidebar {
     mode: PanelMode,
     sessions: Vec<SessionEntry>,
+    activity_layer: Option<Entity<crate::tab_activity::TabActivity>>,
     active_session: usize,
     leading_top_pad: f32,
     /// Smooth width animation between rail (0.0) and pinned (1.0).
-    width_motion: MotionValue,
+    width_motion: SidebarMotion,
     /// User-resized width of the pinned panel. Collapsed mode ignores
     /// this and stays at the fixed rail width.
     panel_width: f32,
@@ -252,9 +265,7 @@ pub struct SessionSidebar {
     tab_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     /// Workspace-independent visible preview for tab sidebar drags.
     drag_preview: Rc<RefCell<Option<SidebarDragPreviewState>>>,
-    /// Effective UI opacity from the workspace appearance settings.
-    /// Lower values let the window/terminal backdrop treatment show
-    /// through, matching the rest of con's chrome.
+    /// Independent opacity for selection surfaces and floating cards.
     ui_opacity: f32,
     /// True while the workspace is showing Files/Search beside the
     /// vertical tabs. The sidebar then becomes the single icon rail so
@@ -336,6 +347,7 @@ impl SessionSidebar {
         Self {
             mode: PanelMode::Collapsed,
             sessions: Vec::new(),
+            activity_layer: None,
             active_session: 0,
             // The workspace top bar already reserves the macOS
             // traffic-light/titlebar area before the sidebar is
@@ -343,7 +355,7 @@ impl SessionSidebar {
             // platform titlebar inset creates a dead band above the
             // tab-sidebar controls.
             leading_top_pad: 6.0,
-            width_motion: MotionValue::new(0.0),
+            width_motion: SidebarMotion::new(0.0),
             panel_width: PANEL_WIDTH,
             effective_panel_max_width: PANEL_MAX_WIDTH,
             rename: None,
@@ -407,7 +419,7 @@ impl SessionSidebar {
             self.cancel_rename(cx);
             self.hovered_rail = None;
             let target = if pinned { 1.0 } else { 0.0 };
-            self.width_motion.set_target(target, PANEL_TWEEN);
+            self.width_motion.set_target(target);
             cx.notify();
         } else if had_rail_only_override {
             cx.notify();
@@ -423,13 +435,15 @@ impl SessionSidebar {
     }
 
     pub fn rendered_width(&self) -> f32 {
-        if self.renders_rail_only() {
+        if self.tools_panel_open || self.rail_only_override {
             return RAIL_WIDTH;
         }
-        match self.mode {
-            PanelMode::Collapsed => RAIL_WIDTH,
-            PanelMode::Pinned => self.effective_panel_width(),
-        }
+        RAIL_WIDTH + (self.effective_panel_width() - RAIL_WIDTH) * self.width_motion.current()
+    }
+
+    pub fn advance_width_motion(&mut self, window: &mut Window, cx: &App) -> bool {
+        self.width_motion.value(window, cx);
+        self.width_motion.is_animating()
     }
 
     pub fn set_tools_panel_open(&mut self, open: bool, active_slot: ActivitySlot) {
@@ -441,6 +455,14 @@ impl SessionSidebar {
             }
         }
         self.active_tool_slot = active_slot;
+    }
+
+    /// Clear lingering rail hover state. Called by the workspace when the
+    /// rail leaves the layout (panel hidden / vertical tabs off) — an
+    /// unmounted rail cannot deliver the hover-leave event, so without this
+    /// the hover card could persist or reappear once the rail is restored.
+    pub fn clear_hovered_rail(&mut self) {
+        self.hovered_rail = None;
     }
 
     pub fn show_rail_only_preserving_pinned(&mut self, cx: &mut Context<Self>) {
@@ -535,9 +557,7 @@ impl SessionSidebar {
         // the sidebar (drop_slot is Some). If the pane is being dragged but
         // the cursor is outside the sidebar, the workspace pane floating
         // preview should be the only visible preview.
-        if self.drop_slot.is_none() {
-            return None;
-        }
+        self.drop_slot?;
         // For pane-origin drags, the workspace floating preview already follows
         // the cursor. The sidebar only needs to show the drop indicator line —
         // no extra overlay here.
@@ -570,11 +590,11 @@ impl SessionSidebar {
                 .bg(theme.title_bar.opacity(0.92))
                 .font_family(theme.font_family.clone())
                 .text_size(px(12.0))
-                .text_color(theme.foreground.opacity(0.82))
+                .text_color(theme.foreground)
                 .child(
                     svg()
                         .path(preview.icon)
-                        .size(px(12.0))
+                        .size(ui_icon_px(theme, 12.0))
                         .flex_shrink_0()
                         .text_color(theme.foreground),
                 )
@@ -616,6 +636,11 @@ impl SessionSidebar {
         self.set_pinned(now_pinned, cx);
     }
 
+    /// Retained metadata also used by the horizontal tab strip.
+    pub(crate) fn session(&self, index: usize) -> Option<&SessionEntry> {
+        self.sessions.get(index)
+    }
+
     /// Update the session list from workspace state.
     pub fn sync_sessions(
         &mut self,
@@ -623,10 +648,10 @@ impl SessionSidebar {
         active: usize,
         cx: &mut Context<Self>,
     ) {
-        if let Some(state) = &self.rename {
-            if state.index >= sessions.len() || sessions[state.index].id != state.session_id {
-                self.rename = None;
-            }
+        if let Some(state) = &self.rename
+            && (state.index >= sessions.len() || sessions[state.index].id != state.session_id)
+        {
+            self.rename = None;
         }
         self.sessions = sessions;
         self.active_session = active;
@@ -726,7 +751,6 @@ impl SessionSidebar {
     #[allow(dead_code)]
     fn render_rail(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
-        let rail_bg = sidebar_surface(theme, self.ui_opacity, 0.035);
         let session_count = self.sessions.len();
         let mode_icon = if self.tools_panel_open || (self.is_pinned() && !self.rail_only_override) {
             "phosphor/caret-line-left.svg"
@@ -735,9 +759,9 @@ impl SessionSidebar {
         };
         let mode_color = if self.tools_panel_open || (self.is_pinned() && !self.rail_only_override)
         {
-            theme.foreground.opacity(0.74)
+            theme.foreground
         } else {
-            theme.muted_foreground.opacity(0.78)
+            theme.muted_foreground
         };
         let files_color = if self.tools_panel_open && self.active_tool_slot == ActivitySlot::Files {
             theme.primary
@@ -750,8 +774,13 @@ impl SessionSidebar {
         } else {
             theme.muted_foreground
         };
-        self.tab_bounds.borrow_mut().clear();
-        let mut rail = div()
+        // The expanded list owns tab navigation and drag bounds. Keep the
+        // rail's session tiles only when that list is not visible.
+        let show_session_tiles = self.renders_rail_only();
+        if show_session_tiles {
+            self.tab_bounds.borrow_mut().clear();
+        }
+        let rail = div()
             .id("tab-sidebar-rail")
             .relative()
             .w(px(RAIL_WIDTH))
@@ -763,7 +792,7 @@ impl SessionSidebar {
             .pt(px(self.leading_top_pad))
             .pb(px(8.0))
             .gap(px(RAIL_ICON_GAP))
-            .bg(rail_bg)
+            // The workspace paints the terminal-matched sidebar base once.
             // Mouse-leave on the rail container clears the hover card
             // even when the cursor exits via a fast diagonal motion
             // that may skip the per-icon hover transitions.
@@ -780,6 +809,9 @@ impl SessionSidebar {
             // is squarely on a pill; this fallback covers the gaps.
             .on_drag_move::<DraggedTab>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<DraggedTab>, _, cx| {
+                    if !show_session_tiles {
+                        return;
+                    }
                     if !matches!(
                         event.drag(cx).origin,
                         DraggedTabOrigin::Sidebar | DraggedTabOrigin::Pane
@@ -841,6 +873,9 @@ impl SessionSidebar {
             // user has to land the cursor precisely on a 32×32 pill
             // to reorder, which is unforgiving on a 44-px rail.
             .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                if !show_session_tiles {
+                    return;
+                }
                 if !matches!(
                     dragged.origin,
                     DraggedTabOrigin::Sidebar | DraggedTabOrigin::Pane
@@ -917,13 +952,7 @@ impl SessionSidebar {
                     }
                 }),
             ))
-            .child(
-                div()
-                    .h(px(1.0))
-                    .w(px(20.0))
-                    .my(px(2.0))
-                    .bg(theme.muted_foreground.opacity(0.18)),
-            )
+            .child(div().h(px(1.0)).w(px(20.0)).my(px(2.0)))
             .child(rail_icon_button(
                 "tab-sidebar-rail-files",
                 "phosphor/folders.svg",
@@ -937,7 +966,7 @@ impl SessionSidebar {
             ))
             .child(rail_icon_button(
                 "tab-sidebar-rail-search",
-                "phosphor/file-magnifying-glass.svg",
+                "phosphor/magnifying-glass.svg",
                 search_color,
                 theme,
                 cx.listener(|_, _, _, cx| {
@@ -946,25 +975,42 @@ impl SessionSidebar {
                     })
                 }),
             ))
-            .child(
-                div()
-                    .h(px(1.0))
-                    .w(px(20.0))
-                    .my(px(2.0))
-                    .bg(theme.muted_foreground.opacity(0.18)),
-            )
+            .child(div().h(px(1.0)).w(px(20.0)).my(px(2.0)))
             .child(rail_icon_button(
                 "tab-sidebar-rail-new",
                 "phosphor/plus.svg",
                 theme.muted_foreground,
                 theme,
                 cx.listener(|_, _, _, cx| cx.emit(NewSession)),
-            ));
+            ))
+            .child(div().h(px(RAIL_SESSIONS_GAP)).flex_shrink_0());
+
+        if !show_session_tiles {
+            return rail;
+        }
+
+        // Session pill list — the only vertically scrollable region of
+        // the rail. The control buttons and dividers above stay fixed:
+        // when the window is short or there are many sessions, this area
+        // absorbs the vertical deficit (flex_1 + min_h_0) and scrolls
+        // instead of compressing the square session tiles.
+        let mut pill_list = div()
+            .id("tab-sidebar-rail-scroll")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(RAIL_ICON_GAP))
+            .overflow_y_scroll();
 
         for (i, session) in self.sessions.iter().enumerate() {
             let is_active = i == self.active_session;
-            let active_bg = elevated_surface(theme, self.ui_opacity);
-            let hover_bg = sidebar_surface(theme, self.ui_opacity, 0.075);
+            // Selection must read without the accent stripe. Overlay the shared
+            // base rather than making the same background more opaque.
+            let active_bg = sidebar_selection_fill(theme);
+            let hover_bg = theme.foreground.opacity(0.04);
             // Drop indicator — a 2px primary-color line above this
             // pill if drop_slot == i, or below the last pill if
             // drop_slot == N. Both states share the same indicator
@@ -984,31 +1030,59 @@ impl SessionSidebar {
             };
 
             let tab_bounds = self.tab_bounds.clone();
-            // No accent-color background fill — keep pills monochrome.
-            // Accent color is expressed only via the active dot below.
-            let pill_bg = if is_active {
+            // One selection cue, matching the expanded list. Custom tab
+            // colors stay visible as fills rather than external stripes.
+            let pill_bg = if let Some(color) = session.color {
+                crate::tab_colors::tab_accent_surface_hsla(
+                    color,
+                    if is_active {
+                        crate::tab_colors::TAB_ACCENT_ACTIVE_ALPHA
+                    } else {
+                        self.tab_accent_inactive_alpha
+                    },
+                    cx,
+                )
+            } else if is_active {
                 active_bg
             } else {
                 gpui::transparent_black()
             };
-            let inactive_hover_bg = hover_bg;
+            let inactive_hover_bg = session.color.map_or(hover_bg, |color| {
+                crate::tab_colors::tab_accent_surface_hsla(
+                    color,
+                    self.tab_accent_inactive_hover_alpha,
+                    cx,
+                )
+            });
             let mut pill = div()
                 .id(SharedString::from(format!("rail-tab-{i}")))
+                .debug_selector(|| "sidebar-session-tile".into())
                 .relative()
                 .flex()
                 .items_center()
                 .justify_center()
                 .size(px(RAIL_ICON_SIZE))
-                .rounded(px(8.0))
+                .flex_shrink_0()
                 .cursor_pointer()
-                .bg(pill_bg)
-                .hover(move |s| {
-                    if is_active {
-                        s
-                    } else {
-                        s.bg(inactive_hover_bg)
-                    }
-                })
+                .group(SharedString::from(format!("rail-tab-group-{i}")))
+                .child(
+                    div()
+                        .debug_selector(|| "sidebar-session-selection".into())
+                        .absolute()
+                        .size(px(RAIL_SELECTION_SIZE))
+                        .rounded(px(7.0))
+                        .bg(pill_bg)
+                        .group_hover(
+                            SharedString::from(format!("rail-tab-group-{i}")),
+                            move |s| {
+                                if is_active {
+                                    s
+                                } else {
+                                    s.bg(inactive_hover_bg)
+                                }
+                            },
+                        ),
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |_this, _, _, cx| cx.emit(SidebarSelect { index: i })),
@@ -1036,18 +1110,31 @@ impl SessionSidebar {
                 .on_prepaint(move |bounds, _, _| {
                     tab_bounds.borrow_mut().push(bounds);
                 })
-                .child(
-                    svg()
-                        .path(session.icon)
-                        .size(px(16.0))
-                        .text_color(if is_active {
-                            theme.foreground
-                        } else {
-                            theme.muted_foreground.opacity(0.78)
-                        }),
-                );
+                .child(self.activity_layer.as_ref().unwrap().read(cx).icon(
+                    sidebar_tab_icon(session.icon),
+                    ui_icon_px(theme, 18.0),
+                    if is_active {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    },
+                    session.status,
+                    theme,
+                    true,
+                ));
 
-            if session.needs_attention && !is_active {
+            if session.needs_attention
+                && !is_active
+                && !session.status.is_some_and(|status| {
+                    matches!(
+                        status.activity,
+                        con_core::terminal_status::Activity::Error
+                            | con_core::terminal_status::Activity::NeedsInput
+                            | con_core::terminal_status::Activity::Paused
+                            | con_core::terminal_status::Activity::Done
+                    )
+                })
+            {
                 pill = pill.child(
                     div()
                         .absolute()
@@ -1058,22 +1145,6 @@ impl SessionSidebar {
                         .bg(theme.primary),
                 );
             }
-            if is_active {
-                let dot_color = if let Some(color) = session.color {
-                    crate::tab_colors::tab_accent_color_hsla(color, cx)
-                } else {
-                    crate::tab_colors::active_tab_indicator_color()
-                };
-                pill = pill.child(
-                    div()
-                        .absolute()
-                        .bottom(px(3.0))
-                        .right(px(3.0))
-                        .size(px(6.0))
-                        .rounded_full()
-                        .bg(dot_color),
-                );
-            }
             if show_indicator_above {
                 pill = pill.child(rail_drop_indicator(theme, true));
             }
@@ -1081,10 +1152,10 @@ impl SessionSidebar {
                 pill = pill.child(rail_drop_indicator(theme, false));
             }
 
-            rail = rail.child(pill);
+            pill_list = pill_list.child(pill);
         }
 
-        rail.child(div().flex_1())
+        rail.child(pill_list)
     }
 
     /// Floating hover card shown next to the hovered rail icon.
@@ -1097,7 +1168,10 @@ impl SessionSidebar {
     /// computing the rail layout from this side, which is brittle —
     /// the cursor IS the icon, and "follow the cursor" is the
     /// established Apple tooltip pattern (Finder, Mail, Safari).
-    #[allow(dead_code)]
+    ///
+    /// Composed by the workspace as a root overlay (window coordinates)
+    /// so it paints above the terminal and is not clipped by the
+    /// sidebar's overflow-hidden container.
     pub fn render_hover_card_overlay(
         &mut self,
         window: &mut Window,
@@ -1113,56 +1187,100 @@ impl SessionSidebar {
         let session = self.sessions.get(i)?;
         let theme = cx.theme();
         let bg = elevated_surface(theme, self.ui_opacity);
-        let edge = sidebar_surface(theme, self.ui_opacity, 0.10);
-
-        // Anchor the card vertically on the cursor — its row IS the
-        // icon under the cursor by construction.
         let cursor = window.mouse_position();
-        let card_height = if session.subtitle.is_some() {
-            64.0
-        } else {
-            44.0
-        };
         let min_top = self.leading_top_pad + RAIL_TOP_CONTROLS_HEIGHT + 8.0;
-        let top = (f32::from(cursor.y) - card_height / 2.0).max(min_top);
+        let max_height = (window.viewport_size().height.as_f32() - min_top - 8.0).clamp(1.0, 240.0);
 
         let name_color = theme.foreground;
-        let sub_color = theme.muted_foreground.opacity(0.65);
-        let meta_color = theme.muted_foreground.opacity(0.50);
+        let sub_color = theme.muted_foreground;
+        let meta_color = theme.muted_foreground;
         let mono_font = theme.mono_font_family.clone();
         let sys_font = theme.font_family.clone();
 
-        let mut card_inner = div().px(px(12.0)).py(px(8.0)).child(
-            div()
-                .text_size(px(12.5))
-                .line_height(px(16.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(name_color)
-                .font_family(sys_font)
-                .truncate()
-                .child(session.name.clone()),
-        );
+        let mut card_inner = div()
+            .flex()
+            .flex_col()
+            .px(px(12.0))
+            .py(px(12.0))
+            .font_family(sys_font)
+            .child(
+                div()
+                    .debug_selector(|| "tab-hover-name".into())
+                    .flex_shrink_0()
+                    .text_size(ui_px(theme, 13.0))
+                    .line_height(ui_px(theme, 18.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(name_color)
+                    .truncate()
+                    .child(session.name.clone()),
+            );
 
         if let Some(sub) = session.subtitle.as_ref() {
             card_inner = card_inner.child(
                 div()
-                    .mt(px(2.0))
-                    .text_size(px(11.0))
-                    .line_height(px(14.0))
+                    .debug_selector(|| "tab-hover-path".into())
+                    .flex_shrink_0()
+                    .mt(px(4.0))
+                    .text_size(ui_px(theme, 11.0))
+                    .line_height(ui_px(theme, 16.0))
                     .text_color(sub_color)
                     .font_family(mono_font)
-                    .truncate()
+                    .w_full()
                     .child(sub.clone()),
             );
         }
 
+        // A single pane already has one identity and working directory.
+        // Extra terminal titles help distinguish panes only in a split tab.
+        let terminal_titles: Vec<_> = session
+            .terminal_titles
+            .iter()
+            .filter(|title| {
+                session.pane_count > 1
+                    && *title != &session.name
+                    && Some(title.as_str()) != session.subtitle.as_deref()
+            })
+            .collect();
+        if !terminal_titles.is_empty() {
+            let mut titles = div().flex().flex_col().flex_shrink_0().mt(px(8.0));
+            for title in terminal_titles {
+                titles = titles.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(ui_px(theme, 11.0))
+                        .line_height(ui_px(theme, 16.0))
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .child(title.clone()),
+                );
+            }
+            card_inner = card_inner.child(titles);
+        }
+
+        if let Some(detail) = session.status_detail.as_ref() {
+            card_inner = card_inner.child(
+                div()
+                    .debug_selector(|| "tab-hover-status".into())
+                    .flex_shrink_0()
+                    .mt(px(8.0))
+                    .text_size(ui_px(theme, 11.0))
+                    .line_height(ui_px(theme, 16.0))
+                    .text_color(theme.foreground)
+                    .w_full()
+                    .child(detail.clone()),
+            );
+        }
+
         let mut meta = div()
-            .mt(px(if session.subtitle.is_some() { 4.0 } else { 2.0 }))
+            .debug_selector(|| "tab-hover-meta".into())
+            .flex_shrink_0()
+            .mt(px(8.0))
             .flex()
             .items_center()
             .gap(px(8.0))
-            .text_size(px(10.5))
-            .line_height(px(13.0))
+            .text_size(ui_px(theme, 11.0))
+            .line_height(ui_px(theme, 14.0))
             .text_color(meta_color);
 
         let pane_label = match session.pane_count {
@@ -1188,26 +1306,32 @@ impl SessionSidebar {
 
         let card = div()
             .id("tab-sidebar-hover-card")
-            .absolute()
-            .top(px(top))
-            .left(px(RAIL_WIDTH + 6.0))
-            .w(px(HOVER_CARD_WIDTH))
+            .debug_selector(|| "tab-hover-card".into())
+            .w(px(HOVER_CARD_WIDTH.min(
+                (window.viewport_size().width.as_f32() - RAIL_WIDTH - 14.0).max(1.0),
+            )))
             .rounded(px(8.0))
             .bg(bg)
             .occlude()
-            .child(card_inner)
             .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(px(-3.0))
-                    .h_full()
-                    .w(px(3.0))
-                    .rounded(px(2.0))
-                    .bg(edge),
+                card_inner
+                    .id("tab-title-details")
+                    .max_h(px(max_height))
+                    .overflow_y_scroll(),
             );
 
-        Some(card.into_any_element())
+        // Let GPUI fit the measured card, including wrapped paths, instead
+        // of estimating its height from character counts or line counts.
+        Some(
+            anchored()
+                .position(point(
+                    px(RAIL_WIDTH + 6.0),
+                    (cursor.y - ui_px(theme, 21.0)).max(px(min_top)),
+                ))
+                .snap_to_window_with_margin(px(8.0))
+                .child(card)
+                .into_any_element(),
+        )
     }
 
     fn render_panel_body(
@@ -1216,13 +1340,11 @@ impl SessionSidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let body_bg;
         let header_color;
         let header_font;
         {
             let theme = cx.theme();
-            body_bg = sidebar_surface(theme, self.ui_opacity, 0.045);
-            header_color = theme.muted_foreground.opacity(0.55);
+            header_color = theme.muted_foreground;
             header_font = theme.font_family.clone();
         }
 
@@ -1238,10 +1360,10 @@ impl SessionSidebar {
                     .items_center()
                     .justify_between()
                     .h(px(34.0))
-                    .px(px(12.0))
+                    .px(px(16.0))
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(crate::ui_scale::ui_px(cx.theme(), 10.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(header_color)
                             .font_family(header_font)
@@ -1267,9 +1389,9 @@ impl SessionSidebar {
             .flex_col()
             .flex_1()
             .min_h_0()
-            .px(px(6.0))
+            .px(px(8.0))
             .pt(px(2.0))
-            .gap(px(2.0))
+            .gap(px(4.0))
             // Body-level drag_move ONLY runs the "below last row"
             // detection — the per-row handlers handle every cursor
             // position that's actually over a row. We fire the
@@ -1397,6 +1519,9 @@ impl SessionSidebar {
                 subtitle: self.sessions[i].subtitle.clone(),
                 is_ssh: self.sessions[i].is_ssh,
                 needs_attention: self.sessions[i].needs_attention,
+                status: self.sessions[i].status,
+                status_detail: self.sessions[i].status_detail.clone(),
+                terminal_titles: self.sessions[i].terminal_titles.clone(),
                 icon: self.sessions[i].icon,
                 has_user_label: self.sessions[i].has_user_label,
                 pane_count: self.sessions[i].pane_count,
@@ -1422,7 +1547,6 @@ impl SessionSidebar {
             .h_full()
             .w_full()
             .flex_shrink_0()
-            .bg(body_bg)
             .child(header)
             .child(list)
     }
@@ -1452,7 +1576,7 @@ impl SessionSidebar {
         let drop_above = drop_slot == Some(i) && drag_in_sidebar;
         let drop_below = i + 1 == total && drop_slot == Some(total) && drag_in_sidebar;
 
-        let row_h = ROW_HEIGHT;
+        let row_h = ui_px(theme, ROW_HEIGHT).max(px(40.0)).as_f32();
 
         let label_block: AnyElement = if is_renaming {
             if let Some(input) = rename_input {
@@ -1469,15 +1593,11 @@ impl SessionSidebar {
             }
         } else {
             let name = session.name.clone();
-            let subtitle = session.subtitle.clone();
+            let subtitle = session.subtitle.as_deref().map(sidebar_directory_name);
             let mono = theme.mono_font_family.clone();
             let sys = theme.font_family.clone();
-            let fg = if is_active {
-                theme.foreground
-            } else {
-                theme.muted_foreground.opacity(0.92)
-            };
-            let sub_fg = theme.muted_foreground.opacity(0.55);
+            let fg = theme.foreground;
+            let sub_fg = theme.muted_foreground;
             let mut block = div()
                 .flex()
                 .flex_col()
@@ -1488,8 +1608,9 @@ impl SessionSidebar {
                     div()
                         .overflow_hidden()
                         .truncate()
-                        .text_size(px(12.5))
-                        .line_height(px(16.0))
+                        .debug_selector(|| "sidebar-session-name".into())
+                        .text_size(ui_px(theme, 12.5))
+                        .line_height(ui_px(theme, 16.0))
                         .font_family(sys)
                         .text_color(fg)
                         .when(is_active, |s| s.font_weight(FontWeight::MEDIUM))
@@ -1500,11 +1621,12 @@ impl SessionSidebar {
                     div()
                         .overflow_hidden()
                         .truncate()
-                        .text_size(px(10.5))
-                        .line_height(px(14.0))
+                        .debug_selector(|| "sidebar-session-directory".into())
+                        .text_size(ui_px(theme, 10.5))
+                        .line_height(ui_px(theme, 14.0))
                         .font_family(mono)
                         .text_color(sub_fg)
-                        .child(sub),
+                        .child(sub.to_owned()),
                 );
             }
             block.into_any_element()
@@ -1567,7 +1689,7 @@ impl SessionSidebar {
                         cx,
                     )
                 })
-                .unwrap_or_else(|| elevated_surface(theme, self.ui_opacity))
+                .unwrap_or_else(|| sidebar_selection_fill(theme))
         } else {
             accent_color
                 .map(|color| {
@@ -1579,7 +1701,7 @@ impl SessionSidebar {
                 })
                 .unwrap_or(gpui::transparent_black())
         };
-        let hover_bg = sidebar_surface(theme, self.ui_opacity, 0.075);
+        let hover_bg = theme.foreground.opacity(0.04);
         let inactive_hover_bg = accent_color
             .map(|color| {
                 crate::tab_colors::tab_accent_surface_hsla(
@@ -1600,17 +1722,33 @@ impl SessionSidebar {
         };
         let tab_bounds = self.tab_bounds.clone();
 
+        let icon_size = ui_icon_px(theme, 16.0);
         let mut icon_stack = div().relative().flex_shrink_0().child(
-            svg()
-                .path(session.icon)
-                .size(px(15.0))
-                .text_color(if is_active {
+            self.activity_layer.as_ref().unwrap().read(cx).icon(
+                sidebar_tab_icon(session.icon),
+                icon_size,
+                if is_active {
                     theme.foreground
                 } else {
-                    theme.muted_foreground.opacity(0.78)
-                }),
+                    theme.muted_foreground
+                },
+                session.status,
+                theme,
+                false,
+            ),
         );
-        if session.needs_attention && !is_active {
+        if session.needs_attention
+            && !is_active
+            && !session.status.is_some_and(|status| {
+                matches!(
+                    status.activity,
+                    con_core::terminal_status::Activity::Error
+                        | con_core::terminal_status::Activity::NeedsInput
+                        | con_core::terminal_status::Activity::Paused
+                        | con_core::terminal_status::Activity::Done
+                )
+            })
+        {
             icon_stack = icon_stack.child(
                 div()
                     .absolute()
@@ -1621,40 +1759,25 @@ impl SessionSidebar {
                     .bg(theme.primary),
             );
         }
-        if is_active {
-            let dot_color = if let Some(color) = session.color {
-                crate::tab_colors::tab_accent_color_hsla(color, cx)
-            } else {
-                crate::tab_colors::active_tab_indicator_color()
-            };
-            icon_stack = icon_stack.child(
-                div()
-                    .absolute()
-                    .bottom(px(-2.0))
-                    .right(px(-2.0))
-                    .size(px(6.0))
-                    .rounded_full()
-                    .bg(dot_color),
-            );
-        }
 
         let row = div()
             .id(SharedString::from(format!("panel-tab-{i}")))
+            .debug_selector(|| "sidebar-session-row".into())
             .group(row_group.clone())
             .relative()
             .flex()
             .items_center()
             .gap(px(8.0))
             .pl(px(10.0))
-            .pr(px(4.0))
+            .pr(px(8.0))
             .h(px(row_h))
-            .rounded(px(8.0))
+            .rounded(px(6.0))
             .cursor_pointer()
             .bg(row_bg)
             .text_color(if is_active {
                 theme.foreground
             } else {
-                theme.muted_foreground.opacity(0.92)
+                theme.muted_foreground
             })
             .hover(move |s| {
                 if is_active {
@@ -1663,15 +1786,12 @@ impl SessionSidebar {
                     s.bg(inactive_hover_bg)
                 }
             })
+            .when_some(session.status_detail.clone(), |row, detail| {
+                row.tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
+            })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    if is_active && this.is_pinned() {
-                        this.toggle_pinned(cx);
-                    } else {
-                        cx.emit(SidebarSelect { index: i });
-                    }
-                }),
+                cx.listener(move |_this, _, _, cx| cx.emit(SidebarSelect { index: i })),
             )
             .on_mouse_down(
                 MouseButton::Middle,
@@ -1745,7 +1865,6 @@ impl SessionSidebar {
                 cx.notify();
             }))
             .context_menu({
-                let total = total;
                 let session_id = session.id;
                 let has_user_label = session.has_user_label;
                 let current_color = session.color;
@@ -1771,6 +1890,7 @@ impl SessionSidebar {
                     .flex()
                     .items_center()
                     .gap(px(2.0))
+                    .flex_shrink_0()
                     .child(rename_btn)
                     .child(close_btn),
             );
@@ -1780,6 +1900,13 @@ impl SessionSidebar {
 
 impl Render for SessionSidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Deferred context menus inherit the trigger's text style, including its font.
+        let ui_font = cx.theme().font_family.clone();
+        let activity_layer = self
+            .activity_layer
+            .get_or_insert_with(|| cx.new(|cx| crate::tab_activity::TabActivity::new(window, cx)))
+            .clone();
+        activity_layer.read(cx).clear();
         // Clear stale drop indicator after the drag completes — GPUI
         // doesn't expose an on_drag_end hook for the source element.
         let has_drag = cx.has_active_drag();
@@ -1797,29 +1924,51 @@ impl Render for SessionSidebar {
                 cx.notify();
             }
         }
-        // Drive the width-tween animation frame.
-        let _progress = self.width_motion.value(window);
+        // The workspace samples this too, so terminal reservation follows
+        // the same animated compact/expanded extent.
+        let _progress = self.width_motion.value(window, cx);
 
         if self.tools_panel_open || self.rail_only_override {
-            let mut rail = div()
+            return div()
+                .font_family(ui_font.clone())
                 .relative()
                 .h_full()
                 .w(px(RAIL_WIDTH))
                 .flex_shrink_0()
-                .child(self.render_rail(window, cx));
-            if let Some(hover_card) = self.render_hover_card_overlay(window, cx) {
-                rail = rail.child(hover_card);
-            }
-            return rail.into_any_element();
+                .child(self.render_rail(window, cx))
+                .child(activity_layer)
+                .into_any_element();
         }
 
         match self.mode {
+            PanelMode::Collapsed if self.width_motion.current() > 0.0 => {
+                let visible_w = self.rendered_width();
+                div()
+                    .font_family(ui_font)
+                    .relative()
+                    .flex()
+                    .h_full()
+                    .w(px(visible_w))
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .child(self.render_rail(window, cx))
+                    .child(
+                        div()
+                            .w(px(self.effective_panel_width() - RAIL_WIDTH))
+                            .h_full()
+                            .flex_shrink_0()
+                            .child(self.render_panel_body(false, window, cx)),
+                    )
+                    .child(activity_layer)
+                    .into_any_element()
+            }
             PanelMode::Pinned => {
                 let t = self.width_motion.current().clamp(0.0, 1.0);
                 let visible_w = RAIL_WIDTH + (self.effective_panel_width() - RAIL_WIDTH) * t;
                 let panel = self.render_panel_body(false, window, cx);
-                let panel_w = (visible_w - RAIL_WIDTH).max(0.0);
                 div()
+                    .font_family(ui_font.clone())
+                    .relative()
                     .flex()
                     .h_full()
                     .w(px(visible_w))
@@ -1829,25 +1978,23 @@ impl Render for SessionSidebar {
                     .child(
                         div()
                             .h_full()
-                            .w(px(panel_w))
+                            .w(px(self.effective_panel_width() - RAIL_WIDTH))
                             .flex_shrink_0()
                             .overflow_hidden()
                             .child(panel),
                     )
+                    .child(activity_layer)
                     .into_any_element()
             }
-            PanelMode::Collapsed => {
-                let mut rail = div()
-                    .relative()
-                    .h_full()
-                    .w(px(RAIL_WIDTH))
-                    .flex_shrink_0()
-                    .child(self.render_rail(window, cx));
-                if let Some(hover_card) = self.render_hover_card_overlay(window, cx) {
-                    rail = rail.child(hover_card);
-                }
-                rail.into_any_element()
-            }
+            PanelMode::Collapsed => div()
+                .font_family(ui_font)
+                .relative()
+                .h_full()
+                .w(px(RAIL_WIDTH))
+                .flex_shrink_0()
+                .child(self.render_rail(window, cx))
+                .child(activity_layer)
+                .into_any_element(),
         }
     }
 }
@@ -1864,14 +2011,21 @@ fn surface_tone(theme: &gpui_component::Theme, intensity: f32) -> Hsla {
     theme.background.blend(over)
 }
 
-fn sidebar_surface(theme: &gpui_component::Theme, opacity: f32, intensity: f32) -> Hsla {
-    let mut color = surface_tone(theme, intensity);
-    color.a = opacity.clamp(0.55, 0.98);
-    color
-}
-
 fn elevated_surface(theme: &gpui_component::Theme, opacity: f32) -> Hsla {
     theme.background.opacity((opacity + 0.06).min(0.98))
+}
+
+fn sidebar_selection_fill(theme: &gpui_component::Theme) -> Hsla {
+    theme
+        .foreground
+        .opacity(if theme.is_dark() { 0.10 } else { 0.07 })
+}
+
+fn sidebar_tab_icon(icon: &'static str) -> &'static str {
+    match icon {
+        "phosphor/terminal.svg" => "phosphor/terminal-window.svg",
+        _ => icon,
+    }
 }
 
 fn sanitize_tab_accent_alpha(alpha: f32) -> f32 {
@@ -1906,6 +2060,21 @@ fn point_in_bounds(p: &gpui::Point<gpui::Pixels>, b: &gpui::Bounds<gpui::Pixels>
         && p.x < b.origin.x + b.size.width
         && p.y >= b.origin.y
         && p.y < b.origin.y + b.size.height
+}
+
+fn sidebar_directory_name(path: &str) -> &str {
+    let windows_path = path.as_bytes().get(1) == Some(&b':') || path.starts_with("\\\\");
+    let is_separator = |c| c == '/' || (windows_path && c == '\\');
+    let trimmed = path.trim_end_matches(is_separator);
+    if trimmed.is_empty() {
+        return path;
+    }
+    let name = trimmed.rsplit(is_separator).next().unwrap_or(path);
+    if windows_path && name == trimmed && trimmed.ends_with(':') {
+        path
+    } else {
+        name
+    }
 }
 
 /// Map the cursor's y-position during a rail drag to a drop slot
@@ -1958,10 +2127,8 @@ fn rail_slot_from_local_y(
     }
     // Mirror the rail layout in render_rail:
     //   pt(leading_top_pad)
-    //   + expand button (28 px) + RAIL_ICON_GAP
-    //   + new-tab button (28 px) + RAIL_ICON_GAP
-    //   + separator h(1) + my(2)*2 = 5 px + RAIL_ICON_GAP
-    //   + i * (RAIL_ICON_SIZE + RAIL_ICON_GAP)
+    //   + top controls (expand, files, search, new, two dividers, gaps)
+    //   + scrollable session list rows
     let header = leading_top_pad + RAIL_TOP_CONTROLS_HEIGHT;
     let stride = RAIL_ICON_SIZE + RAIL_ICON_GAP;
     if local_y < header {
@@ -1994,14 +2161,22 @@ where
     let hover_bg = surface_tone(theme, 0.065);
     div()
         .id(id)
+        .debug_selector(move || id.into())
         .size(px(28.0))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(6.0))
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg))
-        .child(svg().path(icon).size(px(14.0)).text_color(icon_color))
+        .child(
+            svg()
+                .path(icon)
+                .size(ui_icon_px(theme, 16.0))
+                .flex_shrink_0()
+                .text_color(icon_color),
+        )
         .on_mouse_down(MouseButton::Left, handler)
 }
 
@@ -2129,6 +2304,7 @@ where
     div()
         .id(id)
         .size(px(20.0))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
@@ -2138,8 +2314,9 @@ where
         .child(
             svg()
                 .path(icon)
-                .size(px(11.0))
-                .text_color(theme.muted_foreground.opacity(0.72)),
+                .size(ui_icon_px(theme, 11.0))
+                .flex_shrink_0()
+                .text_color(theme.muted_foreground),
         )
         .on_mouse_down(MouseButton::Left, handler)
 }
@@ -2277,13 +2454,394 @@ fn normalize_sidebar_rename_label(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[gpui::test]
+    fn collapsing_keeps_outgoing_panel_extent_until_motion_settles(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let sidebar = cx.new(super::SessionSidebar::new);
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_pinned(true, cx);
+            sidebar.width_motion = crate::motion::SidebarMotion::new(1.0);
+            let expanded = sidebar.rendered_width();
+            sidebar.set_pinned(false, cx);
+            assert!(sidebar.rendered_width() > super::RAIL_WIDTH);
+            assert!(sidebar.rendered_width() <= expanded);
+            assert!(!sidebar.is_pinned());
+            sidebar.width_motion = crate::motion::SidebarMotion::new(0.0);
+            assert_eq!(sidebar.rendered_width(), super::RAIL_WIDTH);
+        });
+    }
+
     use super::{
-        PanelMode, RailModeButtonAction, SessionSidebar, SidebarDragPreviewState,
-        begin_rename_after_cancel_lifecycle, begin_rename_lifecycle,
+        PanelMode, RAIL_ICON_SIZE, RAIL_TOP_CONTROLS_HEIGHT, RailModeButtonAction, SessionSidebar,
+        SidebarDragPreviewState, begin_rename_after_cancel_lifecycle, begin_rename_lifecycle,
         blur_should_commit_for_lifecycle, cancel_rename_lifecycle, normalize_sidebar_rename_label,
-        vertical_drag_overlay_probe_position, vertical_slot_from_bounds,
+        rail_slot_from_local_y, sidebar_directory_name, vertical_drag_overlay_probe_position,
+        vertical_slot_from_bounds,
     };
     use gpui::{Bounds, Point, Size, px};
+
+    struct HoverCardTestView(gpui::Entity<SessionSidebar>);
+
+    impl gpui::Render for HoverCardTestView {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::{ParentElement, Styled};
+            gpui::div()
+                .size_full()
+                .children(self.0.update(cx, |sidebar, cx| {
+                    sidebar.render_hover_card_overlay(window, cx)
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn hover_card_keeps_title_path_and_status_inside_balanced_padding(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            use gpui::AppContext;
+            HoverCardTestView(cx.new(|cx| {
+                let mut sidebar = SessionSidebar::new(cx);
+                sidebar.hovered_rail = Some(0);
+                sidebar.sessions = vec![super::SessionEntry {
+                    id: 0,
+                    name: "Remote build".into(),
+                    subtitle: Some(
+                        "/project/a-long-parent-directory/another-long-directory/server".into(),
+                    ),
+                    is_ssh: true,
+                    needs_attention: true,
+                    status: None,
+                    status_detail: Some("build/test · blocked · permission · 40% — Apply?".into()),
+                    terminal_titles: vec!["build".into(), "logs".into()],
+                    icon: "phosphor/terminal.svg",
+                    has_user_label: true,
+                    pane_count: 2,
+                    color: None,
+                }];
+                sidebar
+            }))
+        });
+        let card = cx.debug_bounds("tab-hover-card").expect("hover card");
+        let name = cx.debug_bounds("tab-hover-name").expect("name");
+        let path = cx.debug_bounds("tab-hover-path").expect("path");
+        let status = cx.debug_bounds("tab-hover-status").expect("status");
+        let meta = cx.debug_bounds("tab-hover-meta").expect("metadata");
+        assert_eq!(name.left() - card.left(), px(12.0));
+        assert_eq!(card.right() - name.right(), px(12.0));
+        assert_eq!(name.top() - card.top(), px(12.0));
+        assert_eq!(card.bottom() - meta.bottom(), px(12.0));
+        assert!(name.bottom() <= path.top());
+        assert!(path.bottom() <= status.top());
+        assert!(status.bottom() <= meta.top());
+        assert_eq!(status.left() - card.left(), px(12.0));
+        assert!(
+            path.size.height > px(16.0),
+            "long paths wrap instead of losing their tail"
+        );
+    }
+
+    #[gpui::test]
+    fn hover_status_tracks_ui_font_in_light_and_dark(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            use gpui::AppContext;
+            HoverCardTestView(cx.new(|cx| {
+                let mut sidebar = SessionSidebar::new(cx);
+                sidebar.hovered_rail = Some(0);
+                sidebar.sessions = vec![session(None, Some("Ready".into()))];
+                sidebar
+            }))
+        });
+        for mode in [
+            gpui_component::ThemeMode::Light,
+            gpui_component::ThemeMode::Dark,
+        ] {
+            cx.update(|_, cx| {
+                gpui_component::Theme::change(mode, None, cx);
+            });
+            let mut heights = Vec::new();
+            for (font_size, expected_height) in [(12.0, 12.0), (16.0, 16.0), (24.0, 24.0)] {
+                cx.update(|_, cx| {
+                    gpui_component::Theme::update(cx, |theme| theme.font_size = px(font_size));
+                });
+                view.update(cx, |_, cx| cx.notify());
+                let status = cx.debug_bounds("tab-hover-status").expect("status label");
+                assert!((status.size.height.as_f32() - expected_height).abs() < 0.5);
+                let path = cx.debug_bounds("tab-hover-path").expect("path");
+                let meta = cx.debug_bounds("tab-hover-meta").expect("metadata");
+                assert!(path.bottom() <= status.top());
+                assert!(status.bottom() <= meta.top());
+                heights.push(status.size.height.as_f32());
+            }
+            assert!(heights[0] < heights[1] && heights[1] < heights[2]);
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_status_icon_follows_density_and_font(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sidebar = SessionSidebar::new(cx);
+            sidebar.sessions = vec![session(
+                Some(con_core::terminal_status::Status {
+                    surface_id: 1,
+                    activity: con_core::terminal_status::Activity::NeedsInput,
+                    evidence: con_core::terminal_status::Evidence::ProgramStatus,
+                    percent: None,
+                }),
+                Some("Waiting for permission".into()),
+            )];
+            sidebar
+        });
+
+        let slot = cx.debug_bounds("tab-status-slot").expect("compact slot");
+        assert_eq!(slot.size, Size::new(px(32.0), px(32.0)));
+        assert!(cx.debug_bounds("tab-status-glyph").is_some());
+        assert!(cx.debug_bounds("tab-status-brand").is_none());
+        assert!(rendered_rings(&view, cx).is_empty());
+
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_pinned(true, cx);
+            sidebar.width_motion = crate::motion::SidebarMotion::new(1.0);
+        });
+        for (font_size, expected) in [(12.0, 14.4), (16.0, 16.0), (24.0, 21.6)] {
+            cx.update(|_, cx| {
+                gpui_component::Theme::update(cx, |theme| theme.font_size = px(font_size));
+            });
+            view.update(cx, |_, cx| cx.notify());
+            let slot = cx.debug_bounds("tab-status-slot").expect("expanded slot");
+            assert!(
+                (slot.size.width.as_f32() - expected).abs() < 0.5,
+                "font {font_size}: icon slot {} expected {}",
+                slot.size.width.as_f32(),
+                expected
+            );
+            assert!(cx.debug_bounds("tab-status-glyph").is_some());
+            assert!(rendered_rings(&view, cx).is_empty());
+        }
+
+        view.update(cx, |sidebar, cx| {
+            sidebar.sessions[0].status = Some(con_core::terminal_status::Status {
+                surface_id: 1,
+                activity: con_core::terminal_status::Activity::Busy,
+                evidence: con_core::terminal_status::Evidence::ProgramStatus,
+                percent: Some(40),
+            });
+            cx.notify();
+        });
+        let rings = rendered_rings(&view, cx);
+        assert_eq!(rings.len(), 1);
+        let slot = cx.debug_bounds("tab-status-slot").unwrap();
+        assert_eq!(rings[0].size, Size::new(px(18.0), px(18.0)));
+        assert!((slot.center().x - rings[0].center().x).abs() < px(0.5));
+        assert!((slot.center().y - rings[0].center().y).abs() < px(0.5));
+        assert!(cx.debug_bounds("tab-status-glyph").is_none());
+        assert!(cx.debug_bounds("tab-status-brand").is_none());
+
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_pinned(false, cx);
+            sidebar.width_motion = crate::motion::SidebarMotion::new(0.0);
+        });
+        assert_eq!(
+            cx.debug_bounds("tab-status-slot")
+                .expect("compact busy slot")
+                .size,
+            Size::new(px(32.0), px(32.0))
+        );
+        let rings = rendered_rings(&view, cx);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].size, Size::new(px(24.0), px(24.0)));
+        let slot = cx.debug_bounds("tab-status-slot").unwrap();
+        assert!((slot.center().x - rings[0].center().x).abs() < px(0.5));
+        assert!((slot.center().y - rings[0].center().y).abs() < px(0.5));
+        assert!(cx.debug_bounds("tab-status-brand").is_some());
+        assert!(cx.debug_bounds("tab-status-glyph").is_none());
+    }
+
+    fn rendered_rings(
+        view: &gpui::Entity<SessionSidebar>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<Bounds<gpui::Pixels>> {
+        view.update(cx, |sidebar, cx| {
+            sidebar
+                .activity_layer
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .rendered_ring_bounds()
+        })
+    }
+
+    fn session(
+        status: Option<con_core::terminal_status::Status>,
+        status_detail: Option<String>,
+    ) -> super::SessionEntry {
+        super::SessionEntry {
+            id: 0,
+            name: "Build".into(),
+            subtitle: Some("/project".into()),
+            is_ssh: false,
+            needs_attention: false,
+            status,
+            status_detail,
+            terminal_titles: Vec::new(),
+            icon: "phosphor/terminal.svg",
+            has_user_label: true,
+            pane_count: 1,
+            color: None,
+        }
+    }
+
+    #[gpui::test]
+    fn selection_is_inset_without_shrinking_drag_targets(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sidebar = SessionSidebar::new(cx);
+            sidebar.sessions = vec![session(None, None)];
+            sidebar
+        });
+        let tile = cx.debug_bounds("sidebar-session-tile").unwrap();
+        let selection = cx.debug_bounds("sidebar-session-selection").unwrap();
+        let icon = cx.debug_bounds("tab-status-brand").unwrap();
+        assert_eq!(tile.size, Size::new(px(40.0), px(40.0)));
+        assert_eq!(selection.size, Size::new(px(32.0), px(32.0)));
+        assert_eq!(tile.center(), selection.center());
+        assert_eq!(tile.center(), icon.center());
+        assert_eq!(icon.size, Size::new(px(18.0), px(18.0)));
+        view.read_with(cx, |sidebar, _| {
+            assert_eq!(sidebar.tab_bounds.borrow()[0], tile);
+        });
+
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_pinned(true, cx);
+            sidebar.width_motion = crate::motion::SidebarMotion::new(1.0);
+        });
+        for mode in [
+            gpui_component::ThemeMode::Light,
+            gpui_component::ThemeMode::Dark,
+        ] {
+            cx.update(|_, cx| gpui_component::Theme::change(mode, None, cx));
+            for font_size in [12.0, 16.0, 24.0] {
+                cx.update(|_, cx| {
+                    gpui_component::Theme::update(cx, |theme| theme.font_size = px(font_size));
+                });
+                view.update(cx, |_, cx| cx.notify());
+                let row = cx.debug_bounds("sidebar-session-row").unwrap();
+                let name = cx.debug_bounds("sidebar-session-name").unwrap();
+                let directory = cx.debug_bounds("sidebar-session-directory").unwrap();
+                assert!(row.top() < name.top());
+                assert!(name.bottom() <= directory.top());
+                assert!(directory.bottom() < row.bottom());
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn sessions_have_one_navigation_list_and_keep_drag_bounds(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sidebar = SessionSidebar::new(cx);
+            sidebar.sessions = (0..2)
+                .map(|id| super::SessionEntry {
+                    id,
+                    name: format!("Tab {id}"),
+                    subtitle: Some("/project".into()),
+                    is_ssh: false,
+                    needs_attention: false,
+                    status: None,
+                    status_detail: None,
+                    terminal_titles: Vec::new(),
+                    icon: "phosphor/terminal.svg",
+                    has_user_label: false,
+                    pane_count: 1,
+                    color: None,
+                })
+                .collect();
+            sidebar
+        });
+        assert!(cx.debug_bounds("sidebar-session-tile").is_some());
+        assert!(cx.debug_bounds("sidebar-session-row").is_none());
+        let new_tab = cx
+            .debug_bounds("tab-sidebar-rail-new")
+            .expect("new tab control");
+        view.read_with(cx, |sidebar, _| {
+            let first = sidebar.tab_bounds.borrow()[0];
+            assert!(first.top() - new_tab.bottom() >= gpui::px(super::RAIL_SESSIONS_GAP));
+            assert_eq!(
+                first.top(),
+                gpui::px(sidebar.leading_top_pad + super::RAIL_TOP_CONTROLS_HEIGHT),
+                "drag fallback must match the actual session list origin",
+            );
+        });
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_pinned(true, cx);
+            sidebar.width_motion = crate::motion::SidebarMotion::new(1.0);
+        });
+        assert!(cx.debug_bounds("sidebar-session-tile").is_none());
+        assert!(cx.debug_bounds("sidebar-session-row").is_some());
+        view.read_with(cx, |sidebar, _| {
+            let bounds = sidebar.tab_bounds.borrow();
+            assert_eq!(bounds.len(), 2);
+            assert_eq!(
+                vertical_slot_from_bounds(bounds[1].center().y, &bounds, 2),
+                Some(2),
+                "expanded rows remain the drag reorder targets",
+            );
+        });
+        for slot in [
+            crate::activity_bar::ActivitySlot::Files,
+            crate::activity_bar::ActivitySlot::Search,
+        ] {
+            view.update(cx, |sidebar, cx| {
+                sidebar.set_tools_panel_open(true, slot);
+                cx.notify();
+            });
+            assert!(cx.debug_bounds("sidebar-session-tile").is_some());
+            assert!(cx.debug_bounds("sidebar-session-row").is_none());
+            view.read_with(cx, |sidebar, _| {
+                assert_eq!(sidebar.tab_bounds.borrow().len(), 2);
+            });
+        }
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_tools_panel_open(false, crate::activity_bar::ActivitySlot::Files);
+            sidebar.show_rail_only_preserving_pinned(cx);
+        });
+        assert!(cx.debug_bounds("sidebar-session-tile").is_some());
+        assert!(cx.debug_bounds("sidebar-session-row").is_none());
+        view.update(cx, |sidebar, cx| sidebar.clear_rail_only_override(cx));
+        assert!(cx.debug_bounds("sidebar-session-tile").is_none());
+        assert!(cx.debug_bounds("sidebar-session-row").is_some());
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_pinned(false, cx);
+            sidebar.width_motion = crate::motion::SidebarMotion::new(0.0);
+        });
+        assert!(cx.debug_bounds("sidebar-session-tile").is_some());
+        assert!(cx.debug_bounds("sidebar-session-row").is_none());
+    }
+
+    #[test]
+    fn bundled_font_has_visible_title_status_glyphs() {
+        let face = ttf_parser::Face::parse(
+            include_bytes!("../../../assets/fonts/IoskeleyMono-Regular.ttf"),
+            0,
+        )
+        .unwrap();
+        for frame in ('\u{2801}'..='\u{28ff}').chain("·✢✳✶✻✽!.".chars()) {
+            let glyph = face.glyph_index(frame).expect("status glyph must exist");
+            let bounds = face
+                .glyph_bounding_box(glyph)
+                .expect("status glyph must have an outline");
+            assert!(
+                bounds.width() > 0 && bounds.height() > 0,
+                "empty glyph: {frame}"
+            );
+        }
+    }
 
     #[test]
     fn vertical_slot_from_bounds_uses_row_midpoints() {
@@ -2313,6 +2871,30 @@ mod tests {
         assert_eq!(vertical_slot_from_bounds(px(90.0), &bounds, 2), Some(0));
         assert_eq!(vertical_slot_from_bounds(px(121.0), &bounds, 2), Some(1));
         assert_eq!(vertical_slot_from_bounds(px(180.0), &bounds, 2), Some(2));
+    }
+
+    #[test]
+    fn rail_slot_from_local_y_starts_after_fixed_controls() {
+        assert_eq!(
+            rail_slot_from_local_y(RAIL_TOP_CONTROLS_HEIGHT - 1.0, 3, 0.0),
+            Some(0)
+        );
+        assert_eq!(
+            rail_slot_from_local_y(RAIL_TOP_CONTROLS_HEIGHT, 3, 0.0),
+            Some(0)
+        );
+        assert_eq!(
+            rail_slot_from_local_y(RAIL_TOP_CONTROLS_HEIGHT + RAIL_ICON_SIZE * 0.75, 3, 0.0),
+            Some(1)
+        );
+        // 40px tiles + 2px gaps: the second slot's midpoint is 63px.
+        // A stale 32px stride would incorrectly insert after the second tile.
+        for (offset, expected) in [(62.0, 1), (64.0, 2), (126.0, 3)] {
+            assert_eq!(
+                rail_slot_from_local_y(RAIL_TOP_CONTROLS_HEIGHT + 7.0 + offset, 3, 7.0),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
@@ -2407,5 +2989,21 @@ mod tests {
             reopened,
             active_generation
         ));
+    }
+
+    #[test]
+    fn directory_labels_preserve_real_names_without_synthetic_ellipsis() {
+        for (path, expected) in [
+            ("/tmp/con-sidebar-verification/project", "project"),
+            ("~/dev/项目/.config/", ".config"),
+            (r"C:\Users\dev\project\", "project"),
+            (r"\\server\share\project", "project"),
+            (r"/tmp/a\b", r"a\b"),
+            ("/", "/"),
+            ("~", "~"),
+            (r"C:\", r"C:\"),
+        ] {
+            assert_eq!(sidebar_directory_name(path), expected);
+        }
     }
 }

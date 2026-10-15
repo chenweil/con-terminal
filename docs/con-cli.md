@@ -30,6 +30,29 @@ con-cli --json tree
 `con-cli` asks the running app for state instead of guessing from outside the
 terminal.
 
+## SSH terminfo cache
+
+Con also provides the cache command used by shell integration. It is a local
+metadata cache: entries identify a host where Con's `xterm-ghostty` terminfo
+has already been installed. It does not store credentials, SSH keys, command
+output, or remote data.
+
+```sh
+con-cli +ssh-cache --host=example.com
+con-cli +ssh-cache --add=example.com
+con-cli +ssh-cache
+con-cli +ssh-cache --remove=example.com
+con-cli +ssh-cache --clear
+```
+
+The host check exits `0` when an entry is present and `1` when it is absent,
+so shell integration can use it without parsing output. Cache entries are
+stored under Con's platform-specific user cache directory and are written
+atomically. `--expire-days N` filters entries older than `N` days for list and
+host checks. On macOS, the installed app bundle exposes this command through
+the compatibility entry point expected by Ghostty's shell integration, so SSH
+terminfo setup works without a separate Ghostty executable.
+
 ## Pane commands
 
 Read terminal content:

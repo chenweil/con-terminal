@@ -4,6 +4,1564 @@ All notable changes to con are documented here.
 
 con is still pre-release, so entries may group related beta work while the product shape is stabilizing.
 
+## `v0.1.0-beta.135` - 2026-10-14
+
+### Changed
+
+**Agent UI**
+
+- Read each reply in order: reasoning and tool activity, then the answer. Live
+  tools and approvals scroll with the conversation, and the input no longer
+  covers messages or tables.
+  _(PR [#481](https://github.com/nowledge-co/con-terminal/pull/481) by [@wey-gu](https://github.com/wey-gu))_
+- Reasoning and tool calls use compact, aligned disclosures with one output
+  surface. Refined model controls, message spacing, code blocks and panel edges
+  make the chat easier to scan.
+  _(PR [#481](https://github.com/nowledge-co/con-terminal/pull/481) by [@wey-gu](https://github.com/wey-gu))_
+- Working feedback appears immediately after sending a message, before the first
+  response token. It uses the same gentle pulsing bars as horizontal tabs and
+  respects reduced motion.
+  _(PR [#481](https://github.com/nowledge-co/con-terminal/pull/481) by [@wey-gu](https://github.com/wey-gu))_
+- Long replies keep a Continue reading control with expansion feedback and a
+  Show less action, instead of a disappearing block-count button.
+  _(PR [#481](https://github.com/nowledge-co/con-terminal/pull/481) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.134` - 2026-10-14
+
+### Changed
+
+**Agent UI**
+
+- Busy tabs use three gently pulsing bars. Chat metadata, thought disclosures,
+  and tool cards have clearer text and quieter, more consistent surfaces.
+  _(PR [#479](https://github.com/nowledge-co/con-terminal/pull/479) by [@wey-gu](https://github.com/wey-gu))_
+- The agent panel has a quieter header edge and a subtle material difference
+  from the titlebar, including with light, transparent chrome.
+  _(PR [#479](https://github.com/nowledge-co/con-terminal/pull/479) by [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Responsiveness**
+
+- Continuous agent output yields between bounded batches so its event queue
+  cannot indefinitely occupy the foreground dispatcher.
+  _(PR [#479](https://github.com/nowledge-co/con-terminal/pull/479) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.133` - 2026-10-14
+
+### Fixed
+
+**macOS releases**
+
+- Correct the architecture check that blocked both macOS packages after a
+  successful build. App and companion CLI binaries now share the same tested
+  check before upload and packaging.
+  _(PR [#477](https://github.com/nowledge-co/con-terminal/pull/477) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.132` - 2026-10-14
+
+### Fixed
+
+**macOS releases**
+
+- Intel and Apple Silicon builds now share separate Apple Silicon packaging
+  jobs, so signing and notarization can be retried without rebuilding the app.
+  Intel compilation remains native, and both packages must pass all existing
+  signature, ticket and installer checks before publication.
+  _(PR [#475](https://github.com/nowledge-co/con-terminal/pull/475) by [@wey-gu](https://github.com/wey-gu))_
+- macOS release builds reuse the runner's installed CMake instead of upgrading
+  and compiling it from source during setup.
+  _(PR [#475](https://github.com/nowledge-co/con-terminal/pull/475) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.131` - 2026-10-13
+
+### Changed
+
+**Panes**
+
+- Split-pane titles stay centered in narrow and wide panes. Zoom and close
+  controls appear on hover without moving the title, with clearer labels and
+  consistent button spacing in light and dark themes.
+  _(PR [#473](https://github.com/nowledge-co/con-terminal/pull/473) by [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**macOS releases**
+
+- Packaging retries interrupted Apple ticket downloads before giving up.
+  Both the app and disk image must still pass signature and notarization-ticket
+  checks before publication.
+  _(PR [#473](https://github.com/nowledge-co/con-terminal/pull/473) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.130` - 2026-10-13
+
+### Changed
+
+**Tabs and input**
+
+- Horizontal tabs keep equal widths with a compact maximum, leaving more room
+  to drag the window. Generic tab identities use small, cached color icons.
+  Tabs shrink before scrolling, and an All tabs menu keeps hidden tabs directly
+  accessible by name. Paging arrows sit outside the labels when tabs overflow;
+  wheel scrolling works over the tab buttons themselves.
+  _(PR [#472](https://github.com/nowledge-co/con-terminal/pull/472) by [@wey-gu](https://github.com/wey-gu))_
+- Opening and closing horizontal tabs smoothly redistributes their space.
+  Closing a tab still closes its terminal immediately. Dragging and Reduce
+  Motion use the final layout without a transition.
+  _(PR [#472](https://github.com/nowledge-co/con-terminal/pull/472) by [@wey-gu](https://github.com/wey-gu))_
+- Smart, Shell and Agent input modes have distinct framed icons. The bottom
+  bar and agent composer share a consistent send button, with clearer empty
+  and ready states. The agent composer keeps its action aligned in multiline
+  drafts and fits narrow panels.
+  _(PR [#472](https://github.com/nowledge-co/con-terminal/pull/472) by [@wey-gu](https://github.com/wey-gu))_
+- The pane target picker is more compact, with clearer selected counts,
+  keyboard hints, selection checks and a separate focused-pane indicator.
+  It sits closer to its control and follows multiline input height. Quieter
+  mode artwork and balanced insets keep the bottom bar unobtrusive.
+  Presets and pane tiles share aligned edges and spacing, with quieter neutral
+  selection fills in light and dark themes.
+  _(PR [#472](https://github.com/nowledge-co/con-terminal/pull/472) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.129` - 2026-10-13
+
+### Added
+
+**Built-in agent**
+
+- Choose **Codex Local** to use an installed Codex CLI's login, configured
+  endpoint, and model with Con's built-in agent. Leave the model blank to follow
+  Codex's default, or fetch its available models in Settings. Replies stream in
+  the agent panel, while commands and edits still use Con's tools and approvals.
+  Requires a recent Codex CLI; this does not provide offline inference. _(PR
+  [#471](https://github.com/nowledge-co/con-terminal/pull/471) by
+  [@sundy-li](https://github.com/sundy-li))_
+
+### Changed
+
+**Documentation**
+
+- The README now shows the current Tail A6 app icon. _(PR
+  [#470](https://github.com/nowledge-co/con-terminal/pull/470) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.128` - 2026-10-12
+
+### Fixed
+
+**Window tabs**
+
+- Horizontal tabs share the available width equally, so AI name updates no
+  longer move neighbouring tabs. Long names truncate with full-name tooltips;
+  narrow windows allow horizontal scrolling instead of shrinking targets away.
+  A quiet outer capsule groups the strip, with fixed icon and title positions
+  and an independent hover-only close control on the right. Selecting a tab
+  brings it into view without pulling the strip back during ordinary scrolling.
+  _(PR [#469](https://github.com/nowledge-co/con-terminal/pull/469) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.127` - 2026-10-12
+
+### Changed
+
+**Window tabs**
+
+- Horizontal tabs share a compact tray with even insets, a distinct selected
+  tab, and readable labels in light and dark themes, without increasing titlebar
+  height. Close controls appear beside the name on hover without shifting the
+  text; long names use the available space and remain visible in tooltips. _(PR
+  [#468](https://github.com/nowledge-co/con-terminal/pull/468) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Window controls**
+
+- Titlebar panel buttons use quiet neutral fills to show which panels are open,
+  with more consistent icons and hover feedback. Icons remain centred when
+  the UI font size is increased. _(PR
+  [#468](https://github.com/nowledge-co/con-terminal/pull/468) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Input bar**
+
+- The bottom input bar has quieter mode controls, clearer pane-target labels,
+  and a compact circular send button that stands out when input is ready.
+  Its height, mode-switch shortcuts, and input behavior stay unchanged. _(PR
+  [#468](https://github.com/nowledge-co/con-terminal/pull/468) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Window tabs**
+
+- Dragged tabs use a matching capsule preview. Reordering remains stable near
+  the right end of the strip, including tabs with different widths. _(PR
+  [#468](https://github.com/nowledge-co/con-terminal/pull/468) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.126` - 2026-10-11
+
+### Changed
+
+**Panel motion**
+
+- Left and right sidebars slide with continuous, non-bouncing motion, including
+  when reversed mid-transition. Agent-panel text keeps its layout while the
+  panel moves. Compact and expanded vertical tabs share the same motion in
+  both directions. The bottom input bar uses the same smooth motion without
+  fading or compressing its contents. System Reduce Motion preferences remain
+  respected. _(PR [#466](https://github.com/nowledge-co/con-terminal/pull/466) by [@wey-gu](https://github.com/wey-gu))_
+- Input modes share one text inset so switching modes does not shift the cursor.
+  Input controls have consistent shapes and clearer send states; the compact
+  tab rail separates tools from sessions with spacing rather than extra lines.
+  _(PR [#466](https://github.com/nowledge-co/con-terminal/pull/466) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.125` - 2026-10-11
+
+### Changed
+
+**Agent panel**
+
+- Agent activity appears in one compact summary, without repeated loading
+  indicators or competing divider lines. Tool details wrap below the action
+  label, and session controls fit narrow panels. _(PR
+  [#464](https://github.com/nowledge-co/con-terminal/pull/464) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Window chrome**
+
+- Sidebars and the bottom input bar share the titlebar's translucent material,
+  with quieter, consistent edges around the terminal. Window Chrome adjusts
+  these areas together; Terminal Glass stays independent. _(PR
+  [#464](https://github.com/nowledge-co/con-terminal/pull/464) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**App icons**
+
+- Tail A6 is now the default app icon across macOS, Windows, and Linux,
+  including Flatpak packages. Previously saved icon choices stay unchanged;
+  Classic remains available in Settings → Appearance. _(PR
+  [#462](https://github.com/nowledge-co/con-terminal/pull/462) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Agent panel**
+
+- Approval buttons stay visible when the tool area sizes itself to its
+  contents, while longer tool output remains scrollable. _(PR
+  [#464](https://github.com/nowledge-co/con-terminal/pull/464) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Added
+
+**Windows, Linux**
+
+- Preview app icons in running Windows and Linux X11 windows. On Linux,
+  saving also updates the user launcher icon outside Flatpak; desktops may
+  cache the old image. Windows pinned shortcuts keep the installed icon,
+  and Wayland does not yet support live window previews. _(PR
+  [#462](https://github.com/nowledge-co/con-terminal/pull/462),
+  [#463](https://github.com/nowledge-co/con-terminal/pull/463) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.124` - 2026-10-10
+
+### Changed
+
+**Vertical tabs**
+
+- Compact tabs have smaller, balanced selection fills without smaller click
+  or drag targets. Shell tabs use clearer terminal-window icons, and Search
+  uses a simpler magnifying glass. Expanded tabs have lighter selection fills
+  and tighter spacing; their titles and directory labels scale with UI font size.
+  _(PR [#460](https://github.com/nowledge-co/con-terminal/pull/460) by
+  [@wey-gu](https://github.com/wey-gu))_
+- Tab context menus use the system UI font instead of inheriting the terminal's
+  monospace font. _(PR
+  [#460](https://github.com/nowledge-co/con-terminal/pull/460) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Terminal pane edges**
+
+- Keep Windows resize fills aligned with the current pane size rather than
+  the previous frame, without stretching terminal text. macOS native terminal
+  edges now use the same physical-pixel alignment as pane dividers. Neither
+  change overrides Terminal Glass or widens the dividers. _(PR
+  [#460](https://github.com/nowledge-co/con-terminal/pull/460) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**macOS**
+
+- Keep transparent terminal panes and surrounding panels in sync during resize
+  and show/hide transitions, preventing brief flashes of the background without
+  turning off transparency or blur. Ordinary terminal updates retain their
+  asynchronous rendering path. _(PR
+  [#460](https://github.com/nowledge-co/con-terminal/pull/460) by
+  [@wey-gu](https://github.com/wey-gu))_
+- Avoid overlapping terminal backgrounds when creating tabs or split panes,
+  or switching tabs with Terminal Glass enabled. Rapid tab switching no longer
+  leaves a delayed hide for a tab that has already become active again. _(PR
+  [#460](https://github.com/nowledge-co/con-terminal/pull/460) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.123` - 2026-10-10
+
+### Changed
+
+**Program-status guide**
+
+- Clarify how to forward program status through SSH and tmux, including
+  capability detection and passthrough examples. _(PR
+  [#455](https://github.com/nowledge-co/con-terminal/pull/455) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Developer Experience**
+
+- Add regression tests for program-status lifecycles, input acknowledgement,
+  bounded report storage and sidebar layout at different UI font sizes in
+  light and dark themes. _(PRs
+  [#456](https://github.com/nowledge-co/con-terminal/pull/456) and
+  [#457](https://github.com/nowledge-co/con-terminal/pull/457) by
+  [@wey-gu](https://github.com/wey-gu))_
+- Add reproducible lifecycle and load fixtures, a retained reducer benchmark,
+  and native Windows/Linux CI coverage for sidebar layout. These checks do
+  not replace physical-window frame-rate or input-latency testing. _(PR
+  [#458](https://github.com/nowledge-co/con-terminal/pull/458) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.122` - 2026-10-09
+
+### Added
+
+**Terminal program status**
+
+- Programs that support OSC 7501 can report activity, completion, or a request
+  for attention on macOS, Windows and Linux. Hover a tab to read its status message.
+  Running work uses a compact progress ring; waiting, errors and completion
+  use a single centered icon without stacked badges or extra animation.
+  _(PRs [#449](https://github.com/nowledge-co/con-terminal/pull/449),
+  [#450](https://github.com/nowledge-co/con-terminal/pull/450) and
+  [#451](https://github.com/nowledge-co/con-terminal/pull/451) by
+  [@wey-gu](https://github.com/wey-gu))_
+- The [program-status guide](docs/program-status.md) covers capability
+  detection, shell examples and SSH/tmux forwarding. Applications need to emit
+  the protocol; Con does not automatically instrument every CLI. _(PR
+  [#452](https://github.com/nowledge-co/con-terminal/pull/452) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**HTML files**
+
+- Open the current HTML file in your default browser from its editor tab bar.
+  The action opens the saved file without changing unsaved edits, supports
+  `.html` and `.htm`, and reports launch errors in a notification. _(PR
+  [#453](https://github.com/nowledge-co/con-terminal/pull/453) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+### Fixed
+
+**Agent handoff**
+
+- Retry briefly when a newly installed ACP executable is temporarily busy,
+  rather than failing the launch immediately. Retries are bounded and do not
+  change tool approval or execution policy. _(PR [#449](https://github.com/nowledge-co/con-terminal/pull/449)
+  by [@wey-gu](https://github.com/wey-gu))_
+
+### Changed
+
+**Panes**
+
+- Editor panes show their files in one compact tab bar instead of a title bar
+  plus a separate tab row. The open file's name appears once, unsaved files
+  get a small dot, and unfocused panes use a quieter tab fill. File tabs scroll
+  horizontally when needed, while pane controls stay visible. _(PR
+  [#448](https://github.com/nowledge-co/con-terminal/pull/448) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+## `v0.1.0-beta.121` - 2026-10-08
+
+### Changed
+
+**Sidebar**
+
+- Expanded vertical tabs appear only in the labeled list, rather than repeating
+  in the adjacent icon rail. Compact tab navigation remains available beside
+  Files and Search. _(PR [#442](https://github.com/nowledge-co/con-terminal/pull/442) by [@wey-gu](https://github.com/wey-gu))_
+- Compact tab hover cards have balanced padding and clearer title, path and
+  status spacing, without an extra strip along the left edge. Sidebar selection
+  uses a single background cue instead of an additional green stripe; custom
+  tab colors remain available. _(PR [#442](https://github.com/nowledge-co/con-terminal/pull/442) by [@wey-gu](https://github.com/wey-gu))_
+- Tab names remain readable when inactive. The list shows concise working
+  directory names; compact hover cards show the full path and omit redundant
+  single-pane titles. _(PR [#442](https://github.com/nowledge-co/con-terminal/pull/442) by [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Keyboard focus**
+
+- Blank title-bar and sidebar/panel divider clicks preserve the active input,
+  so moving or adjusting the layout does not leave typing directed at window
+  chrome instead of the terminal or input field. _(PR [#441](https://github.com/nowledge-co/con-terminal/pull/441) by [@wey-gu](https://github.com/wey-gu))_
+
+**Sidebar**
+
+- Sidebar text, file-tree icons and search results use solid theme colors instead
+  of extra transparency, improving readability on translucent windows. The
+  underlying macOS edge-rendering issue remains tracked in
+  [#439](https://github.com/nowledge-co/con-terminal/issues/439).
+  _(PR [#442](https://github.com/nowledge-co/con-terminal/pull/442) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.120` - 2026-10-08
+
+### Fixed
+
+**Appearance**
+
+- Inactive tab titles and icons stay legible on transparent window chrome,
+  especially in dark themes, without fading the interiors of their glyphs.
+  _(PR [#437](https://github.com/nowledge-co/con-terminal/pull/437) by
+  [@wey-gu](https://github.com/wey-gu))_
+- Title-bar buttons have balanced vertical spacing and quieter panel-toggle
+  states, with consistent hover and press feedback. Shortcut hints and terminal
+  focus are preserved. _(PR [#438](https://github.com/nowledge-co/con-terminal/pull/438)
+  by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.119` - 2026-10-05
+
+### Fixed
+
+**macOS terminal input**
+
+- Text entered through remote-control apps that send Unicode with a placeholder
+  keycode now appears correctly in terminal panes instead of repeating the same
+  letter. _(PR [#435](https://github.com/nowledge-co/con-terminal/pull/435)
+  by [@zerob13](https://github.com/zerob13))_
+
+## `v0.1.0-beta.118` - 2026-10-03
+
+### Fixed
+
+**Agent and CLI**
+
+- The agent no longer mistakes commands such as `etcd --version` for a change
+  of working directory. _(PR [#428](https://github.com/nowledge-co/con-terminal/pull/428)
+  by [@Fengzdadi](https://github.com/Fengzdadi))_
+- `con-cli agent ask` now ends plain-text replies with a newline, keeping the
+  next shell prompt on its own line. _(PR
+  [#429](https://github.com/nowledge-co/con-terminal/pull/429) by
+  [@Fengzdadi](https://github.com/Fengzdadi))_
+
+**Files**
+
+- The Files panel now updates as files and folders are created, renamed, or
+  removed, without losing expanded folders or the selected file. _(PR
+  [#431](https://github.com/nowledge-co/con-terminal/pull/431) by
+  [@adaiguoguo](https://github.com/adaiguoguo))_
+
+## `v0.1.0-beta.117` - 2026-09-29
+
+### Changed
+
+**Appearance**
+
+- The agent panel now feels like part of the translucent window instead of a
+  separate dark block. Its empty-state text is easier to read, and the send
+  controls stay quiet until there is something to send. The Ask input now sits
+  level with the other two modes. _(PR
+  [#426](https://github.com/nowledge-co/con-terminal/pull/426) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.116` - 2026-09-29
+
+### Added
+
+**macOS terminal links**
+
+- Command-click a detected local file link in the terminal to open text in Con's
+  editor or an image in its preview. Links with `:line[:column]` jump to that place;
+  documents and folders still open in their associated app. _(PR
+  [#419](https://github.com/nowledge-co/con-terminal/pull/419) by
+  [@adaiguoguo](https://github.com/adaiguoguo))_
+
+### Fixed
+
+**Appearance and editor**
+
+- Theme changes now refresh controls and scrollbars together, while UI font
+  changes stay in sync across the interface.
+  Editor diagnostics continue to arrive even when the editor is out of view.
+  _(PR [#423](https://github.com/nowledge-co/con-terminal/pull/423) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Tabs**
+
+- Tabs sit more naturally on transparent title bars. The close button has a
+  larger click target. On macOS, returning to one tab no longer resizes the
+  title bar and terminal, avoiding a dark strip during the change. _(PR
+  [#422](https://github.com/nowledge-co/con-terminal/pull/422) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Input bar and search**
+
+- On macOS, showing or hiding the input bar no longer leaves a brief dark
+  placeholder across the bottom of the terminal. The sidebar's file search
+  uses a single-line field with clearer type and compact match options. _(PR
+  [#422](https://github.com/nowledge-co/con-terminal/pull/422) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Command Palette**
+
+- Search results remain fully visible and scrollable instead of collapsing below
+  the search field, including in shorter windows. _(PR
+  [#421](https://github.com/nowledge-co/con-terminal/pull/421) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.115` - 2026-09-28
+
+### Changed
+
+**Appearance**
+
+- The tab bar, sidebar, and input bar now share the terminal's background color
+  and transparency instead of appearing as separate tinted blocks. Selected
+  tabs and the input divider remain easy to distinguish. On macOS, window blur
+  follows the effective Ghostty setting without stacking a second blur layer.
+  _(PR [#417](https://github.com/nowledge-co/con-terminal/pull/417) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+### Fixed
+
+**Settings**
+
+- If Con cannot load its settings, it now shows the file and error with a way
+  to fix the file or update Con, then retry. It no longer silently ignores a
+  new-window request or exits without an in-app explanation. Your settings are
+  not reset. _(PR
+  [#416](https://github.com/nowledge-co/con-terminal/pull/416) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.114` - 2026-09-28
+
+### Fixed
+
+**Tabs**
+
+- Busy indicators keep moving while Con is visible but inactive, and resume
+  when its window is uncovered. _(PR
+  [#413](https://github.com/nowledge-co/con-terminal/pull/413) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Window layout**
+
+- New windows keep your sidebar, input bar, and agent panel visibility choices
+  without bringing back the previous window's terminal tabs. _(PR
+  [#414](https://github.com/nowledge-co/con-terminal/pull/414) by
+  [@adaiguoguo](https://github.com/adaiguoguo))_
+
+## `v0.1.0-beta.113` - 2026-09-27
+
+### Fixed
+
+**Terminal · macOS**
+
+- Cmd+C now copies text selected inside mouse-aware terminal apps such as
+  Codex, while preserving normal terminal selection and link copying. _(PR
+  [#412](https://github.com/nowledge-co/con-terminal/pull/412) by
+  [@adaiguoguo](https://github.com/adaiguoguo))_
+
+**Input**
+
+- Enter submits from the bottom input bar and compact agent composer without
+  inserting or removing text; Shift-Enter still adds a new line. _(PR
+  [#410](https://github.com/nowledge-co/con-terminal/pull/410) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Command palette**
+
+- Pressing Enter twice during the closing animation no longer runs the same
+  command twice. _(PR
+  [#410](https://github.com/nowledge-co/con-terminal/pull/410) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+## `v0.1.0-beta.112` - 2026-09-27
+
+### Added
+
+**Agent**
+
+- On macOS, hand a Codex, Cursor, or Kimi session to another supported agent
+  without losing the working directory and relevant conversation context.
+  Con shows when the instruction was sent and keeps a recovery path if delivery
+  cannot be confirmed. _(PR
+  [#401](https://github.com/nowledge-co/con-terminal/pull/401) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+### Changed
+
+**Tabs**
+
+- Tabs and the sidebar now show activity and progress without moving app icons.
+  They also make errors, input requests, and paused sessions easier to spot.
+  _(PR [#405](https://github.com/nowledge-co/con-terminal/pull/405) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+### Fixed
+
+**Agent**
+
+- Shift-Enter inserts a new line when editing an earlier message instead of
+  sending it. _(PR [#402](https://github.com/nowledge-co/con-terminal/pull/402)
+  by [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Input bar**
+
+- The input bar keeps its size when you resize the window or change input
+  modes. _(PR [#405](https://github.com/nowledge-co/con-terminal/pull/405) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Images · Linux**
+
+- Magnified Kitty images keep their visible edges instead of disappearing at
+  the viewport boundary. _(PR
+  [#402](https://github.com/nowledge-co/con-terminal/pull/402) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Terminal · macOS**
+
+- Command-click can open terminal links inside mouse-aware apps such as Codex
+  CLI without changing their normal click behavior. For long, wrapped sign-in
+  links, hover and press Command-C to copy the complete address without
+  selecting every line. _(PR
+  [#404](https://github.com/nowledge-co/con-terminal/pull/404) and
+  [#406](https://github.com/nowledge-co/con-terminal/pull/406) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+---
+
+## `v0.1.0-beta.111` - 2026-09-24
+
+### Changed
+
+**Files**
+
+- The sidebar now gives more file types and familiar project files their own
+  icons, including YAML, TOML, archives, fonts, lockfiles, and Dockerfiles.
+  _(PR [#400](https://github.com/nowledge-co/con-terminal/pull/400) by
+  [@frostming](https://github.com/frostming))_
+
+### Fixed
+
+**Agent**
+
+- Repeated terminal waits now report when the visible screen has not changed,
+  instead of inviting the agent to keep polling without a next step. _(PR
+  [#399](https://github.com/nowledge-co/con-terminal/pull/399) by
+  [@adaiguoguo](https://github.com/adaiguoguo))_
+
+**Updates and Releases**
+
+- macOS release builds now prepare Ghostty's dependencies before compilation,
+  avoiding a recurring download failure that could delay Intel and Apple
+  Silicon packages. _(PR
+  [#398](https://github.com/nowledge-co/con-terminal/pull/398) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+---
+
+## `v0.1.0-beta.110` - 2026-09-24
+
+### Fixed
+
+**Tabs**
+
+- Tabs running Claude Code and other recognized agent CLIs no longer ask the
+  suggestion model to rename them on every status tick. A changed task title
+  can still update the tab label. _(PR
+  [#391](https://github.com/nowledge-co/con-terminal/pull/391) by
+  [@adaiguoguo](https://github.com/adaiguoguo))_
+
+**Agent**
+
+- Shell probes now return the terminal's host, path, and environment facts
+  reliably. On zsh, repeated probes no longer leave the prompt stuck in a
+  continuation state. _(PR
+  [#392](https://github.com/nowledge-co/con-terminal/pull/392) by
+  [@adaiguoguo](https://github.com/adaiguoguo))_
+
+**Files**
+
+- File-type icons in the sidebar now use the bundled icon font correctly,
+  instead of showing missing-glyph boxes on macOS. _(PR
+  [#393](https://github.com/nowledge-co/con-terminal/pull/393) by
+  [@adaiguoguo](https://github.com/adaiguoguo))_
+
+---
+
+## `v0.1.0-beta.109` - 2026-09-23
+
+### Fixed
+
+**Settings**
+
+- Ghostty configuration errors now include actionable diagnostic details while
+  keeping long error lists contained and scrollable. Generated configuration
+  locations are labeled clearly, and real include paths retain their line
+  numbers. _(PR [#384](https://github.com/nowledge-co/con-terminal/pull/384)
+  by [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- Settings text now scales consistently with UI Size and remains readable in
+  muted states and narrow windows. Wrapped rows no longer clip, key controls
+  stay accessible, and icon previews render more cleanly. _(PR
+  [#389](https://github.com/nowledge-co/con-terminal/pull/389) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Linux**
+
+- Terminal mouse input now follows applications' requested protocol across
+  clicks, drags, hover motion, and wheel events. Selection, terminal padding,
+  button chords, and releases outside the grid are handled without losing
+  gesture state. _(PR
+  [#387](https://github.com/nowledge-co/con-terminal/pull/387) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.108` - 2026-09-23
+
+### Fixed
+
+**Windows, Linux**
+
+- Terminal apps that use synchronized output now update as complete frames
+  instead of briefly exposing partially drawn content. Con also recovers safely
+  when an application leaves a synchronized update open. _(PR
+  [#380](https://github.com/nowledge-co/con-terminal/pull/380) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- Combining marks, variation selectors, emoji sequences, and other multi-codepoint
+  characters now remain intact across rendering, selection, search, links, and
+  transcript extraction. Wide characters also keep their correct terminal-cell
+  boundaries. _(PR
+  [#382](https://github.com/nowledge-co/con-terminal/pull/382) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.107` - 2026-09-22
+
+### Changed
+
+**AI**
+
+- ChatGPT Subscription now refreshes the current model catalog with valid OAuth
+  credentials, remembers the last successful catalog per account, and offers
+  each model's supported reasoning-effort choices. New configurations default
+  to GPT-5.6 Sol, while saved retired selections remain visible with a clear
+  replacement hint. _(PR
+  [#377](https://github.com/nowledge-co/con-terminal/pull/377) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+### Fixed
+
+**macOS**
+
+- The Settings window's native traffic-light buttons now align vertically with
+  the title and save controls. _(PR
+  [#376](https://github.com/nowledge-co/con-terminal/pull/376) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+---
+
+## `v0.1.0-beta.106` - 2026-09-22
+
+### Fixed
+
+**Windows, Linux**
+
+- Text concealed by terminal applications now stays hidden while remaining
+  available to copy and search. Backgrounds, selections, and cursors continue
+  to render normally. _(PR
+  [#378](https://github.com/nowledge-co/con-terminal/pull/378) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.105` - 2026-09-21
+
+### Changed
+
+**Configuration**
+
+- Con now uses a single Ghostty-style configuration file: `con.conf` on macOS
+  and Linux, and `con-terminal.conf` on Windows. Native terminal options use
+  their Ghostty names, while Con-specific settings remain clearly namespaced.
+  Existing `config.ghostty` and legacy TOML configurations migrate without
+  modifying the originals. _(PR
+  [#373](https://github.com/nowledge-co/con-terminal/pull/373) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- macOS can import an existing Ghostty setup during first launch or later from
+  Settings. Imports are validated before replacing anything, preserve Con's
+  own settings, copy referenced resources into a self-contained snapshot, and
+  keep a backup of the previous configuration. The same import and export
+  workflow is available through `con-cli`. _(PR
+  [#373](https://github.com/nowledge-co/con-terminal/pull/373) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- Workspace layout profiles now use the same readable line-oriented style in
+  `.con/workspace.ghostty`. Existing `.con/workspace.toml` profiles remain
+  readable and are never overwritten. _(PR
+  [#373](https://github.com/nowledge-co/con-terminal/pull/373) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.104` - 2026-09-21
+
+### Added
+
+**AI**
+
+- Con's replies now use a purpose-made raccoon avatar. Two optional
+  raccoon-girl variants are available under **Settings > Appearance > Agent
+  Avatar**, with immediate preview and persistent selection. _(PR
+  [#372](https://github.com/nowledge-co/con-terminal/pull/372) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Changed
+
+**Settings**
+
+- Settings now remains usable in narrow windows, with responsive controls,
+  readable wrapping, and a compact provider picker down to phone-sized widths.
+  Desktop layouts keep their existing density. _(PR
+  [#368](https://github.com/nowledge-co/con-terminal/pull/368) by
+  [@zerob13](https://github.com/zerob13))_
+
+**Developer Experience**
+
+- The repository development guide now follows the standard `AGENTS.md`
+  convention, so supported coding agents can discover the same project
+  instructions without a tool-specific entry point. _(PR
+  [#369](https://github.com/nowledge-co/con-terminal/pull/369) by
+  [@zerob13](https://github.com/zerob13))_
+
+### Fixed
+
+**macOS**
+
+- Terminal apps can now change the system pointer shape, including link,
+  text, crosshair, and resize cursors. Pointer hiding requested while typing is
+  also restored safely across panes, windows, and focus changes. _(PR
+  [#370](https://github.com/nowledge-co/con-terminal/pull/370) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.103` - 2026-09-20
+
+### Added
+
+**Windows, Linux**
+
+- Links embedded by terminal apps now show their real destination while Ctrl is
+  held and open with Ctrl-click. Unsafe destinations are blocked using the same
+  policy as macOS, while ordinary visible URLs continue to work as before.
+  _(PR [#366](https://github.com/nowledge-co/con-terminal/pull/366) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- **Find in Terminal** is now available with Ctrl+F, including scrollback
+  search, match counts, next and previous navigation, and in-terminal
+  highlights. The command palette and configurable shortcut use the same
+  search. _(PR [#367](https://github.com/nowledge-co/con-terminal/pull/367) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.102` - 2026-09-20
+
+### Fixed
+
+**Windows, Linux**
+
+- Cursor shape and blinking now follow requests from shells, editors, and other
+  terminal apps, including steady, blinking, bar, block, and underline cursors.
+  _(PR [#364](https://github.com/nowledge-co/con-terminal/pull/364) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Windows**
+
+- Terminal contents now stay aligned with ConPTY when panes grow or reflow,
+  avoiding stale scrollback being pulled into the visible screen during a
+  resize. _(PR [#365](https://github.com/nowledge-co/con-terminal/pull/365) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.101` - 2026-09-20
+
+### Fixed
+
+**macOS**
+
+- Terminal programs can no longer read the system clipboard without approval.
+  Copy and paste initiated by the user continue to work normally. _(PR
+  [#361](https://github.com/nowledge-co/con-terminal/pull/361) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Windows, Linux**
+
+- Terminal apps that request focus reporting now receive accurate updates when
+  focus moves between panes, windows, dialogs, and Con's input surfaces. This
+  improves focus-aware behavior in editors and other TUIs. _(PR
+  [#362](https://github.com/nowledge-co/con-terminal/pull/362) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.100` - 2026-09-19
+
+### Added
+
+**Tabs**
+
+- Tabs now show the mark of a recognized coding agent running in the terminal,
+  making parallel agent sessions easier to scan without changing tab names or
+  SSH context. _(PR
+  [#360](https://github.com/nowledge-co/con-terminal/pull/360) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+### Fixed
+
+**macOS**
+
+- Saved alternate app icons now appear consistently in Finder and system
+  search, while unsaved previews remain limited to the Dock and Cmd-Tab.
+  Choosing Classic restores the bundled icon. _(PR
+  [#359](https://github.com/nowledge-co/con-terminal/pull/359) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.99` - 2026-09-18
+
+### Added
+
+**Files**
+
+- The file tree now shows distinct, theme-aware icons for common languages,
+  configuration files, images, folders, and unknown files. The editor also
+  gains syntax highlighting for Java, Kotlin, Ruby, C, C++, and Zig files.
+  _(PR [#357](https://github.com/nowledge-co/con-terminal/pull/357) by
+  [@Aumnertic](https://github.com/Aumnertic))_
+
+**Tabs**
+
+- Tab icons now reflect activity and attention states reported through terminal
+  titles, including work happening on hidden surfaces. Custom tab names remain
+  unchanged. _(PR [#358](https://github.com/nowledge-co/con-terminal/pull/358)
+  by [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.98` - 2026-09-16
+
+### Fixed
+
+**Terminal**
+
+- TUI applications can now copy plain text to the system clipboard by default,
+  matching established terminal behavior. Explicit opt-outs, clipboard read
+  protection, text validation, and payload limits remain in place. _(PR
+  [#356](https://github.com/nowledge-co/con-terminal/pull/356) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Windows**
+
+- Terminal text now uses foreground-aware DirectWrite grayscale correction,
+  improving edge weight on both light and dark backgrounds without restoring
+  ClearType color fringes. CJK text retains its tuned contrast profile. _(PR
+  [#349](https://github.com/nowledge-co/con-terminal/pull/349) by
+  [@batkiz](https://github.com/batkiz))_
+
+---
+
+## `v0.1.0-beta.97` - 2026-09-09
+
+### Added
+
+**Terminal**
+
+- New panes can now start with a shell command chosen in Settings, while an
+  empty setting continues to follow the platform default. Commands with
+  arguments and quoted paths are supported. _(PR
+  [#350](https://github.com/nowledge-co/con-terminal/pull/350) by
+  [@batkiz](https://github.com/batkiz))_
+
+- Terminal fonts can now use an ordered fallback list, so CJK text, symbols,
+  emoji, and prompt icons resolve predictably without replacing the primary
+  monospace font. The setting is available under Appearance > Fonts and is
+  applied consistently on macOS, Windows, and Linux. _(PR
+  [#348](https://github.com/nowledge-co/con-terminal/pull/348) by
+  [@batkiz](https://github.com/batkiz))_
+
+### Changed
+
+**Appearance**
+
+- Icons in terminal chrome and app UI now follow the configured terminal and
+  UI font sizes, with bounded scaling that keeps compact controls balanced.
+  _(PR [#354](https://github.com/nowledge-co/con-terminal/pull/354) by
+  [@batkiz](https://github.com/batkiz))_
+
+---
+
+## `v0.1.0-beta.96` - 2026-09-07
+
+### Changed
+
+**Terminal runtime**
+
+- Updated libghostty to its September 4 revision, improving extended-key
+  compatibility, terminal memory use, and idle renderer efficiency. _(PR
+  [#345](https://github.com/nowledge-co/con-terminal/pull/345) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+### Fixed
+
+**Windows**
+
+- Changing the terminal font or its size now updates panes that are already
+  open, including their cell metrics and shell geometry. _(PR
+  [#346](https://github.com/nowledge-co/con-terminal/pull/346) by
+  [@batkiz](https://github.com/batkiz))_
+
+**macOS**
+
+- Selecting terminal text copies it to the clipboard again, without weakening
+  the permission gate for clipboard writes initiated by terminal programs.
+  _(PR [#345](https://github.com/nowledge-co/con-terminal/pull/345) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.95` - 2026-09-06
+
+### Fixed
+
+**macOS**
+
+- Restored `con-cli` and local automation connectivity by leaving shared
+  control-socket parent directories such as `/tmp` untouched, while keeping
+  Con-created runtime directories private. _(PR
+  [#341](https://github.com/nowledge-co/con-terminal/pull/341) by
+  [@Job28703](https://github.com/Job28703))_
+- Terminal links now reject unsafe OSC 8 targets before opening a browser,
+  while preserving supported web, mail, file, and SSH links. _(PR
+  [#340](https://github.com/nowledge-co/con-terminal/pull/340) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- Terminal surfaces now pause before system sleep and resume only after the
+  display topology has settled, avoiding the CoreVideo display-link hang
+  observed when waking a Mac onto an external display. _(PR
+  [#342](https://github.com/nowledge-co/con-terminal/pull/342) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+---
+
+## `v0.1.0-beta.94` - 2026-09-02
+
+### Changed
+
+**Windows and Linux**
+
+- Terminal selection now uses libghostty-vt's canonical selection model,
+  keeping drag, word, line, and scrollback selection behavior consistent with
+  terminal state. _(PR
+  [#338](https://github.com/nowledge-co/con-terminal/pull/338) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+### Fixed
+
+**Windows**
+
+- Mouse reporting now uses Ghostty's protocol encoder, improving wheel,
+  button, modifier, coordinate, and alternate-scroll handling in terminal
+  applications. _(PR
+  [#339](https://github.com/nowledge-co/con-terminal/pull/339) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.93` - 2026-09-01
+
+### Added
+
+**macOS**
+
+- SSH shell integration now supports Ghostty's `+ssh` wrapper through Con's
+  bundle-local `con-cli`, including terminal environment forwarding and
+  best-effort `xterm-ghostty` terminfo setup. If setup is unavailable, SSH
+  continues with the standard `xterm-256color` terminal type. _(PR
+  [#335](https://github.com/nowledge-co/con-terminal/pull/335) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Windows and Linux**
+
+- Terminal updates now consume incremental dirty-row changes, reducing
+  unnecessary parser and renderer work during continuous output and window
+  resizing. _(PR
+  [#336](https://github.com/nowledge-co/con-terminal/pull/336) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Developer tools**
+
+- Terminal execution now recognizes semantic shell prompt state on Windows and
+  Linux when shell integration is available, improving completion detection
+  for visible agent-run commands while retaining the existing fallback. _(PR
+  [#328](https://github.com/nowledge-co/con-terminal/pull/328) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- Agent-run commands now report an unconfirmed result instead of claiming
+  success when shell prompt integration disappears before completion can be
+  verified. _(PR
+  [#330](https://github.com/nowledge-co/con-terminal/pull/330) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- Portable terminal sessions now surface title, working-directory, bell,
+  progress, notification, and clipboard effects consistently on Windows and
+  Linux, with bounded payloads and conservative clipboard defaults. _(PR
+  [#331](https://github.com/nowledge-co/con-terminal/pull/331) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- The control plane can now identify the foreground process group and PTY for
+  macOS panes when the terminal backend supports those details. _(PR
+  [#332](https://github.com/nowledge-co/con-terminal/pull/332) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+- macOS release validation now checks the bundle-local SSH compatibility
+  entry point in the app bundle, ZIP, and DMG before artifacts can be
+  published. _(PR [#334](https://github.com/nowledge-co/con-terminal/pull/334)
+  and PR [#337](https://github.com/nowledge-co/con-terminal/pull/337) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+---
+
+## `v0.1.0-beta.92` - 2026-08-31
+
+### Fixed
+
+**macOS**
+
+- Improved IME composition rendering by keeping marked text, cursor
+  suppression, underlining, and cell layout in the terminal renderer. _(PR
+  [#326](https://github.com/nowledge-co/con-terminal/pull/326) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.91` - 2026-08-31
+
+### Fixed
+
+**macOS**
+
+- Removed an unsupported Ghostty SSH terminfo helper invocation that could
+  print a missing `Contents/MacOS/ghostty` error before SSH connections. SSH
+  environment integration remains enabled. _(PR [#321](https://github.com/nowledge-co/con-terminal/pull/321) by [@wey-gu](https://github.com/wey-gu))_
+- Restored automatic SSH terminfo setup by routing Ghostty's existing shell
+  integration helper through the native `con-cli` implementation in the app
+  bundle. _(PR [#323](https://github.com/nowledge-co/con-terminal/pull/323) by [@wey-gu](https://github.com/wey-gu))_
+
+### Added
+
+**Developer tools**
+
+- Added the native `con-cli +ssh-cache` command for tracking remote hosts that
+  already have Con's terminal definition installed. The cache stores host
+  metadata only and provides stable exit codes for shell integration. _(PR [#322](https://github.com/nowledge-co/con-terminal/pull/322) by [@wey-gu](https://github.com/wey-gu))_
+
+---
+
+## `v0.1.0-beta.90` - 2026-08-30
+
+### Added
+
+**Linux**
+
+- Con now works as an `xdg-terminal-exec` provider, so desktop launchers can
+  open a requested directory or start a TUI with its arguments, title, and app
+  identity preserved. The official installer, tarball, and Flatpak metadata
+  advertise the same capabilities. _(PR
+  [#317](https://github.com/nowledge-co/con-terminal/pull/317) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Linux**
+
+- Matched the installed launcher icon name to Con's desktop application id, so
+  launchers can resolve the correct icon and group windows consistently. Older
+  release archives remain compatible with the installer. _(PR
+  [#318](https://github.com/nowledge-co/con-terminal/pull/318) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+---
+
+## `v0.1.0-beta.89` - 2026-08-30
+
+### Added
+
+**Settings**
+
+- Appearance now includes a selectable raccoon app-icon grid. On macOS the
+  choice updates the Dock and Cmd-Tab image for the running app; Finder still
+  uses the bundled icon. _(PR
+  [#311](https://github.com/nowledge-co/con-terminal/pull/311) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**macOS**
+
+- Refined trackpad scrolling in shell scrollback by preserving precise input
+  deltas instead of applying an extra host-side speed multiplier. This keeps
+  slow, fine-grained scrolling from feeling unexpectedly fast while leaving
+  terminal applications' own scroll handling unchanged. _(PR
+  [#308](https://github.com/nowledge-co/con-terminal/pull/308) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Changed
+
+**macOS**
+
+- Added a subtle overlay scrollbar for terminal scrollback. It appears only
+  when a pane has history beyond the visible screen, without changing the
+  terminal's layout or transparency behavior. _(PR
+  [#309](https://github.com/nowledge-co/con-terminal/pull/309) by
+  [@wey-gu](https://github.com/wey-gu))_
+- Clicking a scrollback scrollbar now also focuses its pane, so the next
+  keyboard input goes to the pane the user is working with. _(PR
+  [#310](https://github.com/nowledge-co/con-terminal/pull/310) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Branding**
+
+- Updated the company name shown in Con's About window, license, and Flatpak
+  metadata to **Nowledge Labs, Inc.** Apple signing and notarization settings
+  are unchanged. _(PR
+  [#306](https://github.com/nowledge-co/con-terminal/pull/306) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Input Bar**
+
+- Restored the UI typeface for natural-language Agent input and aligned its
+  baseline with Smart and Shell modes. The mode control now also shows the
+  configured shortcut for switching modes with the same keycaps used elsewhere
+  in Con. _(PR
+  [#307](https://github.com/nowledge-co/con-terminal/pull/307) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+---
+
+## `v0.1.0-beta.88` - 2026-08-28
+
+### Added
+
+**Settings**
+
+- Added per-shortcut and global reset actions in Keyboard Shortcuts, so custom
+  bindings can be restored without rebuilding the entire configuration. _(PR
+  [#305](https://github.com/nowledge-co/con-terminal/pull/305) by
+  [@zhangmo8](https://github.com/zhangmo8))_
+
+### Fixed
+
+**Updates and Releases**
+
+- Improved release and update reliability when macOS, Linux, and Windows
+  artifacts finish concurrently. Appcast publication now retries safely, and
+  incomplete releases remain unpublished instead of being exposed to users.
+  _(PR [#304](https://github.com/nowledge-co/con-terminal/pull/304) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Settings**
+
+- Fixed Shift disappearing from shortcut keycaps when macOS records the shifted
+  character directly. _(PR
+  [#305](https://github.com/nowledge-co/con-terminal/pull/305) by
+  [@zhangmo8](https://github.com/zhangmo8))_
+
+---
+
+## `v0.1.0-beta.87` - 2026-08-27
+
+### Added
+
+**macOS**
+
+- Added **Find in Terminal** with Cmd+F, match counts, next/previous
+  navigation, and selection highlights backed by Ghostty's native terminal
+  search. It is also available from the Edit menu, command palette, and
+  configurable shortcuts. _(PR
+  [#303](https://github.com/nowledge-co/con-terminal/pull/303) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+### Fixed
+
+**Settings**
+
+- Fixed the unsaved-changes confirmation flow for the Settings panel. Escape,
+  Cmd+W, and clicking outside the panel now close it consistently when it is
+  safe to do so, while preserving the option to keep editing, discard, or
+  save changes. _(PR
+  [#301](https://github.com/nowledge-co/con-terminal/pull/301) by
+  [@zhangmo8](https://github.com/zhangmo8))_
+
+**Terminal**
+
+- Fixed terminal mouse interactions that begin inside a pane and end outside
+  it. Con now completes the matching mouse release exactly once, including
+  during focus changes and pane teardown, so selections and mouse-aware TUIs
+  do not remain stuck. _(PR
+  [#302](https://github.com/nowledge-co/con-terminal/pull/302) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+---
+
+## `v0.1.0-beta.86` - 2026-08-27
+
+### Added
+
+**Windows, Linux**
+
+- Added portable Kitty keyboard encoding, mediated clipboard paste, and
+  bounded static image rendering while retaining each platform's native PTY
+  and renderer. _(PR
+  [#297](https://github.com/nowledge-co/con-terminal/pull/297) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Window Management**
+
+- Added an option to keep a window open after its last tab is closed. When
+  enabled, Con opens a fresh tab in that window instead of closing it. _(PR
+  [#295](https://github.com/nowledge-co/con-terminal/pull/295) by
+  [@zhangmo8](https://github.com/zhangmo8))_
+
+---
+
+## `v0.1.0-beta.85` - 2026-08-25
+
+### Added
+
+**macOS**
+
+- Added native desktop notifications for terminal applications that emit OSC 9
+  or OSC 777 sequences, including the first notification shown while Con asks
+  for notification permission. _(PR
+  [#290](https://github.com/nowledge-co/con-terminal/pull/290) by
+  [@yyhhyyyyyy](https://github.com/yyhhyyyyyy))_
+
+**Packaging**
+
+- Added Flatpak packaging and automated AetherPak repository deployment to GitHub Pages (`https://con-releases.nowledge.co/flatpak`), supporting both `x86_64` and `aarch64` architectures. _(PR [#276](https://github.com/nowledge-co/con-terminal/pull/276) by [@abn](https://github.com/abn))_
+- Added automatic container detection and host shell forwarding in the Linux PTY backend using `flatpak-spawn --host`. _(PR [#276](https://github.com/nowledge-co/con-terminal/pull/276) by [@abn](https://github.com/abn))_
+
+### Fixed
+
+**Linux**
+
+- Fixed top bar window decorations to support drag-to-move across Linux window managers. _(PR [#276](https://github.com/nowledge-co/con-terminal/pull/276) by [@abn](https://github.com/abn))_
+
+---
+
+## `v0.1.0-beta.84` - 2026-08-13
+
+### Added
+
+**Editor**
+
+- Added a read-only image viewer for local image files opened from the file
+  tree, sidebar search, or drag-and-drop. Images fit the editor pane without
+  entering text-edit mode, and oversized files show a safe placeholder instead
+  of being decoded at full resolution; the guard checks both file size and
+  declared image dimensions before previewing. _(PR
+  [#270](https://github.com/nowledge-co/con-terminal/pull/270) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+### Fixed
+
+**Sidebar**
+
+- Fixed sidebar rail icons and file-search result icons stretching when the
+  window is compressed. The session rail now keeps controls fixed and scrolls
+  the session list instead of shrinking icon boxes. _(PR
+  [#272](https://github.com/nowledge-co/con-terminal/pull/272) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+---
+
+## `v0.1.0-beta.83` - 2026-08-11
+
+### Fixed
+
+**Terminal**
+
+- Forward right-clicks to terminal apps that enabled mouse reporting, so TUI
+  menus work as expected while Con's context menu still appears for ordinary
+  shell right-clicks. _(PR
+  [#266](https://github.com/nowledge-co/con-terminal/pull/266) by
+  [@sunny0826](https://github.com/sunny0826))_
+- Fixed shifted text input in macOS terminal applications such as LazyGit, so
+  `Shift+P` reaches apps as uppercase `P` instead of triggering lowercase `p`
+  actions. _(PR [#264](https://github.com/nowledge-co/con-terminal/pull/264) by
+  [@Eric-Song-Nop](https://github.com/Eric-Song-Nop))_
+
+---
+
+## `v0.1.0-beta.82` - 2026-08-07
+
+### Changed
+
+**Markdown**
+
+- Updated the Mermaid renderer and HTML parser stack used by rich Markdown so
+  diagram and inline HTML previews stay aligned with current upstream fixes.
+  _(PR [#263](https://github.com/nowledge-co/con-terminal/pull/263) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Sidebar**
+
+- Fixed pinned sidebar tab clicks so selecting the active tab no longer
+  collapses the panel, preserving drag reorder and double-click rename flows.
+  _(PR [#261](https://github.com/nowledge-co/con-terminal/pull/261) by
+  [@sunny0826](https://github.com/sunny0826))_
+- Fixed vertical-tab hover cards so they render as workspace overlays, stay
+  inside the window, and clear stale hover state when the rail is hidden. _(PR
+  [#262](https://github.com/nowledge-co/con-terminal/pull/262) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+---
+
+## `v0.1.0-beta.81` - 2026-08-06
+
+### Added
+
+**Editor**
+
+- Added a file-tree affordance to open files in a dedicated editor tab. The
+  editor tab is reused for additional files, keeps terminal pane layouts
+  untouched, and remains separate from the existing row-click behavior. _(PR
+  [#257](https://github.com/nowledge-co/con-terminal/pull/257) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+### Fixed
+
+**Editor**
+
+- Fixed Markdown preview alignment in wide editor panes: code blocks, tables,
+  and Mermaid diagrams now share the centered content column instead of
+  spanning the pane edge, and long code lines scroll horizontally. _(PR
+  [#258](https://github.com/nowledge-co/con-terminal/pull/258) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+---
+
+## `v0.1.0-beta.80` - 2026-08-05
+
+### Added
+
+**Editor**
+
+- Added an in-place Markdown preview for editor tabs, with live refresh,
+  rendered tables, code blocks, math, Mermaid diagrams, common inline HTML,
+  and local or remote images resolved from the document. _(PR
+  [#254](https://github.com/nowledge-co/con-terminal/pull/254) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+### Fixed
+
+**Editor**
+
+- Fixed Markdown preview layout in wide editor panes: blockquotes now wrap
+  inside the preview column, and prose is centered instead of hugging the left
+  edge. _(PR [#255](https://github.com/nowledge-co/con-terminal/pull/255) by
+  [@sunny0826](https://github.com/sunny0826))_
+
+---
+
+## `v0.1.0-beta.79` - 2026-07-25
+
+### Changed
+
+**Agent**
+
+- Updated Con's built-in agent to Rig 0.40 while preserving live responses,
+  tool approvals, conversation history, and existing turn limits. The agent now
+  follows Rig's published release instead of an interim source revision. _(PR
+  [#250](https://github.com/nowledge-co/con-terminal/pull/250) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Providers**
+
+- Fixed ChatGPT Subscription model discovery after the Codex model catalog
+  started requiring an explicit client compatibility version. **Fetch Models**
+  now loads the account's available catalog, including GPT-5.6 models where
+  available, and the offline fallback includes the GPT-5.6 family. _(PR
+  [#252](https://github.com/nowledge-co/con-terminal/pull/252) by
+  [@wey-gu](https://github.com/wey-gu); reported in issue
+  [#251](https://github.com/nowledge-co/con-terminal/issues/251) by
+  [@zjp1997720](https://github.com/zjp1997720))_
+
+---
+
+## `v0.1.0-beta.78` - 2026-07-15
+
+### Added
+
+**Agent**
+
+- Added **Ask AI** for terminal selections. Use the terminal context menu or
+  the configurable shortcut to place selected output in the agent input as a
+  fenced block. Assistant replies can also switch into selectable-text mode,
+  and thinking or tool-output details now have their own copy controls. _(PR
+  [#248](https://github.com/nowledge-co/con-terminal/pull/248) by
+  [@hhh2210](https://github.com/hhh2210))_
+
+### Changed
+
+**Providers**
+
+- Made ChatGPT Subscription ready on first launch for users already signed in
+  to Codex. Con now imports the compatible Codex auth cache during config load,
+  chooses ChatGPT only when the provider is still an implicit, unconfigured
+  default, and uses GPT-5.5 as the default ChatGPT model. Explicit provider and
+  model choices remain unchanged. _(PR
+  [#245](https://github.com/nowledge-co/con-terminal/pull/245) by
+  [@hhh2210](https://github.com/hhh2210))_
+- Updated the offline OpenAI model list with current GPT-5.5 and GPT-5.4
+  options, while retaining supported o3 and GPT-4.1 models. These choices stay
+  available when a compatible endpoint returns an incomplete model catalog.
+  _(PR [#246](https://github.com/nowledge-co/con-terminal/pull/246) by
+  [@dongshunyao](https://github.com/dongshunyao))_
+
+### Fixed
+
+**Agent**
+
+- Fixed ChatGPT Subscription auth becoming stale after Codex rotates its
+  credentials. Con refreshes imported credentials without overwriting a cache
+  refreshed locally, clears stale state before manual reauthorization, and
+  keeps the model picker focused on models available to subscription accounts.
+  _(PR [#244](https://github.com/nowledge-co/con-terminal/pull/244) by
+  [@hhh2210](https://github.com/hhh2210))_
+
+**Chat**
+
+- Fixed code-block copy feedback leaking between messages. Each copy control
+  now keeps independent state, including code blocks nested inside lists and
+  blockquotes. _(PR
+  [#247](https://github.com/nowledge-co/con-terminal/pull/247) by
+  [@hhh2210](https://github.com/hhh2210))_
+
+---
+
 ## `v0.1.0-beta.77` - 2026-06-08
 
 ### Added
@@ -159,6 +1717,13 @@ con is still pre-release, so entries may group related beta work while the produ
 
 ### Fixed
 
+**Agent**
+
+- Kept the model picker within the agent-panel header so its options no longer
+  push the other controls out of view. _(PR
+  [#209](https://github.com/nowledge-co/con-terminal/pull/209) by
+  [@wey-gu](https://github.com/wey-gu))_
+
 **Terminal**
 
 - Improved terminal input responsiveness by keeping normal keypresses out of
@@ -169,7 +1734,7 @@ con is still pre-release, so entries may group related beta work while the produ
   [#208](https://github.com/nowledge-co/con-terminal/pull/208) by
   [@wey-gu](https://github.com/wey-gu))_
 
-## `v0.1.0-beta.72` - 2026-05-12
+## `v0.1.0-beta.72` - 2026-05-13
 
 ### Changed
 
@@ -623,10 +2188,21 @@ con is still pre-release, so entries may group related beta work while the produ
 - Added an Appearance setting to hide pane title bars when you want the
   sparsest terminal-only layout. _(PR [#149](https://github.com/nowledge-co/con-terminal/pull/149) by [@sundy-li](https://github.com/sundy-li))_
 
+**Tabs**
+
+- Kept vertical tab rows the same height while a new tab's subtitle loads, so
+  neighboring tabs no longer jump. _(PR
+  [#154](https://github.com/nowledge-co/con-terminal/pull/154) by
+  [@chenghuzi](https://github.com/chenghuzi))_
+
 ### Fixed
 
 **macOS**
 
+- Kept the selected cursor shape visible at shell prompts rather than letting
+  Ghostty's shell integration replace it with a bar. _(PR
+  [#155](https://github.com/nowledge-co/con-terminal/pull/155) by
+  [@chenghuzi](https://github.com/chenghuzi))_
 - Fixed embedded Ghostty surface scale sync when moving a window between Retina
   and non-Retina displays. Existing panes now update display id, backing scale,
   layer scale, and pixel size together instead of keeping stale cell metrics. _(PR [#150](https://github.com/nowledge-co/con-terminal/pull/150) by [@chenghuzi](https://github.com/chenghuzi))_
@@ -655,7 +2231,7 @@ con is still pre-release, so entries may group related beta work while the produ
 - Made the portable CI Zig installer retry against Con's mirror if the primary
   Zig download fails. _(PR [#149](https://github.com/nowledge-co/con-terminal/pull/149) by [@sundy-li](https://github.com/sundy-li))_
 
-## `v0.1.0-beta.63` - 2026-05-05
+## `v0.1.0-beta.63` - 2026-05-06
 
 ### Added
 
@@ -663,7 +2239,7 @@ con is still pre-release, so entries may group related beta work while the produ
 
 - Added **Quick Terminal** to the command palette on macOS, matching the View
   menu entry so it can be opened while Con is frontmost even when the global
-  hotkey is disabled. _(PR [#146](https://github.com/nowledge-co/con-terminal/pull/146) by [@nowledge-co](https://github.com/nowledge-co))_
+  hotkey is disabled. _(PR [#146](https://github.com/nowledge-co/con-terminal/pull/146) by [@wey-gu](https://github.com/wey-gu))_
 
 ### Fixed
 
@@ -672,13 +2248,15 @@ con is still pre-release, so entries may group related beta work while the produ
 - Fixed pane-local surface geometry drift that could make TUI output appear
   clipped after switching between surfaces or changing pane layouts. Activating
   a surface now revalidates Ghostty's embedded terminal size against the
-  current pane before exposing it. _(PR [#146](https://github.com/nowledge-co/con-terminal/pull/146) by [@nowledge-co](https://github.com/nowledge-co))_
+  current pane before exposing it. _(PR [#146](https://github.com/nowledge-co/con-terminal/pull/146) by [@wey-gu](https://github.com/wey-gu))_
 
 **Linux**
 
 - Fixed Linux preview terminal rows wrapping like prose in split panes. Rows now
   stay on one fixed terminal line and clip at the pane edge, which prevents TUI
-  layouts from reflowing into later rows. _(PR [#146](https://github.com/nowledge-co/con-terminal/pull/146) by [@nowledge-co](https://github.com/nowledge-co))_
+  layouts from reflowing into later rows. _(PR
+  [#143](https://github.com/nowledge-co/con-terminal/pull/143) by
+  [@sundy-li](https://github.com/sundy-li))_
 
 ### Changed
 
@@ -687,7 +2265,7 @@ con is still pre-release, so entries may group related beta work while the produ
 - Added low-noise macOS surface geometry diagnostics behind
   `CON_GHOSTTY_PROFILE`, so reproduced pane/surface clipping reports can include
   a log file and `con-cli surfaces list` snapshot without requiring a special
-  debug build. _(PR [#146](https://github.com/nowledge-co/con-terminal/pull/146) by [@nowledge-co](https://github.com/nowledge-co))_
+  debug build. _(PR [#146](https://github.com/nowledge-co/con-terminal/pull/146) by [@wey-gu](https://github.com/wey-gu))_
 
 ## `v0.1.0-beta.62` - 2026-05-05
 
@@ -699,18 +2277,40 @@ con is still pre-release, so entries may group related beta work while the produ
   slides down from the active screen, keeps its live tabs/panes while hidden,
   and can return focus to the app you were using before it appeared. It is off
   by default; enable it in Settings -> Keys and use Cmd-Backslash or your chosen
-  shortcut.
+  shortcut. _(PR [#135](https://github.com/nowledge-co/con-terminal/pull/135)
+  by [@sundy-li](https://github.com/sundy-li))_
 - Added public Quick Terminal documentation covering setup, hide/show behavior,
   live state, destruction, and the difference from Summon / Hide Con.
 - Added **New Window** to the macOS Dock menu, so right-clicking the Dock icon
-  can open a fresh Con window without first focusing an existing one.
+  can open a fresh Con window without first focusing an existing one. _(PR
+  [#138](https://github.com/nowledge-co/con-terminal/pull/138) by
+  [@sundy-li](https://github.com/sundy-li))_
+
+**Tabs**
+
+- Added Shift-Command-B on macOS and Control-Alt-B on Windows and Linux to
+  collapse or expand the vertical tab sidebar. The action is also in the
+  command palette and can be remapped. _(PR
+  [#141](https://github.com/nowledge-co/con-terminal/pull/141) by
+  [@sundy-li](https://github.com/sundy-li))_
+
+**Linux**
+
+- Set the window app ID so Wayland and X11 desktops group Con windows with
+  their launcher. _(PR
+  [#137](https://github.com/nowledge-co/con-terminal/pull/137) by
+  [@jenningsloy318](https://github.com/jenningsloy318))_
+- Added Arch Linux installation guidance. _(PR
+  [#136](https://github.com/nowledge-co/con-terminal/pull/136) by
+  [@czyt](https://github.com/czyt))_
 
 **Developer Experience**
 
 - Added a cross-platform `justfile` for common build, run, test, release,
   install, and cleanup flows. The default recipes now dispatch through the
   Windows-safe `cargo w*` aliases when needed while staying simple on macOS and
-  Linux.
+  Linux. _(PR [#138](https://github.com/nowledge-co/con-terminal/pull/138) by
+  [@sundy-li](https://github.com/sundy-li))_
 - Kept project-local `.con/workspace.toml` profiles commit-friendly. Con still
   treats private runtime state separately, while generated layout profiles can
   live with the project when a team wants to share them.
@@ -731,54 +2331,12 @@ con is still pre-release, so entries may group related beta work while the produ
 
 - Added inline rename for horizontal tabs. Double-click a tab title to edit it
   in place, with focus-time select-all, Enter/blur save, and Escape cancel.
+  _(PR [#132](https://github.com/nowledge-co/con-terminal/pull/132) by
+  [@sundy-li](https://github.com/sundy-li))_
 - Added browser-style drag reorder for horizontal tabs, including left/right
-  drop slots and a real trailing drop target after the last tab.
-
-**Distribution**
-
-- Bundled `con-cli` with every release artifact. macOS now ships it inside the
-  app bundle and exposes it through Homebrew/script installs; Linux tarballs
-  install both `con` and `con-cli`; Windows ZIP/script installs include
-  `con-app.exe` and `con-cli.exe`.
-- Added a conservative macOS launch-time self-heal for `~/.local/bin/con-cli`
-  so manual-DMG installs and Sparkle-updated app bundles converge to the same
-  CLI availability as installer/Homebrew installs without overwriting
-  user-managed binaries.
-- Added release verification for the macOS app bundle so a signed/notarized
-  build cannot ship without the control-plane CLI.
-- Added blocking release gates for installer/update safety. macOS and Linux
-  release jobs now verify artifact layout before upload; Windows verifies the
-  ZIP contains both `con-app.exe` and `con-cli.exe`; the finalizer refuses to
-  publish a draft unless all expected assets, appcasts, and gh-pages installer
-  scripts are present and point at the same tag.
-- Tightened those release gates after review: appcasts are now parsed as XML,
-  each macOS architecture publishes its own checksum asset, the finalizer runs
-  from the tagged revision, and the macOS CLI shim ignores transient DMG/test
-  app bundles.
-- Hardened internal `v*-dev.*` release behavior so dev smoke tags are scoped to
-  dev app names/bundle ids, never embed/update stable/beta appcasts, and never
-  update Homebrew casks while the final gate still validates their artifact
-  shape.
-- Aligned the Linux runtime app id, desktop entry filename, and
-  `StartupWMClass` as `co.nowledge.con` so Wayland and X11 launchers can group
-  running Con windows with the installed app entry.
-- Made the release finalizer sync hosted installer scripts from the tagged
-  commit before promotion, so dev smoke tags can test the real `install.sh` /
-  `install.ps1` path without moving beta/stable appcasts or Homebrew casks.
-- Fixed macOS release signing order so the bundled `con-cli` executable is
-  signed before the main app executable and notarized DMGs are not blocked by
-  unsigned nested code.
-- Documented that `con-cli` is part of the normal install path for surface
-  orchestrators such as `pi-interactive-subagents`.
-
-### Changed
-
-**Settings**
-
-- Settings header now shows last-saved time — "Saved just now", "Saved Xm ago", or "Saved Xh ago" with a check-circle icon after a successful save. The timestamp is seeded from `config.toml`'s modification time on init so the indicator persists across settings window reopens.
-- Added `cmd-s` (macOS) / `ctrl-s` (Windows/Linux) keybinding to trigger Save Changes from anywhere in the settings panel.
-- Added `cmd-w` (macOS) / `ctrl-w` (Windows/Linux) to close the standalone settings window or save-and-dismiss in panel mode. Closing via `cmd-w` now correctly reverts any unsaved standalone preview changes, matching the existing Escape path.
-- Save Changes button in the standalone settings window now shows a `⌘ S` / `Ctrl S` keycap hint.
+  drop slots and a real trailing drop target after the last tab. _(PR
+  [#132](https://github.com/nowledge-co/con-terminal/pull/132) by
+  [@sundy-li](https://github.com/sundy-li))_
 
 ### Fixed
 
@@ -786,11 +2344,72 @@ con is still pre-release, so entries may group related beta work while the produ
 
 - Made sidebar and horizontal tab rename lifecycles consistent: unchanged
   rename blur restores terminal focus without pinning smart AI/SSH/CWD labels,
-  while real edits still persist as explicit user names.
+  while real edits still persist as explicit user names. _(PR
+  [#132](https://github.com/nowledge-co/con-terminal/pull/132) by
+  [@sundy-li](https://github.com/sundy-li))_
 - Prevented Escape-cancelled rename editors from committing through delayed blur
-  events, even if the user immediately reopens rename on the same tab.
+  events, even if the user immediately reopens rename on the same tab. _(PR
+  [#132](https://github.com/nowledge-co/con-terminal/pull/132) by
+  [@sundy-li](https://github.com/sundy-li))_
 - Kept macOS titlebar dragging from stealing tab drag/click interactions while
-  preserving the normal double-click titlebar behavior.
+  preserving the normal double-click titlebar behavior. _(PR
+  [#132](https://github.com/nowledge-co/con-terminal/pull/132) by
+  [@sundy-li](https://github.com/sundy-li))_
+
+## `v0.1.0-beta.60` - 2026-05-04
+
+### Added
+
+**Settings**
+
+- Settings now shows when changes were last saved, keeps that timestamp when
+  reopened, and offers Command-S / Control-S to save. Command-W / Control-W
+  closes Settings and discards an unsaved preview when appropriate. _(PR
+  [#126](https://github.com/nowledge-co/con-terminal/pull/126) by
+  [@sundy-li](https://github.com/sundy-li))_
+
+**Windows**
+
+- Documented installation through the community-maintained Scoop bucket.
+  _(PR [#123](https://github.com/nowledge-co/con-terminal/pull/123) by
+  [@EFLKumo](https://github.com/EFLKumo))_
+
+## `v0.1.0-beta.59` - 2026-05-04
+
+### Added
+
+**Distribution**
+
+- Bundled `con-cli` with macOS, Windows, and Linux releases, including the
+  normal installer paths and a conservative macOS repair for manual DMG and
+  Sparkle installs that does not overwrite user-managed binaries. _(PR
+  [#119](https://github.com/nowledge-co/con-terminal/pull/119) by
+  [@wey-gu](https://github.com/wey-gu))_
+- Added release checks for CLI packaging, appcasts, checksums, installer
+  scripts, and isolated dev releases before promoting a beta. _(PR
+  [#122](https://github.com/nowledge-co/con-terminal/pull/122) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**macOS**
+
+- Signed the bundled `con-cli` before the main app, so notarization accepts
+  the complete app bundle. _(PR
+  [#121](https://github.com/nowledge-co/con-terminal/pull/121) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.58` - 2026-05-03
+
+### Fixed
+
+**Sessions**
+
+- Restored each pane's saved working directory and terminal text across
+  restarts, including protected folders on macOS, without inferring a path
+  from the prompt. _(PR
+  [#118](https://github.com/nowledge-co/con-terminal/pull/118) by
+  [@wey-gu](https://github.com/wey-gu))_
 
 ## `v0.1.0-beta.57` - 2026-05-03
 
@@ -842,6 +2461,37 @@ con is still pre-release, so entries may group related beta work while the produ
 - Made the embedded Ghostty initial-output restore hook fail soft for local best-effort builds while keeping macOS release packaging fail-hard, so upstream anchor drift blocks a release instead of silently shipping without terminal text seeding.
 - Fixed cwd restore for macOS privacy-protected directories such as Documents and Downloads. Con's embedded Ghostty path now trusts the shell-integration cwd passed by the app instead of rejecting it during directory open/stat preflight, which macOS may deny even when the shell can `cd` there.
 
+## `v0.1.0-beta.56` - 2026-05-03
+
+### Changed
+
+**Command Palette**
+
+- Refined search, row spacing, typography, and selection styling, and rendered
+  shortcuts as separate, platform-aware keycaps. _(PR
+  [#112](https://github.com/nowledge-co/con-terminal/pull/112) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Terminal**
+
+- Made Clear Terminal work from the menu and command palette on macOS,
+  Windows, and Linux. _(PR
+  [#112](https://github.com/nowledge-co/con-terminal/pull/112) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+**Input bar**
+
+- Kept AI command suggestions usable when a provider replies after the user
+  has typed further into the same command. _(PR
+  [#112](https://github.com/nowledge-co/con-terminal/pull/112) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.55` - 2026-05-02
+
+This tag used the same source revision as beta.54.
+
 ## `v0.1.0-beta.54` - 2026-05-02
 
 ### Added
@@ -854,31 +2504,12 @@ con is still pre-release, so entries may group related beta work while the produ
 - Clarified the human surface model in menus and docs: surfaces are tab-like sessions inside one pane, while surface split commands create a new visible pane first. The terminal context menu now also includes Settings for direct access.
 - Refined the in-pane surface rail from a full-width header into compact local chrome, so a pane with multiple surfaces no longer looks like another nested pane split.
 
-### Changed
-
-**Command Palette**
-
-- Normalized the command palette to Con's current design language: system UI typography, quieter selected-row treatment, a softer search well, and cleaner shortcut alignment.
-- Rendered shortcuts as separate keycaps in the Command Palette and terminal context menu, with platform-aware labels on macOS, Windows, and Linux.
-
 ### Fixed
 
 **Control Plane**
 
 - Kept inactive pane-local surfaces sized to their host pane while they are hidden. TUI coding agents launched in background surfaces now receive the same terminal rows/columns they will have when focused, avoiding incorrect layout assumptions in multi-surface orchestrator workflows. Fixes [#108](https://github.com/nowledge-co/con-terminal/issues/108).
 - Fixed a crash when committing an inline surface rename from the pane-local surface rail.
-
-**Terminal, macOS**
-
-- Fixed Clear Terminal from the app menu and Command Palette by passing the Ghostty binding action name correctly to the embedded terminal.
-
-**Terminal, Windows and Linux Backends**
-
-- Wired Clear Terminal for the preview backends so the shared menu and Command Palette action clears the local VT screen and scrollback there as well.
-
-**Input Bar**
-
-- Made AI command suggestions more tolerant of provider latency: if a completion arrives after the user has typed further into the same suggested command, Con now still shows the remaining ghost text instead of dropping the result as stale.
 
 ## `v0.1.0-beta.53` - 2026-05-02
 
@@ -898,14 +2529,20 @@ con is still pre-release, so entries may group related beta work while the produ
 - Added Command Palette entries for pane-local terminal surfaces. Users can now create the first surface as a visible split, create additional surfaces inside the focused pane, cycle between surfaces in that pane, and close the current surface without reaching for `con-cli`.
 - Added a terminal right-click context menu across macOS, Windows, and Linux. It exposes paste/copy/clear, pane split and zoom controls, pane-local surface controls, Focus Input, and Command Palette through the same action system as keybindings and the app menu.
 
-## `v0.1.0-beta.50` - 2026-05-01
-
-**Terminal, macOS**
-
-- Now zoom window can be done double-click on titlebar
-- Zoomed window fixed buttom one pixel spacing leaked
+## `v0.1.0-beta.51` - 2026-05-01
 
 ### Fixed
+
+**macOS**
+
+- Window zoom and fullscreen now fill the available screen, and double-clicking
+  the tab bar zooms the window again. _(PR
+  [#104](https://github.com/nowledge-co/con-terminal/pull/104) by
+  [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.50` - 2026-05-01
+
+No application changes; this tag updated the previous release notes.
 
 ## `v0.1.0-beta.49` - 2026-05-01
 
@@ -913,7 +2550,6 @@ con is still pre-release, so entries may group related beta work while the produ
 
 **Terminal, macOS**
 
-- Fixed macOS window zoom/fullscreen behavior so Con no longer leaves a bottom gap from terminal cell-sized AppKit resize increments, and restored double-click titlebar zoom behavior on the in-app tab bar.
 - Improved macOS Monterey fallback for the embedded Ghostty terminal. On macOS 12 and older, Con now explicitly keeps Ghostty's hosted IOSurface layer geometry synchronized with the native surface view, addressing reports where old macOS showed an opaque black terminal area but no visible output. Modern macOS keeps Ghostty's existing layer ownership unchanged. Tracks [#20](https://github.com/nowledge-co/con-terminal/issues/20).
 
 ## `v0.1.0-beta.48` - 2026-05-01
@@ -966,62 +2602,69 @@ con is still pre-release, so entries may group related beta work while the produ
 
 **Agent Providers**
 
-- Updated Rig to 0.36.0 and added DeepSeek V4 model support. DeepSeek now defaults to `deepseek-v4-flash`, keeps `deepseek-v4-pro` available in the model picker, and preserves the legacy `deepseek-chat` and `deepseek-reasoner` aliases.
+- Updated Rig to 0.36.0 and added DeepSeek V4 model support. DeepSeek now
+  defaults to `deepseek-v4-flash`, keeps `deepseek-v4-pro` available in the
+  model picker, and preserves the legacy `deepseek-chat` and
+  `deepseek-reasoner` aliases. _(PR
+  [#95](https://github.com/nowledge-co/con-terminal/pull/95) by
+  [@wey-gu](https://github.com/wey-gu))_
 
-**Settings**
+**Panes**
 
-- Settings now opens as a separate window. You can adjust appearance, shortcuts, and provider configuration, save changes, and keep the settings window open while checking the terminal.
-- Appearance controls now preview immediately while Settings stays open. Transparency, blur, background image strength, image layout, terminal font, UI font, and cursor style update live; Save Changes persists the current values.
-- Polished the Settings save action so it uses Con's active theme colors instead of the generic primary button treatment.
-- OpenAI-compatible providers can now fetch available models from the provider's `/models` endpoint when a Base URL and API key are configured.
-
-**Keyboard**
-
-- Added direct tab selection shortcuts: Cmd+1 through Cmd+9 on macOS, Ctrl+1 through Ctrl+9 on Windows and Linux.
-- Added pane zoom for the focused split pane. Use Cmd+Shift+Enter on macOS or Alt+Shift+Enter on Windows and Linux to let one pane fill the tab's terminal area, then press it again to restore the split layout.
-- Added macOS window cycling with Cmd+Backtick and Cmd+Shift+Backtick.
-- Fixed macOS Cmd+Backtick window cycling when the terminal surface has focus.
-- Fixed macOS Cmd+Backtick window cycling at the native window-event layer so it works even when the embedded terminal NSView is first responder.
-- Fixed macOS Cmd+Backtick window cycling to also handle GPUI's shifted and localized symbol forms (`~`, `<`, `>`), matching the platform's keyboard-layout-aware shortcut behavior.
-- Pane picker shortcuts are now scoped to the picker: open it with the configured pane-scope shortcut, then use bare 1-9 to toggle panes, A for all panes, and F for focused pane. A/F are consumed before the input bar sees them, and global Cmd/Ctrl+1-9 remains reserved for tab switching outside the picker.
-- Fixed closing the last pane in one window so it closes only that window instead of quitting Con and killing sibling windows.
+- Added pane zoom for the focused split pane. Use Cmd+Shift+Enter on macOS or
+  Alt+Shift+Enter on Windows and Linux to fill the terminal area, then press it
+  again to restore the split layout. _(PR
+  [#95](https://github.com/nowledge-co/con-terminal/pull/95) by
+  [@wey-gu](https://github.com/wey-gu))_
 
 ### Fixed
 
 **Terminal, macOS**
 
-- Fixed fast trackpad scrolling in macOS terminal panes so precise scroll events are sent through Ghostty's precision-scroll path instead of being treated as coarse wheel ticks.
-- Reduced macOS terminal scroll-path overhead by syncing the native Ghostty scroll container only for visible tab surfaces while still draining background-tab title and process events.
-- Fixed macOS split, nested split, zoom, and unzoom operations that could leave a blank or transparent pane region until the divider was manually resized.
+- Fixed split, zoom, and unzoom operations that could leave a blank or
+  transparent pane until its divider was resized. _(PR
+  [#95](https://github.com/nowledge-co/con-terminal/pull/95) by
+  [@wey-gu](https://github.com/wey-gu))_
 
-**Workspace**
+## `v0.1.0-beta.45` - 2026-04-30
 
-- Fixed the bottom input bar layout so it spans only the terminal area, staying out of the vertical tab sidebar and right agent panel.
+### Added
 
 **Settings**
 
-- Fixed Settings live preview dismissal so unsaved appearance and theme changes are rolled back when the standalone Settings window is closed.
-- Fixed OpenAI-compatible model discovery so fetched model lists are scoped to the configured Base URL instead of leaking across custom endpoints.
-- Fixed OpenAI-compatible model discovery so newly fetched models immediately refresh all related Settings pickers, including active and suggestion model selectors.
-- Fixed OpenAI-compatible model discovery for Base URLs with required query parameters, preserving the query while deriving the `/models` endpoint.
-- Clarified OpenAI-compatible provider setup when `/models` is unavailable: fetching is optional, and users can type the model ID manually.
-- Fixed standalone Settings cleanup so closing the last workspace window also closes Settings on Windows and Linux instead of leaving an orphaned process.
-- Hardened OpenAI-compatible model discovery URL normalization so incomplete `/chat/completions` paths fail clearly instead of becoming relative `/models` URLs.
+- Opened Settings in a separate window with live appearance previews that can
+  be saved or discarded. OpenAI-compatible providers can fetch model IDs from
+  their configured `/models` endpoint, or accept a model ID manually when that
+  endpoint is unavailable. _(PR
+  [#92](https://github.com/nowledge-co/con-terminal/pull/92) by
+  [@wey-gu](https://github.com/wey-gu))_
 
 **Keyboard**
 
-- Fixed direct tab selection shortcuts so terminal panes hand Cmd/Ctrl+1-9 back to the app instead of forwarding them to the shell.
-- Fixed direct tab selection shortcuts so Cmd/Ctrl+1-9 keeps switching tabs while the pane picker is open; pane selection remains on bare 1-9 inside the picker.
+- Added Cmd/Ctrl+1–9 to select tabs and macOS Cmd+Backtick to cycle windows.
+  The pane picker keeps its own bare 1–9, A, and F shortcuts. _(PR
+  [#92](https://github.com/nowledge-co/con-terminal/pull/92) by
+  [@wey-gu](https://github.com/wey-gu))_
 
-**Windowing**
+### Fixed
 
-- Fixed new Con windows opening exactly on top of the previous one. New workspace windows now cascade from the active window while staying within the visible display area when display bounds are available, and still cascade when the platform cannot report bounds.
-- Fixed new-window cascade wrapping so the 28px stagger is preserved on the axis that still fits when the other axis wraps to the display edge.
-- Unified macOS Window menu cycling with the same native AppKit path used by Cmd+Backtick, so menu actions and keyboard shortcuts share one ordering model.
+**Terminal**
 
-**Terminal, Windows Backend (preview)**
+- Reduced RGB color fringing around Windows terminal glyphs by using grayscale
+  DirectWrite antialiasing. _(PR
+  [#91](https://github.com/nowledge-co/con-terminal/pull/91) by
+  [@wey-gu](https://github.com/wey-gu))_
+- Made fast macOS trackpad scrolling use Ghostty's precise-scroll path and
+  avoided unnecessary scroll-container sync for hidden tabs. _(PR
+  [#93](https://github.com/nowledge-co/con-terminal/pull/93) by
+  [@wey-gu](https://github.com/wey-gu))_
 
-- Fixed Windows terminal text rendering to avoid RGB color fringing around glyphs. The DirectWrite atlas now uses grayscale antialiasing with neutral coverage compositing, making CJK and mono text look cleaner in screenshots, scaled displays, remote review, and transparent windows.
+**Workspace**
+
+- Kept the bottom input bar within the terminal column, clear of the tab
+  sidebar and agent panel. _(PR
+  [#93](https://github.com/nowledge-co/con-terminal/pull/93) by
+  [@wey-gu](https://github.com/wey-gu))_
 
 ## `v0.1.0-beta.44` - 2026-04-29
 
@@ -1080,7 +2723,7 @@ con is still pre-release, so entries may group related beta work while the produ
 
 ------
 
-## `v0.1.0-beta.40` - 2026-04-26
+## `v0.1.0-beta.40` - 2026-04-27
 
 ### Added
 

@@ -3,6 +3,14 @@ mod top_bar;
 
 use super::*;
 
+fn workspace_focus_container(focus: &FocusHandle) -> Div {
+    div()
+        .track_focus(focus)
+        // This handle provides shortcut ancestry and editor-only fallback, not
+        // an input target for titlebar/divider clicks. Child focus runs first.
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+}
+
 #[cfg(target_os = "linux")]
 const LINUX_WINDOW_CORNER_RADIUS: Pixels = px(14.0);
 
@@ -52,19 +60,20 @@ impl ConWorkspace {
     }
 
     fn leading_panel_width_for_pane_resize(&self, cx: &mut Context<Self>) -> f32 {
-        if !self.left_panel_open {
+        let progress = self.left_panel_motion.current();
+        if progress <= 0.0 {
             return 0.0;
         }
 
         let sidebar = self.sidebar.read(cx);
         if self.vertical_tabs_enabled() {
             if self.sidebar_tools_open {
-                sidebar.panel_width()
+                sidebar.panel_width() * progress
             } else {
-                sidebar.rendered_width()
+                sidebar.rendered_width() * progress
             }
         } else {
-            sidebar.panel_width()
+            sidebar.panel_width() * progress
         }
     }
 
@@ -118,11 +127,8 @@ impl ConWorkspace {
         }
 
         let top_bar_height = self.current_top_bar_height();
-        let input_bar_height = if self.input_bar_visible {
-            self.input_bar.read(cx).rendered_height(cx).as_f32()
-        } else {
-            0.0
-        };
+        let input_bar_height =
+            self.input_bar.read(cx).rendered_height(cx).as_f32() * self.input_bar_motion.current();
         let win_w = f32::from(win.bounds().size.width);
         let win_h = f32::from(win.bounds().size.height);
         let effective_agent_panel_width = self.agent_panel_width.min(max_agent_panel_width(win_w));
@@ -208,141 +214,135 @@ impl Render for ConWorkspace {
         self.modal_was_open = is_modal_open;
 
         // Keep pane focus in sync with which terminal has window focus
+        let previous_focus = self.tabs[self.active_tab].pane_tree.focused_pane_id();
         self.tabs[self.active_tab].pane_tree.sync_focus(window, cx);
-        self.reconcile_runtime_trackers_for_tab(self.active_tab);
+        self.chrome_preparation_dirty |=
+            previous_focus != self.tabs[self.active_tab].pane_tree.focused_pane_id();
+        if std::mem::take(&mut self.chrome_preparation_dirty) {
+            log::trace!(target: "con::activity", "chrome_prepare");
+            self.refresh_cached_tab_presentation(cx);
+            self.reconcile_runtime_trackers_for_tab(self.active_tab);
 
-        // Sync pane info and CWD to input bar
-        let pane_tree = &self.tabs[self.active_tab].pane_tree;
-        let focused_pane_id = pane_tree.focused_pane_id();
-        let pane_infos: Vec<PaneInfo> = pane_tree
-            .pane_terminals()
-            .into_iter()
-            .map(|(id, terminal)| {
-                let hostname = self
-                    .cached_runtime_for_tab(self.active_tab, &terminal)
-                    .and_then(|runtime| runtime.remote_host);
-                let title = terminal.title(cx);
-                let current_dir = terminal.current_dir(cx);
-                let name = pane_display_name(&hostname, &title, &current_dir, id);
-                let is_busy = terminal.is_busy(cx);
-                let is_alive = terminal.is_alive(cx);
-                PaneInfo {
-                    id,
-                    name,
-                    hostname,
-                    is_busy,
-                    is_alive,
-                }
-            })
-            .collect();
-
-        let cwd = active_terminal.as_ref().and_then(|t| t.current_dir(cx));
-        if self.file_tree_view.read(cx).root().is_none() {
-            self.sync_file_tree_from_active_focus(cx);
-        }
-        let display_cwd = cwd
-            .map(|cwd| match dirs::home_dir() {
-                Some(home) => {
-                    let home_str = home.to_string_lossy().to_string();
-                    if cwd.starts_with(&home_str) {
-                        format!("~{}", &cwd[home_str.len()..])
-                    } else {
-                        cwd
+            // Sync pane info and CWD to input bar
+            let pane_tree = &self.tabs[self.active_tab].pane_tree;
+            let focused_pane_id = pane_tree.focused_pane_id();
+            let pane_infos: Vec<PaneInfo> = pane_tree
+                .pane_terminals()
+                .into_iter()
+                .map(|(id, terminal)| {
+                    let hostname = self
+                        .cached_runtime_for_tab(self.active_tab, &terminal)
+                        .and_then(|runtime| runtime.remote_host);
+                    let title = terminal.title(cx);
+                    let current_dir = terminal.current_dir(cx);
+                    let name = pane_display_name(&hostname, &title, &current_dir, id);
+                    let is_busy = terminal.is_busy(cx);
+                    let is_alive = terminal.is_alive(cx);
+                    PaneInfo {
+                        id,
+                        name,
+                        hostname,
+                        is_busy,
+                        is_alive,
                     }
-                }
-                None => cwd,
-            })
-            .unwrap_or_else(|| "~".to_string());
+                })
+                .collect();
 
-        let skill_entries: Vec<crate::input_bar::SkillEntry> = self
-            .harness
-            .skill_summaries()
-            .into_iter()
-            .map(|(name, desc)| crate::input_bar::SkillEntry {
-                name,
-                description: desc,
-            })
-            .collect();
-        self.input_bar.update(cx, |bar, cx| {
-            bar.set_panes(pane_infos, focused_pane_id, window, cx);
-            bar.set_cwd(display_cwd, cx);
-            bar.set_skills(skill_entries.clone(), cx);
-        });
-        // Up/Down is command-bar recall, not shell suggestion ranking. Keep it
-        // backed by the global submitted-input history across all modes.
-        let recent_commands = self.recent_input_history(80);
-        self.input_bar
-            .update(cx, |bar, cx| bar.set_recent_commands(recent_commands, cx));
+            let cwd = active_terminal.as_ref().and_then(|t| t.current_dir(cx));
+            if self.file_tree_view.read(cx).root().is_none() {
+                self.sync_file_tree_from_active_focus(cx);
+            }
+            let display_cwd = cwd
+                .map(|cwd| match dirs::home_dir() {
+                    Some(home) => {
+                        let home_str = home.to_string_lossy().to_string();
+                        if cwd.starts_with(&home_str) {
+                            format!("~{}", &cwd[home_str.len()..])
+                        } else {
+                            cwd
+                        }
+                    }
+                    None => cwd,
+                })
+                .unwrap_or_else(|| "~".to_string());
 
-        // Sync model name, inline input, and skills to agent panel
-        let active_agent_config = self.active_tab_agent_config();
-        let model_name = AgentHarness::active_model_name_for(&active_agent_config);
-        let provider = active_agent_config.provider.clone();
-        let available_models = self.provider_models_for_config(&active_agent_config);
-        let show_inline = !self.input_bar_visible && self.agent_panel_open;
-        self.agent_panel.update(cx, |panel, cx| {
-            panel.set_session_provider_options(
-                AgentPanel::configured_session_providers(&active_agent_config),
-                window,
-                cx,
-            );
-            panel.set_provider_name(provider, window, cx);
-            panel.set_model_name(model_name);
-            panel.set_session_model_options(available_models, window, cx);
-            panel.set_show_inline_input(show_inline);
-            panel.set_skills(skill_entries, cx);
-            panel.set_recent_inputs(self.recent_input_history(80));
-        });
+            let skill_entries: Vec<crate::input_bar::SkillEntry> = self
+                .harness
+                .skill_summaries()
+                .into_iter()
+                .map(|(name, desc)| crate::input_bar::SkillEntry {
+                    name,
+                    description: desc,
+                })
+                .collect();
+            self.input_bar.update(cx, |bar, cx| {
+                bar.set_panes(pane_infos, focused_pane_id, window, cx);
+                bar.set_cwd(display_cwd, cx);
+                bar.set_skills(skill_entries.clone(), cx);
+            });
+            // Up/Down is command-bar recall, not shell suggestion ranking. Keep it
+            // backed by the global submitted-input history across all modes.
+            let recent_commands = self.recent_input_history(80);
+            self.input_bar
+                .update(cx, |bar, cx| bar.set_recent_commands(recent_commands, cx));
 
-        let agent_panel_progress = self.agent_panel_motion.value(window);
-        let input_bar_progress = self.input_bar_motion.value(window);
-        let tab_strip_progress = self.tab_strip_motion.value(window);
+            // Sync model name, inline input, and skills to agent panel
+            let active_agent_config = self.active_tab_agent_config();
+            let model_name = AgentHarness::active_model_name_for(&active_agent_config);
+            let provider = active_agent_config.provider.clone();
+            let available_models = self.provider_models_for_config(&active_agent_config);
+            let show_inline = !self.input_bar_visible && self.agent_panel_open;
+            self.agent_panel.update(cx, |panel, cx| {
+                panel.set_session_provider_options(
+                    AgentPanel::configured_session_providers(&active_agent_config),
+                    window,
+                    cx,
+                );
+                panel.set_provider_name(provider, window, cx);
+                panel.set_model_name(model_name, cx);
+                panel.set_session_model_options(available_models, window, cx);
+                panel.set_show_inline_input(show_inline, cx);
+                panel.set_skills(skill_entries, cx);
+                panel.set_recent_inputs(self.recent_input_history(80), cx);
+            });
+        }
+
+        // Resolve boolean state here so all reveal paths (keyboard, Files,
+        // agent requests, restored state) share the same motion contract.
+        self.left_panel_motion
+            .set_target(if self.left_panel_open { 1.0 } else { 0.0 });
+        self.agent_panel_motion
+            .set_target(if self.agent_panel_open { 1.0 } else { 0.0 });
+        let left_panel_progress = self.left_panel_motion.value(window, cx);
+        let rail_transitioning = self
+            .sidebar
+            .update(cx, |sidebar, cx| sidebar.advance_width_motion(window, cx));
+        let left_panel_transitioning = self.left_panel_motion.is_animating() || rail_transitioning;
+        self.input_bar_motion
+            .set_target(if self.input_bar_visible { 1.0 } else { 0.0 });
+        let agent_panel_progress = self.agent_panel_motion.value(window, cx);
+        let input_bar_progress = self.input_bar_motion.value(window, cx);
+        let tab_strip_progress = self.tab_strip_motion.value(window, cx);
         let agent_panel_transitioning = self.agent_panel_motion.is_animating();
         let input_bar_transitioning = self.input_bar_motion.is_animating();
         let tab_strip_transitioning = self.tab_strip_motion.is_animating();
         #[cfg(target_os = "macos")]
         let (agent_panel_snap_guard_active, agent_panel_snap_guard_expired) =
             Self::snap_guard_state(&mut self.agent_panel_snap_guard_until, window);
-        #[cfg(target_os = "macos")]
-        let (input_bar_snap_guard_active, input_bar_snap_guard_expired) =
-            Self::snap_guard_state(&mut self.input_bar_snap_guard_until, window);
-        #[cfg(target_os = "macos")]
-        let (top_chrome_snap_guard_active, top_chrome_snap_guard_expired) =
-            Self::snap_guard_state(&mut self.top_chrome_snap_guard_until, window);
         #[cfg(not(target_os = "macos"))]
         let agent_panel_snap_guard_active = false;
-        #[cfg(not(target_os = "macos"))]
-        let input_bar_snap_guard_active = false;
-        #[cfg(not(target_os = "macos"))]
-        let top_chrome_snap_guard_active = false;
         #[cfg(target_os = "macos")]
         {
             let release_cover = Duration::from_millis(CHROME_RELEASE_COVER_MS);
             if agent_panel_snap_guard_expired && !self.agent_panel_open {
                 Self::extend_guard(&mut self.agent_panel_release_cover_until, release_cover);
             }
-            if input_bar_snap_guard_expired && !self.input_bar_visible {
-                Self::extend_guard(&mut self.input_bar_release_cover_until, release_cover);
-            }
-            if top_chrome_snap_guard_expired && !self.horizontal_tabs_visible() {
-                Self::extend_guard(&mut self.top_chrome_release_cover_until, release_cover);
-            }
         }
         #[cfg(target_os = "macos")]
         let agent_panel_release_cover_active =
             Self::snap_guard_active(&mut self.agent_panel_release_cover_until, window);
-        #[cfg(target_os = "macos")]
-        let input_bar_release_cover_active =
-            Self::snap_guard_active(&mut self.input_bar_release_cover_until, window);
-        #[cfg(target_os = "macos")]
-        let top_chrome_release_cover_active =
-            Self::snap_guard_active(&mut self.top_chrome_release_cover_until, window);
         #[cfg(not(target_os = "macos"))]
         let agent_panel_release_cover_active = false;
-        #[cfg(not(target_os = "macos"))]
-        let input_bar_release_cover_active = false;
-        #[cfg(not(target_os = "macos"))]
-        let top_chrome_release_cover_active = false;
         #[cfg(target_os = "macos")]
         {
             let allow_native_transition_underlay = self.terminal_opacity >= 0.999;
@@ -367,7 +367,8 @@ impl Render for ConWorkspace {
             let pane_dragging =
                 self.has_active_tab() && self.tabs[self.active_tab].pane_tree.is_dragging();
             let underlay_active = allow_native_transition_underlay
-                && (agent_panel_transitioning
+                && (left_panel_transitioning
+                    || agent_panel_transitioning
                     || input_bar_transitioning
                     || tab_strip_transitioning
                     || self.agent_panel_drag.is_some()
@@ -383,24 +384,10 @@ impl Render for ConWorkspace {
             .min(max_agent_panel_width(window_width));
         #[cfg(not(target_os = "macos"))]
         let animated_panel_width = effective_agent_panel_width * agent_panel_progress;
-        let agent_panel_reserved_for_layout =
-            self.agent_panel_open || agent_panel_progress > 0.01 || agent_panel_snap_guard_active;
-        #[cfg(target_os = "macos")]
-        let agent_panel_outer_width = if agent_panel_reserved_for_layout {
-            effective_agent_panel_width + 1.0
-        } else {
-            0.0
-        };
-        #[cfg(not(target_os = "macos"))]
-        let agent_panel_outer_width = if agent_panel_progress > 0.01 {
-            animated_panel_width + 1.0
-        } else if agent_panel_reserved_for_layout {
-            effective_agent_panel_width + 1.0
-        } else {
-            0.0
-        };
+        let agent_panel_reserved_for_layout = self.agent_panel_open || agent_panel_progress > 0.0;
+        let agent_panel_outer_width = (effective_agent_panel_width + 1.0) * agent_panel_progress;
         let vertical_tabs_enabled = self.vertical_tabs_enabled();
-        let show_left_panel = self.left_panel_open;
+        let show_left_panel = self.left_panel_open || left_panel_progress > 0.0;
         let show_vertical_tabs = show_left_panel && vertical_tabs_enabled;
         let show_sidebar_tools =
             show_left_panel && (!vertical_tabs_enabled || self.sidebar_tools_open);
@@ -415,13 +402,6 @@ impl Render for ConWorkspace {
         let theme = cx.theme();
         let ui_surface_opacity = self.ui_surface_opacity();
         let elevated_ui_surface_opacity = self.elevated_ui_surface_opacity();
-        let agent_panel_content_progress = ((agent_panel_progress - 0.16) / 0.84)
-            .clamp(0.0, 1.0)
-            .powf(0.9);
-        let input_bar_content_progress = ((input_bar_progress - 0.08) / 0.92)
-            .clamp(0.0, 1.0)
-            .powf(0.92);
-        let compact_titlebar_progress = 1.0 - tab_strip_progress;
         let terminal_background = self.terminal_theme.background;
         let terminal_surface_color: Hsla = Rgba {
             r: f32::from(terminal_background.r) / 255.0,
@@ -434,28 +414,27 @@ impl Render for ConWorkspace {
             a: 1.0,
         }
         .into();
-        let portable_terminal_backdrop_color =
-            terminal_surface_color.opacity(self.terminal_opacity);
         let chrome_transition_seam_color = terminal_surface_color;
         let chrome_static_seam_color =
             terminal_separator_over_backdrop(terminal_surface_color, theme);
         let pane_divider_color = terminal_separator_over_backdrop(terminal_surface_color, theme);
-        #[cfg(target_os = "macos")]
         let top_bar_surface_color = theme.title_bar.opacity(ui_surface_opacity);
-        #[cfg(not(target_os = "macos"))]
-        let top_bar_surface_color = theme.title_bar.opacity(ui_surface_opacity);
-        #[cfg(target_os = "macos")]
-        let input_bar_surface_color = theme.title_bar.opacity(ui_surface_opacity);
-        #[cfg(not(target_os = "macos"))]
-        let input_bar_surface_color = theme.title_bar.opacity(ui_surface_opacity);
-        #[cfg(target_os = "macos")]
-        let elevated_panel_surface_color = theme.background.opacity(elevated_ui_surface_opacity);
-        #[cfg(not(target_os = "macos"))]
-        let elevated_panel_surface_color = theme.background.opacity(elevated_ui_surface_opacity);
-        let sidebar_seam_color =
+        let input_bar_surface_color = top_bar_surface_color;
+        // Auxiliary chrome shares the titlebar's material. These quiet inner
+        // edges are decoration, not the native transition/drag seam covers.
+        // A slight material step makes the panel's header readable even
+        // when the compact titlebar and desktop backdrop are both light.
+        let agent_panel_surface_color =
+            top_bar_surface_color.blend(theme.foreground.opacity(if theme.is_dark() {
+                0.025
+            } else {
+                0.018
+            }));
+        let chrome_edge_color =
             theme
                 .foreground
                 .opacity(if theme.is_dark() { 0.055 } else { 0.045 });
+        let chrome_resize_hover_color = theme.foreground.opacity(0.08);
         let (tab_sidebar_width, sidebar_content_width) = if show_left_panel {
             let sidebar = self.sidebar.read(cx);
             let tab_sidebar_width = if vertical_tabs_enabled {
@@ -476,11 +455,12 @@ impl Render for ConWorkspace {
         } else {
             (0.0, 0.0)
         };
-        let left_panel_width = if vertical_tabs_enabled {
+        let full_left_panel_width = if vertical_tabs_enabled {
             tab_sidebar_width + sidebar_content_width
         } else {
             sidebar_content_width
         };
+        let left_panel_width = full_left_panel_width * left_panel_progress;
         let terminal_content_left = left_panel_width;
         let terminal_content_width =
             (window_width - terminal_content_left - agent_panel_outer_width).max(0.0);
@@ -581,6 +561,8 @@ impl Render for ConWorkspace {
         };
 
         let pane_content_bounds = self.pane_content_bounds.clone();
+        #[cfg(target_os = "macos")]
+        let native_tab_handoff = self.native_tab_handoff_pending.then(|| cx.weak_entity());
         let mut pane_content = div()
             .relative()
             .flex_1()
@@ -588,16 +570,20 @@ impl Render for ConWorkspace {
             .min_h_0()
             .w_full()
             .overflow_hidden()
-            .when(cfg!(not(target_os = "macos")), |pane_content| {
-                pane_content.bg(portable_terminal_backdrop_color)
-            })
             .child(pane_tree_rendered)
-            .on_children_prepainted(move |bounds_list, _, _| {
+            .on_children_prepainted(move |bounds_list, _window, _cx| {
                 let Some(bounds) = bounds_list.first().copied() else {
                     return;
                 };
                 if let Ok(mut guard) = pane_content_bounds.lock() {
                     *guard = Some(bounds);
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(workspace) = &native_tab_handoff {
+                    _window.request_native_surface_presentation_sync();
+                    let _ = workspace.update(_cx, |workspace, cx| {
+                        workspace.commit_native_tab_handoff(cx);
+                    });
                 }
             })
             .on_drag_move::<DraggedTab>(cx.listener(
@@ -648,76 +634,76 @@ impl Render for ConWorkspace {
                 let Some(pane_id) = dragged.pane_id else {
                     return;
                 };
-                if let Some(drag) = this.pane_title_drag.take() {
-                    if let Some(PaneDropTarget::Split(target)) = drag.target {
-                        this.tab_strip_drop_slot = None;
-                        this.tabs[this.active_tab].pane_tree.move_pane(
-                            pane_id,
-                            target.target_pane_id,
-                            target.direction,
-                            target.placement,
-                        );
-                        cx.notify();
-                        return;
-                    }
+                if let Some(drag) = this.pane_title_drag.take()
+                    && let Some(PaneDropTarget::Split(target)) = drag.target
+                {
+                    this.tab_strip_drop_slot = None;
+                    this.tabs[this.active_tab].pane_tree.move_pane(
+                        pane_id,
+                        target.target_pane_id,
+                        target.direction,
+                        target.placement,
+                    );
+                    this.sync_sidebar(cx);
+                    cx.notify();
                 }
                 // No split target — drop on pane content without a target does nothing.
                 // (Tab-strip drops are handled by the tab strip's own on_drop.)
             }));
 
-        if let Some(drag) = self.pane_title_drag.as_ref().filter(|drag| drag.active) {
-            if let Some(PaneDropTarget::Split(target)) = drag.target {
-                let content_bounds = self
-                    .pane_content_bounds
-                    .lock()
-                    .ok()
-                    .and_then(|guard| *guard);
-                if let Some(content_bounds) = content_bounds {
-                    let regions =
-                        split_preview_regions(target.bounds, target.direction, target.placement);
-                    let (existing_left, existing_top, existing_width, existing_height) =
-                        split_preview_local_rect(regions.existing, content_bounds);
-                    let (incoming_left, incoming_top, incoming_width, incoming_height) =
-                        split_preview_local_rect(regions.incoming, content_bounds);
-                    let (seam_left, seam_top, seam_width, seam_height) =
-                        split_preview_local_rect(regions.seam, content_bounds);
-                    pane_content = pane_content
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(existing_left))
-                                .top(px(existing_top))
-                                .w(px(existing_width.max(0.0)))
-                                .h(px(existing_height.max(0.0)))
-                                .bg(theme.background.opacity(0.18)),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(incoming_left))
-                                .top(px(incoming_top))
-                                .w(px(incoming_width.max(0.0)))
-                                .h(px(incoming_height.max(0.0)))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .px(px(12.0))
-                                .bg(theme.primary.opacity(0.22))
-                                .font_family(theme.font_family.clone())
-                                .text_size(px(12.0))
-                                .text_color(theme.foreground.opacity(0.78))
-                                .child(div().truncate().child(drag.title.clone())),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .left(px(seam_left))
-                                .top(px(seam_top))
-                                .w(px(seam_width.max(0.0)))
-                                .h(px(seam_height.max(0.0)))
-                                .bg(theme.primary.opacity(0.62)),
-                        );
-                }
+        if let Some(drag) = self.pane_title_drag.as_ref().filter(|drag| drag.active)
+            && let Some(PaneDropTarget::Split(target)) = drag.target
+        {
+            let content_bounds = self
+                .pane_content_bounds
+                .lock()
+                .ok()
+                .and_then(|guard| *guard);
+            if let Some(content_bounds) = content_bounds {
+                let regions =
+                    split_preview_regions(target.bounds, target.direction, target.placement);
+                let (existing_left, existing_top, existing_width, existing_height) =
+                    split_preview_local_rect(regions.existing, content_bounds);
+                let (incoming_left, incoming_top, incoming_width, incoming_height) =
+                    split_preview_local_rect(regions.incoming, content_bounds);
+                let (seam_left, seam_top, seam_width, seam_height) =
+                    split_preview_local_rect(regions.seam, content_bounds);
+                pane_content = pane_content
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(existing_left))
+                            .top(px(existing_top))
+                            .w(px(existing_width.max(0.0)))
+                            .h(px(existing_height.max(0.0)))
+                            .bg(theme.background.opacity(0.18)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(incoming_left))
+                            .top(px(incoming_top))
+                            .w(px(incoming_width.max(0.0)))
+                            .h(px(incoming_height.max(0.0)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .px(px(12.0))
+                            .bg(theme.primary.opacity(0.22))
+                            .font_family(theme.font_family.clone())
+                            .text_size(px(12.0))
+                            .text_color(theme.foreground.opacity(0.78))
+                            .child(div().truncate().child(drag.title.clone())),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(seam_left))
+                            .top(px(seam_top))
+                            .w(px(seam_width.max(0.0)))
+                            .h(px(seam_height.max(0.0)))
+                            .bg(theme.primary.opacity(0.62)),
+                    );
             }
         }
 
@@ -727,9 +713,6 @@ impl Render for ConWorkspace {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .when(cfg!(not(target_os = "macos")), |terminal_area| {
-                terminal_area.bg(portable_terminal_backdrop_color)
-            })
             .child(pane_content);
 
         #[cfg(not(target_os = "macos"))]
@@ -742,56 +725,56 @@ impl Render for ConWorkspace {
             );
         }
 
-        let input_bar_reserved_for_layout =
-            input_bar_progress > 0.01 || input_bar_snap_guard_active;
+        let input_bar_reserved_for_layout = self.input_bar_visible || input_bar_progress > 0.0;
 
         if input_bar_reserved_for_layout {
             let full_input_bar_height = self.input_bar.read(cx).rendered_height(cx).as_f32();
-            let input_bar_height = if input_bar_progress > 0.01 {
-                full_input_bar_height * input_bar_progress
-            } else {
-                full_input_bar_height
-            };
-            let input_bar_content_opacity = if input_bar_progress > 0.01 {
-                input_bar_content_progress
-            } else {
-                0.0
-            };
+            let input_bar_height = full_input_bar_height * input_bar_progress;
             terminal_area = terminal_area.child(
                 div()
+                    .relative()
                     .overflow_hidden()
                     .h(px(input_bar_height))
                     .flex_shrink_0()
                     .bg(input_bar_surface_color)
-                    .child(div().h(px(1.0)).bg(chrome_static_seam_color))
+                    .pt(px(1.0))
+                    // Separate output from input without adding another base fill.
                     .child(
                         div()
-                            .min_h(px((input_bar_height - 1.0).max(0.0)))
-                            .opacity(input_bar_content_opacity)
-                            .child(self.input_bar.clone()),
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w_full()
+                            .h(px(1.0))
+                            .bg(chrome_edge_color),
+                    )
+                    .child(
+                        div().h(px((full_input_bar_height - 1.0).max(0.0))).child(
+                            self.input_bar
+                                .clone()
+                                .cached(
+                                    StyleRefinement::default()
+                                        .w_full()
+                                        .h(px(full_input_bar_height - 1.0)),
+                                )
+                                .into_any_element(),
+                        ),
                     ),
             );
         }
 
-        let mut main_area = div()
-            .relative()
-            .flex()
-            .flex_1()
-            .min_h_0()
-            .when(cfg!(not(target_os = "macos")), |main_area| {
-                main_area.bg(portable_terminal_backdrop_color)
-            });
+        let mut main_area = div().relative().flex().flex_1().min_h_0();
 
         if show_left_panel {
             let mut left_sidebar = div()
-                .w(px(left_panel_width))
+                .w(px(full_left_panel_width))
                 .h_full()
                 .flex()
                 .flex_row()
                 .flex_shrink_0()
                 .overflow_hidden()
                 .occlude()
-                .bg(elevated_panel_surface_color);
+                .bg(top_bar_surface_color);
             if show_vertical_tabs {
                 left_sidebar = left_sidebar.child(
                     div()
@@ -819,7 +802,17 @@ impl Render for ConWorkspace {
                 }
                 left_sidebar = left_sidebar.child(sidebar_panel.child(sidebar_content));
             }
-            main_area = main_area.child(left_sidebar);
+            main_area = main_area.child(
+                div()
+                    .w(px(left_panel_width))
+                    .min_w_0()
+                    .h_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .justify_end()
+                    .overflow_hidden()
+                    .child(left_sidebar),
+            );
         }
         // ── Main column: terminal area only (editor panes live inside pane tree) ──
         let main_column = div()
@@ -832,7 +825,7 @@ impl Render for ConWorkspace {
 
         main_area = main_area.child(main_column);
 
-        if show_sidebar_tools {
+        if show_sidebar_tools && !left_panel_transitioning {
             let resize_edge = left_panel_width;
             main_area = main_area.child(
                 div()
@@ -841,7 +834,7 @@ impl Render for ConWorkspace {
                     .bottom_0()
                     .left(px((resize_edge - 1.0).max(0.0)))
                     .w(px(1.0))
-                    .bg(sidebar_seam_color),
+                    .bg(chrome_edge_color),
             );
             main_area = main_area.child(
                 div()
@@ -854,7 +847,7 @@ impl Render for ConWorkspace {
                     .cursor_col_resize()
                     .occlude()
                     .bg(theme.transparent)
-                    .hover(|s| s.bg(theme.muted.opacity(0.08)))
+                    .hover(|s| s.bg(chrome_resize_hover_color))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, _window, cx| {
@@ -873,40 +866,35 @@ impl Render for ConWorkspace {
                     .bottom_0()
                     .left(px((left_panel_width - 1.0).max(0.0)))
                     .w(px(1.0))
-                    .bg(sidebar_seam_color),
+                    .bg(chrome_edge_color),
             );
         }
 
         let render_agent_panel = agent_panel_reserved_for_layout;
 
         if render_agent_panel {
-            #[cfg(target_os = "macos")]
-            let panel_width = effective_agent_panel_width + 1.0;
-            #[cfg(not(target_os = "macos"))]
-            let panel_width = if agent_panel_progress > 0.01 {
-                animated_panel_width + 1.0
-            } else {
-                effective_agent_panel_width + 1.0
-            };
-            #[cfg(target_os = "macos")]
-            let agent_panel_content_opacity =
-                if self.agent_panel_open || agent_panel_progress > 0.01 {
-                    agent_panel_content_progress
-                } else {
-                    0.0
-                };
-            #[cfg(not(target_os = "macos"))]
-            let agent_panel_content_opacity = agent_panel_content_progress;
+            let panel_width = agent_panel_outer_width;
 
             main_area = main_area.child(
                 div()
+                    .relative()
                     .w(px(panel_width))
+                    .min_w_0()
                     .h_full()
                     .overflow_hidden()
                     .flex_shrink_0()
                     .flex()
                     .flex_row()
-                    .bg(elevated_panel_surface_color)
+                    .bg(agent_panel_surface_color)
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(1.0))
+                            .bg(chrome_edge_color),
+                    )
                     .child(
                         div()
                             .id("agent-panel-divider")
@@ -914,7 +902,15 @@ impl Render for ConWorkspace {
                             .w(px(1.0))
                             .h_full()
                             .flex_shrink_0()
-                            .bg(chrome_static_seam_color)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .w(px(1.0))
+                                    .bg(chrome_edge_color),
+                            )
                             .child(
                                 div()
                                     .absolute()
@@ -924,11 +920,14 @@ impl Render for ConWorkspace {
                                     .w(px(5.0))
                                     .cursor_col_resize()
                                     .bg(theme.transparent)
-                                    .hover(|s| s.bg(chrome_static_seam_color.opacity(0.18)))
+                                    .hover(|s| s.bg(chrome_resize_hover_color))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
                                             move |this, event: &MouseDownEvent, _window, cx| {
+                                                if this.agent_panel_motion.is_animating() {
+                                                    return;
+                                                }
                                                 this.release_active_terminal_mouse_selection(cx);
                                                 this.agent_panel_drag = Some((
                                                     f32::from(event.position.x),
@@ -942,69 +941,64 @@ impl Render for ConWorkspace {
                     )
                     .child(
                         div()
-                            .flex_1()
+                            .w(px(effective_agent_panel_width))
+                            .flex_shrink_0()
                             .min_w_0()
                             .h_full()
-                            .opacity(agent_panel_content_opacity)
-                            .child(self.agent_panel.clone()),
+                            .child(
+                                self.agent_panel
+                                    .clone()
+                                    .cached(StyleRefinement::default().size_full())
+                                    .into_any_element(),
+                            ),
                     ),
             );
         }
 
         // Top bar — compact titlebar for one tab, full strip for many
-        let top_bar_height = if top_chrome_snap_guard_active {
-            TOP_BAR_TABS_HEIGHT
-        } else {
-            self.current_top_bar_height()
-        };
-        let top_bar_controls_offset = 1.0 + (3.0 * tab_strip_progress);
+        let top_bar_height = self.current_top_bar_height();
 
         let top_bar = self.render_top_bar(
             window,
             cx,
             top_bar_height,
-            top_bar_controls_offset,
-            compact_titlebar_progress,
             tab_strip_progress,
-            elevated_ui_surface_opacity,
             top_bar_surface_color,
         );
         let show_compact_top_bar_separator =
             cfg!(not(target_os = "macos")) && top_bar_height > 0.5 && tab_strip_progress <= 0.01;
 
-        let theme = cx.theme();
-        let mut root = div()
+        // Owned clone: `theme` outlives the sidebar overlay update below,
+        // which mutably borrows `cx` (the `&Theme` borrow would conflict).
+        let theme = cx.theme().clone();
+        let mut root = workspace_focus_container(&self.workspace_focus)
             .relative()
             .flex()
             .flex_col()
             .size_full()
             .bg(theme.transparent)
-            .font_family(theme.mono_font_family.clone())
-            .track_focus(&self.workspace_focus);
+            .font_family(theme.mono_font_family.clone());
 
         root = root
             .key_context("ConWorkspace")
-            // Pane drag-to-resize: capture mouse move/up on root so it works
-            // even when cursor is over terminal views (which capture mouse events).
-            .on_mouse_move({
-                cx.listener(move |this, event: &MouseMoveEvent, win, cx| {
-                    if this.handle_active_resize_mouse_move(event, win, cx) {
+            .on_drag_move::<DraggedTab>(cx.listener(
+                |this, event: &gpui::DragMoveEvent<DraggedTab>, win, cx| {
+                    if event.drag(cx).origin != DraggedTabOrigin::HorizontalTabStrip {
                         return;
                     }
-
                     if let Some(preview) = this
                         .tab_drag_preview
                         .lock()
                         .ok()
                         .and_then(|guard| guard.clone())
                     {
-                        let preview_size = tab_like_drag_preview_size();
+                        let preview_size = preview.size;
                         let leading_pad = top_bar::top_bar_leading_pad(win);
                         let min_left = px(leading_pad);
                         let max_left =
                             (win.viewport_size().width - preview_size.width).max(min_left);
                         let probe = tab_drag_overlay_probe_position(
-                            event.position,
+                            event.event.position,
                             &preview,
                             preview_size,
                             min_left,
@@ -1016,8 +1010,24 @@ impl Render for ConWorkspace {
                             .ok()
                             .map(|g| g.clone())
                             .unwrap_or_default();
-                        if let Some(slot) =
-                            horizontal_tab_slot_from_bounds(probe, &tab_bounds, this.tabs.len())
+                        let dragged_id = this
+                            .active_dragged_tab_session_id
+                            .lock()
+                            .ok()
+                            .and_then(|id| *id);
+                        if let Some(slot) = this
+                            .tabs
+                            .iter()
+                            .position(|tab| Some(tab.summary_id) == dragged_id)
+                            .and_then(|source| {
+                                horizontal_tab_slot_from_bounds(
+                                    probe,
+                                    &tab_bounds,
+                                    this.tabs.len(),
+                                    source,
+                                    preview.source_visual_index,
+                                )
+                            })
                         {
                             let new_target = Some(TabDragTarget::Reorder { slot });
                             if this.tab_strip_drop_slot != Some(slot)
@@ -1027,15 +1037,16 @@ impl Render for ConWorkspace {
                                 this.tab_drag_target = new_target;
                                 cx.notify();
                             }
-                        } else {
-                            // Cursor left valid tab bounds — clear stale target.
-                            if this.tab_strip_drop_slot.is_some() || this.tab_drag_target.is_some()
-                            {
-                                this.tab_strip_drop_slot = None;
-                                this.tab_drag_target = None;
-                                cx.notify();
-                            }
                         }
+                    }
+                },
+            ))
+            // Pane drag-to-resize: capture mouse move/up on root so it works
+            // even when cursor is over terminal views (which capture mouse events).
+            .on_mouse_move({
+                cx.listener(move |this, event: &MouseMoveEvent, win, cx| {
+                    if this.handle_active_resize_mouse_move(event, win, cx) {
+                        return;
                     }
 
                     if this.active_tab >= this.tabs.len() {
@@ -1043,11 +1054,8 @@ impl Render for ConWorkspace {
                     }
 
                     let top_bar_height = this.current_top_bar_height();
-                    let input_bar_height = if this.input_bar_visible {
-                        this.input_bar.read(cx).rendered_height(cx).as_f32()
-                    } else {
-                        0.0
-                    };
+                    let input_bar_height = this.input_bar.read(cx).rendered_height(cx).as_f32()
+                        * this.input_bar_motion.current();
 
                     // Compute layout-dependent inputs *before* re-borrowing
                     // `this` mutably for the pane tree, otherwise we
@@ -1110,9 +1118,7 @@ impl Render for ConWorkspace {
                         );
                         cx.notify();
                     }
-                    if this.active_tab >= this.tabs.len() {
-                        return;
-                    }
+                    if this.active_tab >= this.tabs.len() {}
                 }),
             )
             .on_action(cx.listener(Self::quit))
@@ -1143,6 +1149,7 @@ impl Render for ConWorkspace {
             .on_action(cx.listener(Self::split_left))
             .on_action(cx.listener(Self::split_up))
             .on_action(cx.listener(Self::clear_terminal))
+            .on_action(cx.listener(Self::find_in_terminal))
             .on_action(cx.listener(Self::clear_restored_terminal_history_action))
             .on_action(cx.listener(Self::export_workspace_layout))
             .on_action(cx.listener(Self::add_workspace_layout_tabs))
@@ -1155,6 +1162,8 @@ impl Render for ConWorkspace {
             .on_action(cx.listener(Self::rename_current_surface))
             .on_action(cx.listener(Self::close_surface))
             .on_action(cx.listener(Self::focus_input))
+            .on_action(cx.listener(Self::ask_ai))
+            .on_action(cx.listener(Self::open_agent_handoff))
             .on_action(cx.listener(Self::editor_move_left))
             .on_action(cx.listener(Self::editor_move_right))
             .on_action(cx.listener(Self::editor_move_up))
@@ -1173,6 +1182,7 @@ impl Render for ConWorkspace {
             .on_action(cx.listener(Self::editor_delete_forward))
             .on_action(cx.listener(Self::editor_insert_newline))
             .on_action(cx.listener(Self::editor_save))
+            .on_action(cx.listener(Self::editor_toggle_preview))
             .on_action(cx.listener(Self::editor_undo))
             .on_action(cx.listener(Self::editor_copy))
             .on_action(cx.listener(Self::editor_cut))
@@ -1288,43 +1298,41 @@ impl Render for ConWorkspace {
         }
         root = root.child(main_area);
 
+        // Vertical-tab rail hover card — composed here as a root overlay
+        // (window coordinates) so it paints above the terminal and is not
+        // clipped by the sidebar's overflow-hidden container. Only composed
+        // while the rail is actually in the layout; when it is not, clear
+        // stale hover state (an unmounted rail cannot deliver hover-leave).
+        if !show_vertical_tabs {
+            self.sidebar
+                .update(cx, |sidebar, _cx| sidebar.clear_hovered_rail());
+        }
+        if show_vertical_tabs
+            && let Some(hover_card) = self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.render_hover_card_overlay(window, cx)
+            })
+        {
+            root = root.child(hover_card);
+        }
+
         if let Some(preview) = self
             .tab_drag_preview
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
         {
-            let preview_size = tab_like_drag_preview_size();
+            let preview_size = preview.size;
             let leading_pad = top_bar::top_bar_leading_pad(window);
             let min_left = px(leading_pad);
             let max_left = (window.viewport_size().width - preview_size.width).max(min_left);
             let left =
                 tab_drag_overlay_origin(window.mouse_position(), &preview, min_left, max_left).x;
             root = root.child(
-                div()
+                top_bar::tab_drag_capsule(&preview, &theme)
                     .absolute()
                     .left(left)
                     .top(preview.source_top)
-                    .w(preview_size.width)
-                    .h(preview_size.height)
-                    .px(px(10.0))
-                    .rounded(px(4.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .cursor_grab()
-                    .bg(theme.title_bar.opacity(0.92))
-                    .font_family(theme.font_family.clone())
-                    .text_size(px(12.0))
-                    .text_color(theme.foreground.opacity(0.82))
-                    .child(
-                        svg()
-                            .path(preview.icon)
-                            .size(px(12.0))
-                            .flex_shrink_0()
-                            .text_color(theme.foreground),
-                    )
-                    .child(div().flex_1().min_w_0().truncate().child(preview.title)),
+                    .cursor_grab(),
             );
         }
 
@@ -1337,8 +1345,8 @@ impl Render for ConWorkspace {
                 tab_drag_preview_origin(
                     drag.current_pos,
                     preview_size,
-                    px(TOP_BAR_COMPACT_HEIGHT),
-                    px(TOP_BAR_TABS_HEIGHT - TOP_BAR_COMPACT_HEIGHT),
+                    px(TAB_DROP_PREVIEW_TOP),
+                    px(TAB_DROP_PREVIEW_HEIGHT),
                 )
             } else {
                 pane_drag_floating_preview_origin(drag.current_pos, preview_size)
@@ -1375,18 +1383,6 @@ impl Render for ConWorkspace {
             );
         }
 
-        if top_chrome_release_cover_active {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top(px(TOP_BAR_COMPACT_HEIGHT))
-                    .left(px(terminal_content_left))
-                    .right(px(agent_panel_outer_width))
-                    .h(px(TOP_BAR_TABS_HEIGHT - TOP_BAR_COMPACT_HEIGHT))
-                    .bg(chrome_transition_seam_color),
-            );
-        }
-
         if self.sidebar_drag.is_some() {
             root = root.child(
                 div()
@@ -1399,47 +1395,19 @@ impl Render for ConWorkspace {
             );
         }
 
-        if input_bar_snap_guard_active {
-            if self.input_bar_visible {
-                root = root.child(
-                    div()
-                        .absolute()
-                        .left(px(terminal_content_left))
-                        .right(px(agent_panel_outer_width))
-                        .bottom(self.input_bar.read(cx).rendered_height(cx))
-                        .h(px(CHROME_MOTION_SEAM_OVERDRAW))
-                        .bg(chrome_transition_seam_color),
-                );
-            }
-        }
-
-        if input_bar_release_cover_active {
+        if agent_panel_snap_guard_active && self.agent_panel_open {
+            let agent_panel_seam_right = (effective_agent_panel_width
+                - (CHROME_MOTION_SEAM_OVERDRAW - CHROME_TRANSITION_SEAM_COVER))
+                .max(0.0);
             root = root.child(
                 div()
                     .absolute()
-                    .left(px(terminal_content_left))
-                    .right(px(agent_panel_outer_width))
+                    .top(px(top_bar_height))
                     .bottom_0()
-                    .h(self.input_bar.read(cx).rendered_height(cx))
+                    .right(px(agent_panel_seam_right))
+                    .w(px(CHROME_MOTION_SEAM_OVERDRAW))
                     .bg(chrome_transition_seam_color),
             );
-        }
-
-        if agent_panel_snap_guard_active {
-            if self.agent_panel_open {
-                let agent_panel_seam_right = (effective_agent_panel_width
-                    - (CHROME_MOTION_SEAM_OVERDRAW - CHROME_TRANSITION_SEAM_COVER))
-                    .max(0.0);
-                root = root.child(
-                    div()
-                        .absolute()
-                        .top(px(top_bar_height))
-                        .bottom_0()
-                        .right(px(agent_panel_seam_right))
-                        .w(px(CHROME_MOTION_SEAM_OVERDRAW))
-                        .bg(chrome_transition_seam_color),
-                );
-            }
         }
 
         if agent_panel_release_cover_active {
@@ -1636,3 +1604,6 @@ impl Render for ConWorkspace {
         root.into_any_element()
     }
 }
+
+#[cfg(test)]
+mod focus_tests;

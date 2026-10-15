@@ -192,17 +192,15 @@ impl Conversation {
             match msg.role {
                 MessageRole::User => {
                     history.push(RigMessage::User {
-                        content: OneOrMany::one(UserContent::Text(Text {
-                            text: msg.content.clone(),
-                        })),
+                        content: OneOrMany::one(UserContent::Text(Text::new(msg.content.clone()))),
                     });
                 }
                 MessageRole::Assistant => {
                     history.push(RigMessage::Assistant {
                         id: None,
-                        content: OneOrMany::one(AssistantContent::Text(Text {
-                            text: msg.content.clone(),
-                        })),
+                        content: OneOrMany::one(AssistantContent::Text(Text::new(
+                            msg.content.clone(),
+                        ))),
                     });
                 }
                 // System and Tool messages are handled separately
@@ -291,7 +289,7 @@ impl Conversation {
             })
             .collect();
 
-        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.created_at));
         summaries
     }
 

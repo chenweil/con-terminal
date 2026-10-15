@@ -71,9 +71,9 @@ ConWorkspace::send_to_agent()
                             ▼
                         AgentProvider (con-agent)
                             │
-                            ├── Builds Rig Agent with tools
-                            ├── Creates ConHook with event_tx + approval_rx
-                            └── agent.prompt(msg).with_hook(hook).with_history(history)
+                            ├── Builds Rig Agent with tools + ConHook
+                            ├── Creates streaming request with conversation history
+                            └── agent.stream_prompt(msg).history(history)
                                     │
                                     ▼
                                 Rig Agent Loop
@@ -89,6 +89,40 @@ ConWorkspace::send_to_agent()
                         Provider adds assistant message to conversation
                         Bridge emits HarnessEvent::ResponseComplete
 ```
+
+## Local Codex transport
+
+`codex-local` is a separate provider, not an API-key/OAuth variant of an HTTP
+client. `crates/con-agent/src/codex_local.rs` starts a dedicated JSONL stdio app-server
+on the shared Tokio runtime. Codex owns authentication and model routing; Con
+never imports credentials for this path.
+
+Both HTTP/Rig agents and local Codex receive the same Rig `ToolServerHandle`
+registry built in `provider.rs`. Codex advertises those definitions as experimental
+`dynamicTools`; `item/tool/call` dispatches through `ConHook` before invoking the
+Rig tool. Tool-start, approval-needed/ended, result, text and reasoning events use
+the existing channels, so routing stays per-tab. Native Codex execution is disabled
+and read-only sandbox/approval settings are checked before starting generation.
+
+Each user request gets an ephemeral thread with recent text history injected via
+`thread/inject_items`. Con remains the conversation authority; no Codex thread IDs
+or rollouts are persisted. The child exits on completion, errors, cancellation or
+timeout. Lightweight completions use the same transport with no dynamic tools.
+See [Configuration](configuration.md#local-codex-provider) for setup and limits.
+
+The regular `con-agent` tests cover the JSONL transport, streaming, tool approval,
+cancellation and process cleanup without a Codex installation. An opt-in test
+also exercises a real app-server against a loopback-only Responses fixture:
+
+```bash
+CON_CODEX_TEST_BIN=/absolute/path/to/codex \
+  cargo test -p con-agent real_app_server_routes_tools -- --ignored --nocapture
+```
+
+That test uses a temporary `CODEX_HOME`, injected history, Con's real
+`TerminalExecTool` channel and manual approval. Its visible-execution receiver is
+an isolated fixture, not the user's terminal. It requires no credentials, paid
+model calls or external model service, and rejects leaked native execution tools.
 
 ## Event Polling & Tab Routing
 
@@ -196,7 +230,7 @@ The mutex is held briefly for two operations:
 1. **Snapshot** — clone conversation before agent call
 2. **Add message** — insert assistant response after agent completes
 
-Rig manages its own history via `with_history(&mut Vec<rig::message::Message>)`. Our `to_rig_history()` provides User/Assistant text pairs. Rig appends tool call/result messages during its turn loop.
+Each streaming request receives history from `to_rig_history()` as User/Assistant text pairs. Rig appends tool call/result messages during its turn loop and returns the final response to Con for persistence.
 
 ## Focused Pane Fact Preflight
 
@@ -235,7 +269,7 @@ auto_approve_tools = false  # skip approval for dangerous tools
 max_turns = 10              # max tool-use turns per request
 ```
 
-`auto_approve_tools = true` makes `ConHook` return `ToolCallHookAction::cont()` for all tools, bypassing the approval channel entirely.
+`auto_approve_tools = true` makes `ConHook` continue all tool calls without consulting the approval channel. Rig 0.40 uses an exact total model-call budget; Con preserves the ceiling shipped by its earlier Rig integration when converting `max_turns`.
 
 ## Input Classification
 
@@ -275,7 +309,7 @@ This matters for SSH, tmux, and full-screen TUIs:
 - `ssh_host` is only populated when a remote host is proven. If con cannot prove it, the prompt says `unknown`.
 - `tmux_session` only comes from authoritative command-line evidence, not from inherited process environment, pane titles, or status-line patterns.
 - Shell freshness now comes from Ghostty command-boundary tracking. After any unconfirmed PTY input, con stops trusting cwd and last-command metadata until shell integration proves a fresh prompt again.
-- Current embedded Ghostty panes explicitly report what the backend cannot prove yet. Today that includes authoritative foreground command text, alternate-screen state, and remote-host identity, so manual tmux/editor/SSH flows may remain `unknown` until Ghostty exports stronger facts.
+- Current embedded Ghostty panes expose the local PTY foreground process group and TTY name while explicit support flags distinguish unavailable values from unsupported portable backends. Authoritative foreground command text, alternate-screen state, and remote-host identity remain unavailable, so manual tmux/editor/SSH flows may stay `unknown`.
 - When the pane mode is not `shell`, or shell metadata is stale, the prompt explicitly tells the model to inspect the live pane with `list_panes`, `read_pane`, and `send_keys` before making claims about cwd, hostname, or the running app.
 
 con now keeps a per-pane runtime tracker for each tab. The tracker is reducer-based: it merges Ghostty observations, typed shell-probe results, and con-originated actions such as pane creation, visible shell exec, raw input, and process exit. It invalidates active tmux/app state when a fresh shell prompt returns without a fresh typed probe, and it exposes both current runtime truth and recent causal history to the prompt, `list_panes`, the sidebar, and smart-input classification.
@@ -304,6 +338,6 @@ For whole-tab situation questions, the harness and prompt now also carry a typed
 
 con also now exposes a tmux-specific inspect surface. `tmux_inspect` returns tmux adapter state when tmux has been authoritatively detected, including the explicit reason native tmux pane/window control is not yet available.
 
-What is still missing is stronger backend truth for foreground runtime identity. The next layer is not more local heuristics; it is an upstream Ghostty observability contract for explicit foreground process and semantic prompt state. See `docs/impl/pane-runtime-observer.md`.
+What is still missing is exact executable identity for the foreground process group and richer semantic prompt state. The process-group ID is useful transition evidence, but it does not identify the exact local process or any program nested inside SSH or tmux. See `docs/impl/pane-runtime-observer.md`.
 
 Separately, con also needs a control-plane split between visible shell execution, local hidden execution, tmux-native control, and raw TUI input. That design lives in `docs/impl/agent-runtime-control-plane.md`.

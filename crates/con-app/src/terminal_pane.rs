@@ -1,7 +1,10 @@
 //! TerminalPane — Ghostty-backed terminal pane wrapper.
 
 use con_agent::context::{PaneObservationFrame, PaneObservationSupport, derive_screen_hints};
+#[cfg(not(target_os = "macos"))]
 use con_ghostty::TerminalColors;
+use con_ghostty::{GhosttyTerminal, TerminalProgress, TerminalPromptState};
+#[cfg(not(target_os = "macos"))]
 use con_terminal::TerminalTheme;
 use gpui::*;
 
@@ -22,12 +25,85 @@ impl TerminalPane {
         self.entity.read(cx).title()
     }
 
+    /// Naming context excludes application-owned animation frames.
+    pub fn title_name(&self, cx: &App) -> Option<String> {
+        self.entity
+            .read(cx)
+            .terminal_title
+            .name()
+            .map(str::to_owned)
+    }
+
+    pub fn cached_title(&self, cx: &App) -> Option<String> {
+        self.entity.read(cx).terminal_title.raw().map(str::to_owned)
+    }
+
     pub fn current_dir(&self, cx: &App) -> Option<String> {
         self.entity.read(cx).current_dir()
     }
 
+    pub fn foreground_process_group_id(&self, cx: &App) -> Option<u64> {
+        self.entity
+            .read(cx)
+            .terminal()
+            .and_then(|terminal| terminal.foreground_process_group_id())
+    }
+
+    pub fn surface_instance(&self, cx: &App) -> Option<std::sync::Weak<GhosttyTerminal>> {
+        self.entity
+            .read(cx)
+            .terminal()
+            .map(std::sync::Arc::downgrade)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn root_identity(&self, cx: &App) -> Option<con_ghostty::process::ProcessIdentity> {
+        self.entity
+            .read(cx)
+            .terminal()
+            .and_then(|terminal| terminal.root_identity())
+    }
+
+    pub fn tty_name(&self, cx: &App) -> Option<String> {
+        self.entity
+            .read(cx)
+            .terminal()
+            .and_then(|terminal| terminal.tty_name())
+    }
+
+    pub fn observation_support(&self, _cx: &App) -> PaneObservationSupport {
+        #[cfg(target_os = "linux")]
+        if self
+            .entity
+            .read(_cx)
+            .terminal()
+            .is_some_and(|terminal| terminal.uses_host_process_namespace())
+        {
+            // Host metadata is presentation-only; host PIDs and TTY names are
+            // not available to the sandbox's local control-plane observations.
+            return PaneObservationSupport::default();
+        }
+        PaneObservationSupport {
+            foreground_process_group_id: GhosttyTerminal::SUPPORTS_FOREGROUND_PROCESS_GROUP_ID,
+            tty_name: GhosttyTerminal::SUPPORTS_TTY_NAME,
+            ..PaneObservationSupport::default()
+        }
+    }
+
+    pub fn progress(&self, cx: &App) -> Option<TerminalProgress> {
+        self.entity.read(cx).progress()
+    }
+
     pub fn is_alive(&self, cx: &App) -> bool {
         self.entity.read(cx).is_alive()
+    }
+
+    pub fn prompt_state(&self, cx: &App) -> TerminalPromptState {
+        self.entity
+            .read(cx)
+            .terminal()
+            .map(|terminal| terminal.prompt_state())
+            .unwrap_or_default()
     }
 
     pub fn surface_ready(&self, cx: &App) -> bool {
@@ -60,9 +136,47 @@ impl TerminalPane {
         self.entity.update(cx, |view, _| view.write_or_queue(data));
     }
 
+    /// Write only when the terminal is live and initialized, so the bytes go
+    /// straight to the PTY instead of being queued for a surface that may
+    /// never come up. Reports whether such a write was observed; `false`
+    /// means the delivery result is unknown and must be reconciled by the user.
+    pub fn write_observed(&self, data: &[u8], cx: &mut App) -> bool {
+        self.entity.update(cx, |view, _| {
+            if view.terminal().is_none() || !view.is_alive() {
+                return false;
+            }
+            view.write_or_queue(data);
+            true
+        })
+    }
+
+    /// Automation bytes bypass keyboard encoding and paste transformations.
+    #[cfg(target_os = "macos")]
+    pub fn write_raw_observed(&self, data: &[u8], cx: &mut App) -> bool {
+        let view = self.entity.read(cx);
+        if !view.is_alive() {
+            return false;
+        }
+        view.terminal()
+            .is_some_and(|terminal| terminal.write_raw_to_pty(data).unwrap_or(false))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn write_raw_observed(&self, _data: &[u8], _cx: &mut App) -> bool {
+        false
+    }
+
     pub fn ensure_surface(&self, window: &mut Window, cx: &mut App) {
         self.entity.update(cx, |view, cx| {
             view.ensure_initialized_for_control(window, cx)
+        });
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub fn show_terminal_find(&self, window: &mut Window, cx: &mut App) {
+        self.entity.update(cx, |view, cx| {
+            view.ensure_initialized_for_control(window, cx);
+            view.show_terminal_find(String::new(), window, cx);
         });
     }
 
@@ -72,11 +186,13 @@ impl TerminalPane {
         });
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn set_theme(
         &self,
         theme: &TerminalTheme,
         colors: &TerminalColors,
         font_family: &str,
+        font_fallback: &[String],
         font_size: f32,
         background_opacity: f32,
         background_blur: bool,
@@ -93,6 +209,7 @@ impl TerminalPane {
             if let Err(err) = terminal.update_appearance(
                 colors,
                 font_family,
+                font_fallback,
                 font_size,
                 background_opacity,
                 background_blur,
@@ -110,11 +227,19 @@ impl TerminalPane {
     }
 
     pub fn clear_scrollback(&self, cx: &mut App) {
-        if let Some(terminal) = self.entity.read(cx).terminal() {
-            if let Err(err) = terminal.clear_screen_and_scrollback() {
-                log::error!("Failed to clear Ghostty scrollback: {}", err);
-            }
+        if let Some(terminal) = self.entity.read(cx).terminal()
+            && let Err(err) = terminal.clear_screen_and_scrollback()
+        {
+            log::error!("Failed to clear Ghostty scrollback: {}", err);
         }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn set_clipboard_write_enabled(&self, enabled: bool, cx: &App) -> Result<(), String> {
+        if let Some(terminal) = self.entity.read(cx).terminal() {
+            terminal.set_clipboard_write_enabled(enabled)?;
+        }
+        Ok(())
     }
 
     pub fn notify(&self, cx: &mut App) {
@@ -126,14 +251,20 @@ impl TerminalPane {
     }
 
     #[cfg(target_os = "macos")]
+    pub fn set_handoff_menu_entry_enabled(&self, enabled: bool, cx: &App) {
+        self.entity.read(cx).set_handoff_menu_entry_enabled(enabled);
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn set_native_transition_underlay_visible(&self, visible: bool, cx: &App) {
         self.entity
             .read(cx)
             .set_transition_underlay_visible(visible);
     }
 
-    pub fn shutdown_surface(&self, cx: &mut App) {
-        self.entity.update(cx, |view, _| view.shutdown_surface());
+    pub fn shutdown_surface(&self, window: Option<&mut Window>, cx: &mut App) {
+        self.entity
+            .update(cx, |view, cx| view.shutdown_surface(window, cx));
     }
 
     pub fn set_focus_state(&self, focused: bool, cx: &mut App) {
@@ -173,10 +304,13 @@ impl TerminalPane {
             .update(cx, |view, cx| view.mark_native_layout_pending(cx));
     }
 
-    pub fn release_mouse_selection(&self, cx: &App) {
-        if let Some(terminal) = self.entity.read(cx).terminal() {
-            terminal.send_mouse_button(false, con_ghostty::MouseButton::Left, 0);
-        }
+    pub fn selection_text(&self, cx: &App) -> Option<String> {
+        self.entity.read(cx).selection_text()
+    }
+
+    pub fn release_mouse_selection(&self, cx: &mut App) {
+        self.entity
+            .update(cx, |view, cx| view.release_mouse_selection(cx));
     }
 
     pub fn entity_id(&self) -> EntityId {
@@ -262,6 +396,8 @@ impl TerminalPane {
         PaneObservationFrame {
             title: title.clone(),
             cwd: self.current_dir(cx),
+            foreground_process_group_id: self.foreground_process_group_id(cx),
+            tty_name: self.tty_name(cx),
             screen_hints: derive_screen_hints(
                 title.as_deref(),
                 if visible_output.is_empty() {
@@ -278,7 +414,7 @@ impl TerminalPane {
             last_command: self.last_command(cx),
             last_exit_code: self.last_exit_code(cx),
             last_command_duration_secs: self.last_command_duration(cx).map(|d| d.as_secs_f64()),
-            support: PaneObservationSupport::default(),
+            support: self.observation_support(cx),
             has_shell_integration: self.has_shell_integration(cx),
             is_alt_screen: self.is_alt_screen(cx),
             is_busy: self.is_busy(cx),
@@ -318,6 +454,26 @@ pub fn subscribe_terminal_pane(
     window: &mut Window,
     cx: &mut Context<ConWorkspace>,
 ) {
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    pane.entity.update(cx, |view, cx| {
+        // Input-bar broadcast targets are not keyboard focus. Report only
+        // the GPUI leaf focus in an active window, including modal blur.
+        let focus = view.focus_handle(cx);
+        cx.on_focus(&focus, window, GhosttyView::sync_terminal_focus)
+            .detach();
+        cx.on_blur(&focus, window, GhosttyView::sync_terminal_focus)
+            .detach();
+        cx.observe_window_activation(window, GhosttyView::sync_terminal_focus)
+            .detach();
+        view.sync_terminal_focus(window, cx);
+    });
+    #[cfg(target_os = "macos")]
+    cx.subscribe_in(
+        &pane.entity,
+        window,
+        ConWorkspace::on_terminal_file_requested,
+    )
+    .detach();
     cx.subscribe_in(
         &pane.entity,
         window,
@@ -336,8 +492,23 @@ pub fn subscribe_terminal_pane(
         ConWorkspace::on_terminal_title_changed,
     )
     .detach();
+    cx.subscribe_in(&pane.entity, window, ConWorkspace::on_terminal_bell)
+        .detach();
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    cx.subscribe_in(
+        &pane.entity,
+        window,
+        ConWorkspace::on_terminal_desktop_notification,
+    )
+    .detach();
     cx.subscribe_in(&pane.entity, window, ConWorkspace::on_terminal_cwd_changed)
         .detach();
+    cx.subscribe_in(
+        &pane.entity,
+        window,
+        ConWorkspace::on_terminal_progress_changed,
+    )
+    .detach();
     cx.subscribe_in(
         &pane.entity,
         window,

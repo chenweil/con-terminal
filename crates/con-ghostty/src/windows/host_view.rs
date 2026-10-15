@@ -24,13 +24,19 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 
+use crate::cursor::CursorBlink;
 use crate::stub::GhosttyScrollbar;
 use crate::transcript::{TranscriptBuffer, snapshot_to_lines};
+use crate::{DesktopNotificationPolicy, clipboard_write_policy};
 
 use super::conpty::{ConPty, PtySize};
 use super::profile::{perf_trace_enabled, perf_trace_verbose};
-use super::render::{RenderOutcome, Renderer, RendererConfig, Selection, ThemeColors};
-use super::vt::{ScreenSnapshot, VtScreen};
+use super::render::{RenderOutcome, Renderer, RendererConfig, ThemeColors};
+use super::vt::{
+    SelectionAutoscroll, SelectionAutoscrollUpdate, SelectionGeometry, SelectionPoint, VtKeyEvent,
+    VtKeyOutcome, VtMouseAction, VtMouseButton, VtMouseEvent, VtMouseModifiers, VtPasteResult,
+    VtPasteSource, VtScreen,
+};
 
 use super::render::CellMetrics;
 
@@ -44,8 +50,15 @@ pub struct RenderSession {
     conpty: Arc<ConPty>,
     shell_cwd: Option<PathBuf>,
     config: Mutex<RendererConfig>,
-    base_font_size_px: f32,
+    /// Logical (96-DPI) font size. Settings can update it while the pane is
+    /// alive; DPI changes use the latest value rather than the construction
+    /// time value.
+    base_font_size_px: Mutex<f32>,
     dpi: AtomicU32,
+    /// A live metrics change must be reconciled with VT and ConPTY geometry.
+    /// Kept explicit so a partial resize failure is retried by the next
+    /// prepaint instead of leaving the renderer and child process desynced.
+    geometry_sync_pending: AtomicBool,
     /// When a local user action mutates terminal state (typing, paste,
     /// mouse selection), the next render should prefer the freshest
     /// frame over the lowest-latency non-blocking staging drain. This
@@ -66,7 +79,6 @@ pub struct RenderSession {
     /// so fractional deltas accumulate here instead of turning every
     /// tiny touchpad event into a full-row jump.
     scroll_remainder: Mutex<ScrollRemainder>,
-    drag_anchor: Mutex<Option<(u16, u64)>>,
 }
 
 unsafe impl Send for RenderSession {}
@@ -109,14 +121,31 @@ impl ScrollRemainder {
 /// We don't import GPUI's `Modifiers` here because `con-ghostty` must
 /// stay independent of the UI crate on Windows. The view layer copies
 /// the three bits we care about (shift/alt/control) into this struct.
-/// `platform` (the Win key / cmd key) is not reported in SGR and not
-/// meaningful for xterm shift-bypass semantics, so it's deliberately
-/// omitted.
+/// `platform` (the Win key / cmd key) is not part of terminal mouse
+/// protocols or meaningful for xterm shift-bypass semantics, so it's
+/// deliberately omitted.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MouseEventMods {
     pub shift: bool,
     pub alt: bool,
     pub control: bool,
+}
+
+impl From<MouseEventMods> for VtMouseModifiers {
+    fn from(modifiers: MouseEventMods) -> Self {
+        Self {
+            shift: modifiers.shift,
+            control: modifiers.control,
+            alt: modifiers.alt,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseDownRoute {
+    Ignored,
+    LocalSelection,
+    TerminalCapture,
 }
 
 impl RenderSession {
@@ -137,8 +166,11 @@ impl RenderSession {
         height_px: u32,
         dpi: u32,
         config: RendererConfig,
+        shell: String,
         cwd: Option<PathBuf>,
         initial_output: Option<Vec<u8>>,
+        clipboard_write_enabled: bool,
+        desktop_notification_policy: Arc<DesktopNotificationPolicy>,
         wake: W,
     ) -> Result<Self>
     where
@@ -164,10 +196,44 @@ impl RenderSession {
         let (cols, rows) = renderer.grid_for_dimensions(&renderer_config);
         log::info!("RenderSession: grid {cols}x{rows}");
 
+        let prepared_conpty = ConPty::prepare().context("prepare ConPTY pipes failed")?;
+        let vt_writer = prepared_conpty.writer();
+        let accept_vt_replies = Arc::new(AtomicBool::new(false));
+        let accept_vt_replies_in_callback = accept_vt_replies.clone();
         let vt = Arc::new(
-            VtScreen::new(cols, rows, renderer_config.theme.as_ref())
-                .context("VtScreen::new failed")?,
+            VtScreen::new_with_write_pty(
+                cols,
+                rows,
+                renderer_config.theme.as_ref(),
+                Some(Arc::new(move |bytes, class| {
+                    if !accept_vt_replies_in_callback.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    vt_writer.write_all(bytes, class)
+                })),
+            )
+            .context("VtScreen::new failed")?,
         );
+        vt.set_clipboard_write_policy(clipboard_write_policy(clipboard_write_enabled));
+        vt.set_desktop_notification_policy(desktop_notification_policy);
+        vt.set_clipboard_write_enabled(clipboard_write_enabled)
+            .map_err(anyhow::Error::msg)?;
+        let metrics = renderer.metrics();
+        let cell_width_px = metrics.cell_width_px.max(1);
+        let cell_height_px = metrics.cell_height_px.max(1);
+        // The renderer already owns an initial render target of the requested
+        // size, so initialize only libghostty's pixel geometry here. Waiting
+        // for the next size change leaves cell-based Kitty placements at 0px
+        // indefinitely when the pane opens at its final dimensions.
+        vt.resize(cols, rows, cell_width_px, cell_height_px)
+            .context("initial VtScreen::resize failed")?;
+        vt.set_mouse_geometry(
+            renderer_config.initial_width,
+            renderer_config.initial_height,
+            cell_width_px,
+            cell_height_px,
+        )
+        .context("initial mouse geometry failed")?;
         let transcript = Arc::new(Mutex::new(TranscriptBuffer::default()));
         if let Some(output) = initial_output
             .as_deref()
@@ -177,25 +243,38 @@ impl RenderSession {
             let text = String::from_utf8_lossy(output);
             transcript.lock().push(text.as_ref());
         }
+        // Replaying a restored transcript must not inject stale query
+        // responses into the new shell. Enable replies only after replay,
+        // while the child process still cannot have emitted output.
+        accept_vt_replies.store(true, Ordering::Release);
 
         let vt_for_pty = vt.clone();
+        let vt_for_exit = vt.clone();
         let transcript_for_pty = transcript.clone();
         let wake_for_pty: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
-        let shell = super::conpty::default_shell_command();
+        let wake_for_exit = wake_for_pty.clone();
         let shell_cwd = resolve_shell_cwd(cwd);
-        log::info!("RenderSession: spawning ConPTY shell={shell} cwd={shell_cwd:?}");
-        let conpty = ConPty::spawn(
-            &shell,
-            shell_cwd.as_deref(),
-            PtySize { cols, rows },
-            move |bytes| {
-                let text = String::from_utf8_lossy(bytes);
-                transcript_for_pty.lock().push(text.as_ref());
-                vt_for_pty.feed(bytes);
-                wake_for_pty();
-            },
-        )
-        .context("ConPty::spawn failed")?;
+        log::info!(
+            "RenderSession: spawning ConPTY shell={shell} cwd={shell_cwd:?} \
+             cell={cell_width_px}x{cell_height_px}"
+        );
+        let conpty = prepared_conpty
+            .spawn(
+                &shell,
+                shell_cwd.as_deref(),
+                PtySize { cols, rows },
+                move |bytes| {
+                    let text = String::from_utf8_lossy(bytes);
+                    transcript_for_pty.lock().push(text.as_ref());
+                    vt_for_pty.feed(bytes);
+                    wake_for_pty();
+                },
+                move || {
+                    vt_for_exit.push_program_event(crate::ProgramStatusEvent::ProcessExit);
+                    wake_for_exit();
+                },
+            )
+            .context("ConPty::spawn failed")?;
         let conpty = Arc::new(conpty);
 
         Ok(Self {
@@ -205,24 +284,33 @@ impl RenderSession {
             conpty,
             shell_cwd,
             config: Mutex::new(renderer_config),
-            base_font_size_px,
+            base_font_size_px: Mutex::new(base_font_size_px),
             dpi: AtomicU32::new(current_dpi),
+            geometry_sync_pending: AtomicBool::new(false),
             low_latency_requested: AtomicBool::new(false),
             low_latency_generation_target: AtomicU64::new(0),
             low_latency_burst_until: Mutex::new(None),
             scroll_remainder: Mutex::new(ScrollRemainder::default()),
-            drag_anchor: Mutex::new(None),
         })
     }
 
     /// Render one frame. `Rendered` returns freshly-read BGRA bytes;
     /// `Unchanged` means "nothing moved, reuse the last image".
-    pub fn render_frame(&self) -> Result<RenderOutcome> {
+    pub fn render_frame(&self, blink: &mut CursorBlink, focused: bool) -> Result<RenderOutcome> {
         let prof_started = perf_trace_enabled().then(Instant::now);
         let renderer = self.renderer.lock();
         let config = self.config.lock().clone();
         let snapshot_started = perf_trace_enabled().then(Instant::now);
-        let snapshot = self.vt.snapshot();
+        let Some(mut snapshot) = self.vt.try_snapshot() else {
+            return Ok(RenderOutcome::Pending);
+        };
+        // Blink changes do not mutate VT generation. Include the cursor row
+        // in partial readbacks on both edges, including when it disappears.
+        if snapshot.cursor.visible && !snapshot.dirty_rows.contains(&snapshot.cursor.row) {
+            snapshot.dirty_rows.push(snapshot.cursor.row);
+            snapshot.dirty_rows.sort_unstable();
+        }
+        snapshot.cursor = blink.update(snapshot.cursor, focused, Instant::now());
         let snapshot_ms = snapshot_started
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
@@ -233,6 +321,7 @@ impl RenderSession {
         let prefer_latest = immediate || generation_ready || burst_active;
         let render_started = perf_trace_enabled().then(Instant::now);
         let outcome = renderer.render(&snapshot, &config, prefer_latest)?;
+        self.vt.acknowledge_snapshot(snapshot.generation);
         let render_ms = render_started
             .map(|started| started.elapsed().as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
@@ -282,18 +371,23 @@ impl RenderSession {
         let config = self.config.lock();
         let (cols, rows) = renderer.grid_for_dimensions(&config);
         drop(config);
-        let cell_w = metrics.cell_width_px.max(1);
-        let cell_h = metrics.cell_height_px.max(1);
+        let cell_width_px = metrics.cell_width_px.max(1);
+        let cell_height_px = metrics.cell_height_px.max(1);
         drop(renderer);
 
         self.vt
-            .resize(cols, rows, cell_w, cell_h)
+            .resize(cols, rows, cell_width_px, cell_height_px)
             .context("VtScreen::resize failed")?;
+        self.vt
+            .set_mouse_geometry(width_px, height_px, cell_width_px, cell_height_px)
+            .context("mouse geometry resize failed")?;
         self.conpty
             .resize(PtySize { cols, rows })
             .context("ConPty::resize failed")?;
+        self.geometry_sync_pending.store(false, Ordering::Release);
         log::debug!(
-            "RenderSession::resize -> {width_px}x{height_px} grid={cols}x{rows} cell={cell_w}x{cell_h}"
+            "RenderSession::resize -> {width_px}x{height_px} grid={cols}x{rows} \
+             cell={cell_width_px}x{cell_height_px}"
         );
         Ok(())
     }
@@ -319,13 +413,7 @@ impl RenderSession {
             // palette would leave the border showing the previous
             // theme's background. Mirror what `WindowsGhosttyApp::
             // update_appearance` does at session construction.
-            config.clear_color = [
-                theme.bg[0] as f32 / 255.0,
-                theme.bg[1] as f32 / 255.0,
-                theme.bg[2] as f32 / 255.0,
-                1.0,
-            ];
-            config.theme = Some(theme.clone());
+            config.apply_theme(theme);
             // `set_theme` bumps the VT generation itself, so the next
             // prepaint re-runs draw_cells with the new palette + new
             // clear_color + any new opacity.
@@ -343,22 +431,79 @@ impl RenderSession {
         }
     }
 
+    /// Apply a live font change, rebuild cell metrics, and resize both the VT
+    /// and ConPTY grid. The settings panel updates existing sessions, so only
+    /// changing the app-level template is not sufficient.
+    pub fn set_font(
+        &self,
+        font_family: &str,
+        font_fallback: &[String],
+        font_size_px: f32,
+    ) -> Result<()> {
+        let logical_size = font_size_px.max(1.0);
+        let dpi = self.dpi.load(Ordering::Acquire).max(1);
+        let physical_size = scale_font_size(logical_size, dpi);
+        {
+            let config = self.config.lock();
+            if config.font_family == font_family
+                && config.font_fallback == font_fallback
+                && (config.font_size_px - physical_size).abs() <= f32::EPSILON
+            {
+                return Ok(());
+            }
+        }
+
+        let (width, height) = {
+            let renderer = self.renderer.lock();
+            renderer
+                .rebuild_atlas(font_family, font_fallback, physical_size)
+                .context("rebuild_atlas on font change failed")?;
+            renderer.dimensions_px()
+        };
+        *self.base_font_size_px.lock() = logical_size;
+        {
+            let mut config = self.config.lock();
+            config.font_family = font_family.to_string();
+            config.font_fallback = font_fallback.to_vec();
+            config.font_size_px = physical_size;
+        }
+        self.geometry_sync_pending.store(true, Ordering::Release);
+        // Renderer::resize is idempotent for unchanged pixel dimensions, but
+        // this method still re-derives the grid from the new atlas metrics.
+        self.resize(width, height)?;
+        self.vt.bump_generation();
+        log::info!(
+            "RenderSession::set_font family={font_family:?} logical_px={logical_size:.2} physical_px={physical_size:.2}"
+        );
+        Ok(())
+    }
+
+    /// Whether a metrics change still needs to reach VT and ConPTY.
+    pub fn geometry_sync_pending(&self) -> bool {
+        self.geometry_sync_pending.load(Ordering::Acquire)
+    }
+
     /// Notify of a DPI change. Rebuilds the glyph atlas at the new
     /// physical font size and re-derives the cell grid. Follow with a
     /// `resize` to match the new physical dimensions.
     pub fn set_dpi(&self, dpi: u32) -> Result<()> {
         let new_dpi = dpi.max(1);
-        let prev = self.dpi.swap(new_dpi, Ordering::AcqRel);
+        let renderer = self.renderer.lock();
+        let prev = self.dpi.load(Ordering::Acquire);
         if prev == new_dpi {
             return Ok(());
         }
-        let new_font = scale_font_size(self.base_font_size_px, new_dpi);
-        let renderer = self.renderer.lock();
+        let new_font = scale_font_size(*self.base_font_size_px.lock(), new_dpi);
+        let (family, fallback) = {
+            let config = self.config.lock();
+            (config.font_family.clone(), config.font_fallback.clone())
+        };
         renderer
-            .rebuild_atlas(new_font)
+            .rebuild_atlas(&family, &fallback, new_font)
             .context("rebuild_atlas on DPI change failed")?;
         let mut config = self.config.lock();
         config.font_size_px = new_font;
+        self.dpi.store(new_dpi, Ordering::Release);
         log::info!("RenderSession::set_dpi {prev} -> {new_dpi} font_px={new_font:.2}");
         Ok(())
     }
@@ -374,11 +519,11 @@ impl RenderSession {
     }
 
     pub fn is_alive(&self) -> bool {
-        self.conpty.is_alive()
+        self.conpty.is_alive() && !self.vt.is_write_desynchronized()
     }
 
-    pub fn is_bracketed_paste(&self) -> bool {
-        self.vt.is_bracketed_paste()
+    pub fn root_identity(&self) -> Option<crate::process::ProcessIdentity> {
+        self.conpty.root_identity()
     }
 
     pub fn is_decckm(&self) -> bool {
@@ -391,7 +536,15 @@ impl RenderSession {
 
     /// Send UTF-8 text to the child shell. Handles the ConPTY Enter
     /// quirk (shell expects CR, not LF).
-    pub fn write_input(&self, text: &str) {
+    pub fn write_input(&self, text: &str) -> Result<()> {
+        self.write_text_input(text, false)
+    }
+
+    pub fn send_text(&self, text: &str) -> Result<()> {
+        self.write_text_input(text, true)
+    }
+
+    fn write_text_input(&self, text: &str, user_input: bool) -> Result<()> {
         self.scroll_viewport_to_bottom();
         self.request_low_latency_after_next_generation();
         let bytes: std::borrow::Cow<[u8]> = if text.as_bytes().contains(&b'\n') {
@@ -399,15 +552,35 @@ impl RenderSession {
         } else {
             std::borrow::Cow::Borrowed(text.as_bytes())
         };
-        let _ = self.conpty.write(&bytes);
+        if user_input {
+            self.vt.write_user_input(&bytes)
+        } else {
+            self.vt.write_input(&bytes)
+        }
+        .context("failed to queue ConPTY input")
     }
 
-    /// Raw PTY write — no CR/LF normalization. Used for bracketed-paste
-    /// wrappers (ESC [200~ / ESC [201~) whose bytes mustn't be touched.
-    pub fn write_pty_raw(&self, data: &[u8]) {
-        self.scroll_viewport_to_bottom();
-        self.request_low_latency_after_next_generation();
-        let _ = self.conpty.write(data);
+    pub fn send_key(&self, event: &VtKeyEvent<'_>) -> Result<VtKeyOutcome> {
+        let outcome = self.vt.send_key(event)?;
+        if outcome.output_accepted {
+            self.scroll_viewport_to_bottom();
+            self.request_low_latency_after_next_generation();
+        }
+        Ok(outcome)
+    }
+
+    pub fn paste_text(
+        &self,
+        text: &str,
+        source: VtPasteSource,
+        confirm_unsafe_paste: bool,
+    ) -> Result<VtPasteResult> {
+        let result = self.vt.paste_text(text, source, confirm_unsafe_paste)?;
+        if result == VtPasteResult::Accepted {
+            self.scroll_viewport_to_bottom();
+            self.request_low_latency_after_next_generation();
+        }
+        Ok(result)
     }
 
     pub fn clear_screen_and_scrollback(&self) {
@@ -415,136 +588,217 @@ impl RenderSession {
         self.request_low_latency_present();
     }
 
-    /// Mouse-left-down at the given cell.
+    /// Mouse-down at the given surface position.
     ///
     /// Xterm convention: Shift bypasses mouse tracking so the user can
     /// always select text, even when a TUI has `set mouse=a` on. When
-    /// tracking is off or Shift is held, we drive local selection;
-    /// otherwise we emit an SGR button-press report and leave selection
-    /// alone. Shift+click with an existing selection extends from the
-    /// original anchor (matches every other terminal).
-    pub fn mouse_down(&self, col: u16, row: u16, mods: MouseEventMods) {
-        if self.vt.mouse_tracking_active() && !mods.shift {
-            self.request_low_latency_after_next_generation();
-            self.report_sgr_button(0, col, row, mods, true);
-            return;
-        }
-        self.request_low_latency_present();
-        let point = self.selection_point(col, row);
-        if mods.shift {
-            let renderer = self.renderer.lock();
-            let existing_anchor = renderer.selection().map(|s| s.anchor).unwrap_or(point);
-            *self.drag_anchor.lock() = Some(existing_anchor);
-            renderer.set_selection(Some(Selection {
-                anchor: existing_anchor,
-                extent: point,
-            }));
-            return;
-        }
-        *self.drag_anchor.lock() = Some(point);
-        self.renderer.lock().set_selection(Some(Selection {
-            anchor: point,
-            extent: point,
-        }));
-    }
-
-    /// Mouse-moved at the given cell while left button is held.
-    ///
-    /// When mouse tracking is active and the shell requested motion
-    /// (BUTTON / ANY mode), we emit an SGR motion report with the
-    /// motion bit (+32) set. Otherwise we extend the local drag.
-    pub fn mouse_drag(&self, col: u16, row: u16, mods: MouseEventMods) {
-        if self.vt.mouse_tracking_active() && !mods.shift {
-            self.request_low_latency_after_next_generation();
-            // Button 0 (LMB) + 32 = motion-with-button bit per SGR spec.
-            self.report_sgr_button(32, col, row, mods, true);
-            return;
-        }
-        self.request_low_latency_present();
-        let anchor = *self.drag_anchor.lock();
-        if let Some(anchor) = anchor {
-            self.renderer.lock().set_selection(Some(Selection {
-                anchor,
-                extent: self.selection_point(col, row),
-            }));
-        }
-    }
-
-    /// Mouse-left-up at the given cell.
-    ///
-    /// Emits an SGR release when mouse tracking is active (unless Shift
-    /// is held to keep selection). Otherwise clears a transient 1-cell
-    /// selection — a click without drag shouldn't leave a lone cell
-    /// highlighted.
-    pub fn mouse_up(&self, col: u16, row: u16, mods: MouseEventMods) {
-        if self.vt.mouse_tracking_active() && !mods.shift {
-            self.request_low_latency_after_next_generation();
-            self.report_sgr_button(0, col, row, mods, false);
-            return;
-        }
-        self.request_low_latency_present();
-        let anchor = self.drag_anchor.lock().take();
-        if let Some(anchor) = anchor
-            && anchor == self.selection_point(col, row)
-        {
-            self.renderer.lock().set_selection(None);
-        }
-    }
-
-    fn selection_point(&self, col: u16, row: u16) -> (u16, u64) {
-        let viewport_offset = self.vt.scrollbar().map_or(0, |scrollbar| scrollbar.offset);
-        (col, viewport_offset.saturating_add(row as u64))
-    }
-
-    fn report_sgr_button(
+    /// tracking is off or Shift is held, we drive local selection (left
+    /// button only — non-left buttons never drive selection); otherwise
+    /// Ghostty encodes the press using the terminal's active mouse protocol.
+    /// Shift+single-click with an existing selection extends from the original
+    /// anchor; repeated clicks retain the platform's word/line behavior.
+    /// The return value records the chosen route so the view can preserve it
+    /// through drag/release. A captured event stays on the terminal route even
+    /// when the active protocol legitimately emits zero bytes.
+    pub fn mouse_down(
         &self,
-        base_button: u8,
-        col: u16,
-        row: u16,
+        button: VtMouseButton,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
         mods: MouseEventMods,
-        pressed: bool,
-    ) {
-        let col = col.saturating_add(1);
-        let row = row.saturating_add(1);
-        let mut cb = base_button;
-        if mods.alt {
-            cb |= 0x08;
+        click_count: u8,
+    ) -> MouseDownRoute {
+        if self.vt.mouse_tracking_active() && !mods.shift {
+            self.vt.selection_cancel_gesture();
+            return match self.send_terminal_mouse_event(
+                VtMouseAction::Press,
+                Some(button),
+                point,
+                mods,
+            ) {
+                Ok(output_written) => {
+                    if output_written {
+                        self.request_low_latency_after_next_generation();
+                    }
+                    MouseDownRoute::TerminalCapture
+                }
+                Err(err) => {
+                    log::debug!("windows terminal mouse press failed: {err:#}");
+                    MouseDownRoute::Ignored
+                }
+            };
         }
-        if mods.control {
-            cb |= 0x10;
+        if button != VtMouseButton::Left {
+            // Non-left buttons never drive local selection; when tracking
+            // is off the click is simply not consumed by the terminal.
+            return MouseDownRoute::Ignored;
         }
-        let terminator = if pressed { 'M' } else { 'm' };
-        let seq = format!("\x1b[<{cb};{col};{row}{terminator}");
-        let _ = self.conpty.write(seq.as_bytes());
+        self.request_low_latency_present();
+        let result = self
+            .vt
+            .selection_press(point, geometry, click_count, mods.shift);
+        match result {
+            Ok(()) => MouseDownRoute::LocalSelection,
+            Err(err) => {
+                log::debug!("windows terminal selection press failed: {err:#}");
+                self.vt.selection_cancel_gesture();
+                MouseDownRoute::Ignored
+            }
+        }
+    }
+
+    /// Mouse-moved at the given surface position while a button is held.
+    ///
+    /// Ghostty applies the active mode's motion gate and same-cell deduplication.
+    /// `local_selection` preserves the route chosen for the matching press,
+    /// even if the child changes mouse modes while the button remains held.
+    pub fn mouse_drag(
+        &self,
+        button: VtMouseButton,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
+        mods: MouseEventMods,
+        local_selection: bool,
+    ) -> SelectionAutoscroll {
+        if !local_selection {
+            match self.send_terminal_mouse_event(VtMouseAction::Motion, Some(button), point, mods) {
+                Ok(true) => self.request_low_latency_after_next_generation(),
+                Ok(false) => {}
+                Err(err) => log::debug!("windows terminal mouse drag failed: {err:#}"),
+            }
+            return SelectionAutoscroll::None;
+        }
+        if button != VtMouseButton::Left {
+            return SelectionAutoscroll::None;
+        }
+        self.request_low_latency_present();
+        match self.vt.selection_drag(point, geometry) {
+            Ok(autoscroll) => autoscroll,
+            Err(err) => {
+                log::debug!("windows terminal selection drag failed: {err:#}");
+                self.vt.selection_cancel_gesture();
+                SelectionAutoscroll::None
+            }
+        }
+    }
+
+    /// Finish the route chosen for a pointer press.
+    pub fn mouse_up(
+        &self,
+        button: VtMouseButton,
+        point: Option<SelectionPoint>,
+        mods: MouseEventMods,
+        local_selection: bool,
+    ) -> bool {
+        if local_selection {
+            if button != VtMouseButton::Left {
+                return false;
+            }
+            self.request_low_latency_present();
+            let point = point.map(|point| (point.col, point.row));
+            if let Err(err) = self.vt.selection_release(point) {
+                log::debug!("windows terminal selection release failed: {err:#}");
+                self.vt.selection_cancel_gesture();
+            }
+            return false;
+        }
+
+        let Some(point) = point else {
+            return false;
+        };
+        match self.send_terminal_mouse_event(VtMouseAction::Release, Some(button), point, mods) {
+            Ok(output_written) => {
+                if output_written {
+                    self.request_low_latency_after_next_generation();
+                }
+                output_written
+            }
+            Err(err) => {
+                log::debug!("windows terminal mouse release failed: {err:#}");
+                false
+            }
+        }
+    }
+
+    pub fn selection_autoscroll_tick(
+        &self,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
+    ) -> SelectionAutoscrollUpdate {
+        match self.vt.selection_autoscroll_tick(point, geometry) {
+            Ok(update) => {
+                if update.changed {
+                    self.request_low_latency_present();
+                }
+                update
+            }
+            Err(err) => {
+                log::debug!("windows terminal selection autoscroll failed: {err:#}");
+                self.vt.selection_cancel_gesture();
+                SelectionAutoscrollUpdate::default()
+            }
+        }
+    }
+
+    /// Report pointer motion with no button held. Ghostty emits this only for
+    /// DECSET 1003 and deduplicates cell formats internally.
+    pub fn mouse_hover(&self, point: SelectionPoint, mods: MouseEventMods) -> bool {
+        if !self.vt.mouse_tracking_active() {
+            return false;
+        }
+        match self.send_terminal_mouse_event(VtMouseAction::Motion, None, point, mods) {
+            Ok(output_written) => {
+                if output_written {
+                    self.request_low_latency_after_next_generation();
+                }
+                output_written
+            }
+            Err(err) => {
+                log::debug!("windows terminal mouse hover failed: {err:#}");
+                false
+            }
+        }
+    }
+
+    fn send_terminal_mouse_event(
+        &self,
+        action: VtMouseAction,
+        button: Option<VtMouseButton>,
+        point: SelectionPoint,
+        mods: MouseEventMods,
+    ) -> Result<bool> {
+        self.vt
+            .send_mouse_event(VtMouseEvent {
+                action,
+                button,
+                modifiers: mods.into(),
+                surface_x_px: point.surface_x_px as f32,
+                surface_y_px: point.surface_y_px as f32,
+            })
+            .map(|outcome| outcome.output_written)
     }
 
     /// Cancel any in-flight drag (used on focus loss).
     pub fn cancel_drag(&self) {
-        *self.drag_anchor.lock() = None;
+        self.vt.selection_cancel_gesture();
     }
 
-    /// SGR mouse-wheel report. Only used when the shell has enabled
-    /// mouse tracking — see `mouse_tracking_active`. `col`/`row` are
-    /// 1-based cell coordinates per the SGR spec. Alt/Ctrl are encoded
-    /// into the button byte; Shift is handled upstream by the view,
-    /// which bypasses reporting entirely when Shift is held so the user
-    /// can scroll Con's own scrollback without the TUI seeing it.
-    pub fn forward_wheel(&self, col: u16, row: u16, delta_y: f32, mods: MouseEventMods) {
+    /// Mouse-wheel report using the terminal's active protocol. Shift bypass is
+    /// handled by the view so users can still scroll Con's own scrollback.
+    pub fn forward_wheel(&self, point: SelectionPoint, delta_y: f32, mods: MouseEventMods) {
         if delta_y.abs() < f32::EPSILON {
             return;
         }
-        self.request_low_latency_after_next_generation();
-        let mut button = sgr_wheel_button_for_delta(delta_y);
-        if mods.alt {
-            button |= 0x08;
+        let button = if delta_y > 0.0 {
+            VtMouseButton::Button4
+        } else {
+            VtMouseButton::Button5
+        };
+        match self.send_terminal_mouse_event(VtMouseAction::Press, Some(button), point, mods) {
+            Ok(true) => self.request_low_latency_after_next_generation(),
+            Ok(false) => {}
+            Err(err) => log::debug!("windows terminal mouse wheel failed: {err:#}"),
         }
-        if mods.control {
-            button |= 0x10;
-        }
-        let col = col.max(1);
-        let row = row.max(1);
-        let seq = format!("\x1b[<{button};{col};{row}M");
-        let _ = self.conpty.write(seq.as_bytes());
     }
 
     /// Scroll the terminal viewport when the shell did not request
@@ -585,6 +839,10 @@ impl RenderSession {
 
     pub fn scrollbar(&self) -> Option<GhosttyScrollbar> {
         self.vt.scrollbar()
+    }
+
+    pub fn snapshot_scrollbar(&self) -> Option<(u64, Option<GhosttyScrollbar>)> {
+        self.vt.snapshot_scrollbar()
     }
 
     pub fn generation(&self) -> u64 {
@@ -632,10 +890,10 @@ impl RenderSession {
     }
 
     fn scroll_rows_for_delta(&self, delta_y_px: f32, alternate_screen: bool) -> isize {
-        let cell_h = self.metrics().cell_height_px.max(1) as f32;
+        let cell_height_px = self.metrics().cell_height_px.max(1) as f32;
         self.scroll_remainder
             .lock()
-            .rows_for_delta(delta_y_px, cell_h, alternate_screen)
+            .rows_for_delta(delta_y_px, cell_height_px, alternate_screen)
     }
 
     fn send_scroll_as_cursor_keys(&self, rows: isize) {
@@ -644,24 +902,57 @@ impl RenderSession {
         };
         self.request_low_latency_after_next_generation();
         for _ in 0..rows.unsigned_abs() {
-            let _ = self.conpty.write(seq.as_bytes());
+            if let Err(err) = self.vt.write_input(seq.as_bytes()) {
+                log::debug!("windows terminal alternate-scroll write failed: {err}");
+                break;
+            }
         }
     }
 
     pub fn has_selection(&self) -> bool {
-        self.renderer.lock().selection().is_some()
+        self.vt.has_selection()
     }
 
     /// Extract the current selection as text. Returns `None` when
     /// nothing is selected.
     pub fn selection_text(&self) -> Option<String> {
-        let selection = self.renderer.lock().selection()?;
-        let snapshot = self.vt.snapshot();
-        Some(extract_selection_text(&snapshot, selection))
+        self.vt.selection_text()
+    }
+
+    pub fn take_selection_text(&self) -> Option<String> {
+        self.vt.take_selection_text()
     }
 
     pub fn read_screen_text(&self, max_lines: usize) -> Vec<String> {
         snapshot_to_lines(&self.vt.snapshot(), max_lines)
+    }
+
+    pub fn title(&self) -> Option<String> {
+        self.vt.title()
+    }
+
+    pub fn take_bell(&self) -> bool {
+        self.vt.take_bell()
+    }
+
+    pub fn progress(&self) -> Option<crate::TerminalProgress> {
+        self.vt.progress()
+    }
+
+    pub fn take_program_events(&self) -> Vec<crate::ProgramStatusEvent> {
+        self.vt.take_program_events()
+    }
+
+    pub fn set_clipboard_write_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.vt.set_clipboard_write_enabled(enabled)
+    }
+
+    pub fn take_clipboard_write(&self) -> Option<String> {
+        self.vt.take_clipboard_write()
+    }
+
+    pub fn take_desktop_notification(&self) -> Option<crate::DesktopNotification> {
+        self.vt.take_desktop_notification()
     }
 
     pub fn current_dir(&self) -> Option<String> {
@@ -681,7 +972,7 @@ impl RenderSession {
     }
 
     pub fn clear_selection(&self) {
-        self.renderer.lock().set_selection(None);
+        self.vt.clear_selection();
     }
 
     pub fn dimensions_px(&self) -> (u32, u32) {
@@ -750,10 +1041,6 @@ fn is_valid_shell_cwd(path: &Path) -> bool {
     path.is_absolute() && path.is_dir()
 }
 
-fn sgr_wheel_button_for_delta(delta_y: f32) -> u8 {
-    if delta_y > 0.0 { 64 } else { 65 }
-}
-
 fn cursor_key_for_scroll_rows(rows: isize, decckm: bool) -> Option<&'static str> {
     match rows.cmp(&0) {
         std::cmp::Ordering::Greater => Some(if decckm { "\x1bOA" } else { "\x1b[A" }),
@@ -770,59 +1057,9 @@ fn scale_font_size(logical_px: f32, dpi: u32) -> f32 {
     logical_px * (dpi as f32) / 96.0
 }
 
-fn extract_selection_text(snapshot: &ScreenSnapshot, sel: Selection) -> String {
-    let cols = snapshot.cols;
-    if cols == 0 || snapshot.cells.is_empty() {
-        return String::new();
-    }
-    let viewport_offset = snapshot.scrollbar.map_or(0, |scrollbar| scrollbar.offset);
-    let mut out = String::new();
-    let rows = snapshot.rows;
-    for row in 0..rows {
-        let mut row_buf = String::new();
-        let mut row_has_cell = false;
-        let mut last_non_blank: i32 = -1;
-        for col in 0..cols {
-            if !sel.contains(col, row, cols, viewport_offset) {
-                continue;
-            }
-            row_has_cell = true;
-            let idx = row as usize * cols as usize + col as usize;
-            let cell = snapshot.cells.get(idx).copied().unwrap_or_default();
-            let ch = if cell.codepoint == 0 {
-                ' '
-            } else {
-                char::from_u32(cell.codepoint).unwrap_or(' ')
-            };
-            row_buf.push(ch);
-            if cell.codepoint != 0 && cell.codepoint != 0x20 {
-                last_non_blank = row_buf.chars().count() as i32 - 1;
-            }
-        }
-        if !row_has_cell {
-            continue;
-        }
-        if last_non_blank >= 0 {
-            let trimmed: String = row_buf.chars().take(last_non_blank as usize + 1).collect();
-            out.push_str(&trimmed);
-        }
-        out.push('\n');
-    }
-    if out.ends_with('\n') {
-        out.pop();
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sgr_wheel_delta_matches_gpui_scroll_direction() {
-        assert_eq!(sgr_wheel_button_for_delta(1.0), 64);
-        assert_eq!(sgr_wheel_button_for_delta(-1.0), 65);
-    }
 
     #[test]
     fn alt_scroll_rows_match_cursor_direction() {

@@ -4,34 +4,41 @@
 //! are laid out each frame, so large files are fast.
 
 use crate::{
+    chat_markdown::ParsedChatMarkdown,
     editor_buffer::{CursorPosition, EditorBuffer},
     editor_lsp::{self, EditorDiagnostic, LspClient, LspClientEvent},
-    editor_syntax,
+    editor_preview, editor_syntax,
 };
 use crossbeam_channel::{Receiver, Sender};
 use gpui::{
-    App, Bounds, Context, CursorStyle, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla,
-    InteractiveElement, IntoElement, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollStrategy,
-    SharedString, Styled, StyledText, Task, UniformListScrollHandle, Window, div, px, svg,
-    uniform_list,
+    App, Bounds, Context, CursorStyle, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    FontWeight, Hsla, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render,
+    ScrollHandle, ScrollStrategy, SharedString, Styled, StyledImage, StyledText, Task,
+    UniformListScrollHandle, Window, div, img, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Theme,
-    scroll::{ScrollableElement, Scrollbar, ScrollbarHandle, ScrollbarShow},
+    scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode},
 };
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
+
+/// Unique-per-process id for `EditorView` instances, used to namespace GPUI
+/// element ids (multiple editor panes may show previews simultaneously).
+static NEXT_EDITOR_VIEW_ID: AtomicU64 = AtomicU64::new(1);
 
 const EDITOR_FONT_SIZE: f32 = 14.0;
 #[cfg_attr(not(test), allow(dead_code))]
 const LINE_HEIGHT: f32 = EDITOR_FONT_SIZE * 1.5;
 const GUTTER_WIDTH: f32 = 44.0;
-const TAB_BAR_HEIGHT: f32 = 28.0;
 const TEXT_IN_CONTENT_LEFT: f32 = 12.0;
 const ROW_TEXT_LEFT: f32 = GUTTER_WIDTH + TEXT_IN_CONTENT_LEFT;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -39,6 +46,7 @@ const CHAR_WIDTH: f32 = editor_char_width(EDITOR_FONT_SIZE);
 const SCROLLBAR_HITBOX_SIZE: f32 = 16.0;
 const CURSOR_SCROLL_PADDING: f32 = 32.0;
 const LSP_DID_CHANGE_DEBOUNCE_MS: u64 = 150;
+const PREVIEW_PARSE_DEBOUNCE_MS: u64 = 300;
 
 const fn editor_char_width(font_size: f32) -> f32 {
     // GPUI's text rendering does the actual shaping, but this lightweight editor
@@ -46,6 +54,234 @@ const fn editor_char_width(font_size: f32) -> f32 {
     // pixel offsets. Berkeley/Ioskeley-style mono fonts render close to a 3/5-em
     // cell, so keep hit-testing and overlays on that same grid.
     font_size * 0.6
+}
+
+/// Files larger than this are not decoded by the image viewer. GPUI's `img`
+/// element decodes at full resolution and keeps the RGBA buffer in memory
+/// regardless of the on-screen size (a 4000×3000 PNG alone is ~48 MB), so
+/// oversized files are shown as a "too large" placeholder instead.
+const IMAGE_SIZE_LIMIT: u64 = 20 * 1024 * 1024;
+/// Decoded RGBA memory budget for the image viewer. Header-only dimension
+/// probing keeps tiny compressed images with absurd dimensions from being
+/// handed to GPUI's decoder.
+const IMAGE_MAX_DECODED_PIXELS: usize = 64 * 1024 * 1024;
+const IMAGE_MAX_DIMENSION: usize = 16_384;
+/// SVG dimensions are declared on the root `<svg>` tag. Reading a bounded
+/// prefix avoids pulling a large SVG file into memory on the UI thread.
+const SVG_HEADER_PROBE_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageDimensions {
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageMetadata {
+    file_size: Option<u64>,
+    dimensions: Option<ImageDimensions>,
+    too_large: bool,
+}
+
+impl ImageMetadata {
+    fn inspect(path: &Path) -> Self {
+        let file_size = image_file_size(path);
+        let dimension_probe = image_dimension_probe(path, file_size);
+        let dimensions = dimension_probe.dimensions;
+        Self {
+            file_size,
+            dimensions,
+            too_large: image_exceeds_size_limit(file_size)
+                || dimension_probe.unsafe_to_decode
+                || dimensions.is_some_and(image_dimensions_exceed_limit),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageDimensionProbe {
+    dimensions: Option<ImageDimensions>,
+    unsafe_to_decode: bool,
+}
+
+/// Cached file size for image tabs. Missing or unreadable files return `None`;
+/// the image element's own fallback already covers those at render time.
+fn image_file_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+/// Returns true when an image at `path` should be refused by the viewer.
+fn image_exceeds_size_limit(size: Option<u64>) -> bool {
+    size.is_some_and(|size| size > IMAGE_SIZE_LIMIT)
+}
+
+fn image_dimension_probe(path: &Path, file_size: Option<u64>) -> ImageDimensionProbe {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    {
+        return svg_declared_dimensions(path, file_size);
+    }
+
+    ImageDimensionProbe {
+        dimensions: imagesize::size(path).ok().map(|size| ImageDimensions {
+            width: size.width,
+            height: size.height,
+        }),
+        unsafe_to_decode: false,
+    }
+}
+
+fn image_dimensions_exceed_limit(dimensions: ImageDimensions) -> bool {
+    dimensions.width > IMAGE_MAX_DIMENSION
+        || dimensions.height > IMAGE_MAX_DIMENSION
+        || dimensions
+            .width
+            .checked_mul(dimensions.height)
+            .is_none_or(|pixels| pixels > IMAGE_MAX_DECODED_PIXELS)
+}
+
+fn svg_declared_dimensions(path: &Path, file_size: Option<u64>) -> ImageDimensionProbe {
+    if image_exceeds_size_limit(file_size) {
+        return ImageDimensionProbe {
+            dimensions: None,
+            unsafe_to_decode: false,
+        };
+    }
+    use std::io::Read as _;
+    let mut buffer =
+        Vec::with_capacity(SVG_HEADER_PROBE_BYTES.min(file_size.unwrap_or(0) as usize));
+    let Some(mut file) = std::fs::File::open(path).ok() else {
+        return ImageDimensionProbe {
+            dimensions: None,
+            unsafe_to_decode: false,
+        };
+    };
+    if file
+        .by_ref()
+        .take(SVG_HEADER_PROBE_BYTES as u64)
+        .read_to_end(&mut buffer)
+        .is_err()
+    {
+        return ImageDimensionProbe {
+            dimensions: None,
+            unsafe_to_decode: false,
+        };
+    }
+    let svg = String::from_utf8_lossy(&buffer);
+    ImageDimensionProbe {
+        dimensions: parse_svg_declared_dimensions(&svg),
+        unsafe_to_decode: svg.find("<svg").is_none(),
+    }
+}
+
+fn parse_svg_declared_dimensions(svg: &str) -> Option<ImageDimensions> {
+    let start = svg.find("<svg")?;
+    let tag = &svg[start..start + svg[start..].find('>')?];
+    if let Some(view_box) = svg_attribute(tag, "viewBox").or_else(|| svg_attribute(tag, "viewbox"))
+        && let Some(dimensions) = parse_svg_view_box_dimensions(view_box)
+    {
+        return Some(dimensions);
+    }
+
+    let width = svg_attribute(tag, "width").and_then(parse_svg_length)?;
+    let height = svg_attribute(tag, "height").and_then(parse_svg_length)?;
+    Some(ImageDimensions { width, height })
+}
+
+fn svg_attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut rest = tag;
+    while let Some(index) = rest.find(name) {
+        let before = rest[..index].chars().next_back();
+        let after = rest[index + name.len()..].chars().next();
+        if before.is_none_or(|ch| ch.is_whitespace() || ch == '<')
+            && after.is_some_and(|ch| ch.is_whitespace() || ch == '=')
+        {
+            let mut value = rest[index + name.len()..].trim_start();
+            value = value.strip_prefix('=')?.trim_start();
+            let quote = value.chars().next()?;
+            if quote == '"' || quote == '\'' {
+                let value = &value[quote.len_utf8()..];
+                let end = value.find(quote)?;
+                return Some(&value[..end]);
+            }
+            let end = value.find(char::is_whitespace).unwrap_or(value.len());
+            return Some(&value[..end]);
+        }
+        rest = &rest[index + name.len()..];
+    }
+    None
+}
+
+fn parse_svg_view_box_dimensions(value: &str) -> Option<ImageDimensions> {
+    let numbers = value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ',')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<f64>().ok())
+        .collect::<Vec<_>>();
+    if numbers.len() != 4 {
+        return None;
+    }
+    positive_dimension(numbers[2])
+        .zip(positive_dimension(numbers[3]))
+        .map(|(width, height)| ImageDimensions { width, height })
+}
+
+fn parse_svg_length(value: &str) -> Option<usize> {
+    let value = value.trim();
+    if value.ends_with('%') {
+        return None;
+    }
+    static SVG_LENGTH_NUMBER: OnceLock<regex::Regex> = OnceLock::new();
+    let regex = SVG_LENGTH_NUMBER.get_or_init(|| {
+        regex::Regex::new(r"^([+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?)")
+            .expect("valid SVG length regex")
+    });
+    positive_dimension(
+        regex
+            .captures(value)?
+            .get(1)?
+            .as_str()
+            .parse::<f64>()
+            .ok()?,
+    )
+}
+
+fn positive_dimension(value: f64) -> Option<usize> {
+    value
+        .is_finite()
+        .then_some(value)
+        .filter(|value| *value > 0.0)
+        .map(|value| value.ceil() as usize)
+}
+
+/// Human-readable byte size for the image viewer status bar.
+fn format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_image_dimensions(dimensions: ImageDimensions) -> String {
+    format!("{}×{}", dimensions.width, dimensions.height)
+}
+
+fn image_labels(file_size: Option<u64>, dimensions: Option<ImageDimensions>) -> (String, String) {
+    (
+        file_size
+            .map(format_file_size)
+            .unwrap_or_else(|| "unknown size".to_string()),
+        dimensions
+            .map(format_image_dimensions)
+            .unwrap_or_else(|| "unknown dimensions".to_string()),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -79,12 +315,30 @@ pub struct EditorEmptied;
 impl EventEmitter<ActiveFileChanged> for EditorView {}
 impl EventEmitter<EditorEmptied> for EditorView {}
 
+/// How a tab's content is presented. Image tabs open in a read-only viewer
+/// instead of the text buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorTabKind {
+    Text,
+    Image,
+}
+
 #[derive(Clone)]
 pub struct EditorTab {
     pub path: PathBuf,
+    kind: EditorTabKind,
+    /// Set when the image file exceeds [`IMAGE_SIZE_LIMIT`]: the viewer shows a
+    /// "too large" placeholder instead of asking GPUI to decode the file.
+    image_too_large: bool,
+    /// Cached at open time to keep image-tab rendering side-effect-free.
+    image_file_size: Option<u64>,
+    /// Header-declared dimensions cached at open time, before full decode.
+    image_dimensions: Option<ImageDimensions>,
     buffer: EditorBuffer,
     render_cache: EditorRenderCache,
     save_enabled: bool,
+    preview: bool,
+    preview_cache: Option<(u64, Arc<ParsedChatMarkdown>)>,
 }
 
 #[derive(Clone, Default)]
@@ -109,6 +363,8 @@ struct EditorRenderCacheKey {
 #[derive(Clone)]
 struct EditorRenderSnapshot {
     path: PathBuf,
+    image_file_size: Option<u64>,
+    image_dimensions: Option<ImageDimensions>,
     lines: Arc<Vec<String>>,
     syntax_runs: Arc<Vec<Vec<gpui::TextRun>>>,
     widest_line_index: usize,
@@ -117,22 +373,63 @@ struct EditorRenderSnapshot {
     selection: Option<(CursorPosition, CursorPosition)>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PreviewParseRequest {
+    path: PathBuf,
+    revision: u64,
+    generation: u64,
+    text: String,
+}
+
 impl EditorTab {
     fn new(path: PathBuf, buffer: EditorBuffer) -> Self {
         Self {
             path,
+            kind: EditorTabKind::Text,
+            image_too_large: false,
+            image_file_size: None,
+            image_dimensions: None,
             buffer,
             render_cache: EditorRenderCache::default(),
             save_enabled: true,
+            preview: false,
+            preview_cache: None,
+        }
+    }
+
+    /// Create a read-only image tab. The file is never read into the text
+    /// buffer — GPUI's `img` element streams it from disk through the shared
+    /// asset cache (async decode + global cache handled by the framework).
+    /// `metadata` is cached so status and placeholders do not stat or probe
+    /// headers on every repaint. Oversized or over-dimensioned files are
+    /// refused before GPUI decodes them.
+    fn image(path: PathBuf, metadata: ImageMetadata) -> Self {
+        Self {
+            path,
+            kind: EditorTabKind::Image,
+            image_too_large: metadata.too_large,
+            image_file_size: metadata.file_size,
+            image_dimensions: metadata.dimensions,
+            buffer: EditorBuffer::from_text(String::new()),
+            render_cache: EditorRenderCache::default(),
+            save_enabled: false,
+            preview: false,
+            preview_cache: None,
         }
     }
 
     fn read_error(path: PathBuf, error: std::io::Error) -> Self {
         Self {
             path,
+            kind: EditorTabKind::Text,
+            image_too_large: false,
+            image_file_size: None,
+            image_dimensions: None,
             buffer: EditorBuffer::from_text(format!("Error reading file: {error}")),
             render_cache: EditorRenderCache::default(),
             save_enabled: false,
+            preview: false,
+            preview_cache: None,
         }
     }
 
@@ -184,6 +481,8 @@ impl EditorTab {
         let lines = self.render_cache.lines.clone();
         EditorRenderSnapshot {
             path: self.path.clone(),
+            image_file_size: self.image_file_size,
+            image_dimensions: self.image_dimensions,
             line_count: lines.len().max(1),
             lines,
             syntax_runs: self.render_cache.syntax_runs.clone(),
@@ -206,43 +505,96 @@ pub struct EditorView {
     open_generation: u64,
     scroll_handle: UniformListScrollHandle,
     cursor_visible: bool,
-    cursor_blink: Option<Task<()>>,
+    _cursor_blink: Task<()>,
     selection_anchor: Option<CursorPosition>,
     content_bounds: Option<Bounds<Pixels>>,
+    pending_source_scroll: Option<u64>,
     focus_handle: FocusHandle,
     metrics: EditorMetrics,
     lsp_clients: HashMap<PathBuf, LspClient>,
     lsp_diagnostics: HashMap<PathBuf, Vec<EditorDiagnostic>>,
     lsp_event_tx: Sender<LspClientEvent>,
     lsp_event_rx: Receiver<LspClientEvent>,
-    lsp_event_pump: Option<Task<()>>,
+    _lsp_event_pump: Task<()>,
     lsp_change_generations: HashMap<PathBuf, u64>,
     lsp_change_debounce_tasks: HashMap<PathBuf, Task<()>>,
     dirty_close_blocked_tab: Option<usize>,
+    view_id: u64,
+    preview_scroll_handle: ScrollHandle,
+    file_tab_scroll_handle: ScrollHandle,
+    file_tab_reveal_pending: bool,
+    preview_parse_generation: u64,
+    preview_parse_task: Option<Task<()>>,
+    preview_parse_pending: Option<(PathBuf, u64)>,
 }
 
 impl EditorView {
     pub fn new_with_font_size(font_size: f32, cx: &mut Context<Self>) -> Self {
         let (lsp_event_tx, lsp_event_rx) = crossbeam_channel::unbounded();
+        // Own background work for the entity's lifetime, not its render passes.
+        let cursor_blink = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(550))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.tabs.is_empty() || this.active_tab_is_image() {
+                            return;
+                        }
+                        this.cursor_visible = !this.cursor_visible;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let lsp_event_pump = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(120))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.drain_lsp_events() {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             tabs: Vec::new(),
             active_tab: 0,
             open_generation: 0,
             scroll_handle: UniformListScrollHandle::new(),
             cursor_visible: true,
-            cursor_blink: None,
+            _cursor_blink: cursor_blink,
             selection_anchor: None,
             content_bounds: None,
+            pending_source_scroll: None,
             focus_handle: cx.focus_handle(),
             metrics: EditorMetrics::from_terminal_font_size(font_size),
             lsp_clients: HashMap::new(),
             lsp_diagnostics: HashMap::new(),
             lsp_event_tx,
             lsp_event_rx,
-            lsp_event_pump: None,
+            _lsp_event_pump: lsp_event_pump,
             lsp_change_generations: HashMap::new(),
             lsp_change_debounce_tasks: HashMap::new(),
             dirty_close_blocked_tab: None,
+            view_id: NEXT_EDITOR_VIEW_ID.fetch_add(1, Ordering::Relaxed),
+            preview_scroll_handle: ScrollHandle::new(),
+            file_tab_scroll_handle: ScrollHandle::new(),
+            file_tab_reveal_pending: false,
+            preview_parse_generation: 0,
+            preview_parse_task: None,
+            preview_parse_pending: None,
         }
     }
 
@@ -258,13 +610,40 @@ impl EditorView {
     /// Load a file from disk into the editor pane. If the file is already open,
     /// it becomes the active editor tab; otherwise a new editor tab is appended.
     pub fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.open_file_at(path, None, cx);
+    }
+
+    pub fn open_file_at(
+        &mut self,
+        path: PathBuf,
+        position: Option<(usize, usize)>,
+        cx: &mut Context<Self>,
+    ) {
         self.open_generation = self.open_generation.wrapping_add(1);
         let generation = self.open_generation;
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+        if let Some(index) = self.tabs.iter().position(|tab| {
+            tab.path == path || tab.path.canonicalize().ok().as_ref() == Some(&path)
+        }) {
             self.active_tab = index;
+            self.file_tab_reveal_pending = true;
             self.dirty_close_blocked_tab = None;
             self.scroll_handle = UniformListScrollHandle::new();
+            self.reveal_source_position(position);
             cx.emit(ActiveFileChanged);
+            cx.notify();
+            return;
+        }
+
+        // Images open in a read-only viewer: no text read, no LSP, no save.
+        // GPUI's `img` element loads the file lazily through the asset cache,
+        // so the tab can be created synchronously. Files over
+        // `IMAGE_SIZE_LIMIT`, or images whose headers declare too many pixels,
+        // are refused up front so GPUI never decodes a huge RGBA buffer.
+        if editor_syntax::is_image_path(&path) {
+            let apply = self.open_file_from_image_with_activation(path, true);
+            if apply.active_file_changed {
+                cx.emit(ActiveFileChanged);
+            }
             cx.notify();
             return;
         }
@@ -285,6 +664,9 @@ impl EditorView {
                             activate,
                         );
                         this.ensure_lsp_for_path(&path);
+                        if activate {
+                            this.reveal_source_position(position);
+                        }
                         if apply.active_file_changed {
                             cx.emit(ActiveFileChanged);
                         }
@@ -306,6 +688,28 @@ impl EditorView {
         .detach();
     }
 
+    fn reveal_source_position(&mut self, position: Option<(usize, usize)>) {
+        let Some((line, column)) = position else {
+            return;
+        };
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if tab.kind == EditorTabKind::Image {
+            return;
+        }
+        tab.preview = false;
+        let row = line
+            .saturating_sub(1)
+            .min(tab.buffer.lines().len().saturating_sub(1));
+        let text = &tab.buffer.lines()[row];
+        let byte = Self::byte_offset_for_visual_column(text, column.saturating_sub(1));
+        self.set_cursor(row, byte);
+        // The first content layout may not exist yet. Retry once after the
+        // actual viewport has been measured, including horizontal scrolling.
+        self.pending_source_scroll = Some(self.open_generation);
+    }
+
     fn open_file_from_content_with_activation(
         &mut self,
         path: PathBuf,
@@ -321,6 +725,29 @@ impl EditorView {
             |path| EditorTab::new(path, EditorBuffer::from_text(content)),
         );
         if apply.activated {
+            self.file_tab_reveal_pending = true;
+            self.dirty_close_blocked_tab = None;
+            self.scroll_handle = UniformListScrollHandle::new();
+        }
+        apply
+    }
+
+    fn open_file_from_image_with_activation(
+        &mut self,
+        path: PathBuf,
+        activate: bool,
+    ) -> LoadedFileApply {
+        let metadata = ImageMetadata::inspect(&path);
+        let apply = Self::apply_loaded_file_tab(
+            &mut self.tabs,
+            &mut self.active_tab,
+            path,
+            activate,
+            false,
+            |path| EditorTab::image(path, metadata),
+        );
+        if apply.activated {
+            self.file_tab_reveal_pending = true;
             self.dirty_close_blocked_tab = None;
             self.scroll_handle = UniformListScrollHandle::new();
         }
@@ -342,6 +769,7 @@ impl EditorView {
             |path| EditorTab::read_error(path, error),
         );
         if apply.activated {
+            self.file_tab_reveal_pending = true;
             self.dirty_close_blocked_tab = None;
             self.scroll_handle = UniformListScrollHandle::new();
         }
@@ -383,27 +811,238 @@ impl EditorView {
         }
     }
 
+    /// Open dropped external paths. Only image files open in the editor —
+    /// non-image drops keep their existing behavior (the editor ignores them;
+    /// only the terminal pane consumes them, as shell-escaped paths). Returns
+    /// true when at least one image was opened so the caller can focus.
+    fn open_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> bool {
+        let mut opened_any = false;
+        for path in paths {
+            if editor_syntax::is_image_path(path) {
+                self.open_file(path.clone(), cx);
+                opened_any = true;
+            }
+        }
+        opened_any
+    }
+
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
+    }
+
+    pub fn tab_summaries(&self) -> Vec<(String, bool)> {
+        self.tabs
+            .iter()
+            .map(|tab| {
+                let name = tab
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| tab.path.display().to_string());
+                (name, tab.buffer.is_dirty())
+            })
+            .collect()
+    }
+
+    pub fn active_tab_index(&self) -> usize {
+        self.active_tab
+    }
+
+    pub fn preview_available(&self) -> bool {
+        self.active_tab_ref().is_some_and(|tab| {
+            tab.kind != EditorTabKind::Image
+                && editor_syntax::language_for_path(&tab.path) == Some("markdown")
+        })
     }
 
     pub fn active_path(&self) -> Option<&Path> {
         self.active_tab_ref().map(|tab| tab.path.as_path())
     }
 
+    pub fn file_tab_scroll_handle(&self) -> &ScrollHandle {
+        &self.file_tab_scroll_handle
+    }
+
+    pub fn reveal_active_file_tab_after_layout(&mut self, cx: &mut Context<Self>) {
+        if self.file_tab_reveal_pending {
+            self.file_tab_reveal_pending = false;
+            // The first prepaint initializes the handle's viewport and overflow.
+            // Reveal on the next frame, without resetting manually scrolled tabs.
+            self.file_tab_scroll_handle.scroll_to_item(self.active_tab);
+            cx.notify();
+        }
+    }
+
     pub fn activate_tab(&mut self, index: usize) {
         if index < self.tabs.len() && self.active_tab != index {
             self.open_generation = self.open_generation.wrapping_add(1);
             self.active_tab = index;
+            self.file_tab_reveal_pending = true;
             self.dirty_close_blocked_tab = None;
             self.scroll_handle = UniformListScrollHandle::new();
+            self.preview_scroll_handle = ScrollHandle::new();
             if let Some(path) = self.active_path().map(Path::to_path_buf) {
                 self.ensure_lsp_for_path(&path);
             }
         }
     }
 
-    fn activate_tab_and_emit(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub fn preview_active(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.preview)
+    }
+
+    fn preview_toggle_target(path: &Path, preview: bool) -> Option<bool> {
+        (editor_syntax::language_for_path(path) == Some("markdown")).then_some(!preview)
+    }
+
+    fn preview_parse_plan(
+        tab: &EditorTab,
+        pending: Option<(&Path, u64)>,
+    ) -> Option<(PathBuf, u64, String)> {
+        let revision = tab.buffer.revision();
+        let cache_current = tab
+            .preview_cache
+            .as_ref()
+            .is_some_and(|(cached, _)| *cached == revision);
+        if cache_current {
+            return None;
+        }
+        if pending.is_some_and(|(pending_path, pending_revision)| {
+            pending_path == tab.path && pending_revision == revision
+        }) {
+            return None;
+        }
+        Some((tab.path.clone(), revision, tab.buffer.text()))
+    }
+
+    fn begin_preview_parse_for_tabs(
+        tabs: &[EditorTab],
+        tab_index: usize,
+        pending: &mut Option<(PathBuf, u64)>,
+        generation: &mut u64,
+    ) -> Option<PreviewParseRequest> {
+        let tab = tabs.get(tab_index)?;
+        let pending_ref = pending
+            .as_ref()
+            .map(|(path, revision)| (path.as_path(), *revision));
+        let (path, revision, text) = Self::preview_parse_plan(tab, pending_ref)?;
+        *generation = generation.wrapping_add(1);
+        let request_generation = *generation;
+        *pending = Some((path.clone(), revision));
+        Some(PreviewParseRequest {
+            path,
+            revision,
+            generation: request_generation,
+            text,
+        })
+    }
+
+    fn begin_preview_parse(&mut self, tab_index: usize) -> Option<PreviewParseRequest> {
+        Self::begin_preview_parse_for_tabs(
+            &self.tabs,
+            tab_index,
+            &mut self.preview_parse_pending,
+            &mut self.preview_parse_generation,
+        )
+    }
+
+    fn apply_preview_parse_result_to_tabs(
+        tabs: &mut [EditorTab],
+        pending: &mut Option<(PathBuf, u64)>,
+        current_generation: u64,
+        path: &Path,
+        revision: u64,
+        result_generation: u64,
+        parsed: ParsedChatMarkdown,
+    ) -> bool {
+        if current_generation != result_generation {
+            return false;
+        }
+        *pending = None;
+        let Some(tab) = tabs.iter_mut().find(|tab| tab.path == path) else {
+            return false;
+        };
+        if tab.buffer.revision() != revision {
+            return false;
+        }
+        // Parsed markdown carries gpui text-geometry handles: main-thread
+        // only, and this cache never leaves the UI thread.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let cached = Arc::new(parsed);
+        tab.preview_cache = Some((revision, cached));
+        true
+    }
+
+    fn apply_preview_parse_result(
+        &mut self,
+        path: &Path,
+        revision: u64,
+        generation: u64,
+        parsed: ParsedChatMarkdown,
+    ) -> bool {
+        Self::apply_preview_parse_result_to_tabs(
+            &mut self.tabs,
+            &mut self.preview_parse_pending,
+            self.preview_parse_generation,
+            path,
+            revision,
+            generation,
+            parsed,
+        )
+    }
+
+    /// Toggle the rendered markdown preview for the active tab. Only markdown
+    /// files can be previewed; other languages ignore the toggle.
+    pub fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let Some(preview) = Self::preview_toggle_target(&tab.path, tab.preview) else {
+            return;
+        };
+        let tab = &mut self.tabs[self.active_tab];
+        tab.preview = preview;
+        self.preview_scroll_handle = ScrollHandle::new();
+        if preview {
+            self.schedule_preview_parse(self.active_tab, cx);
+        }
+        cx.notify();
+    }
+
+    /// Reparse the tab's markdown after a debounce, unless the cached parse
+    /// already matches the buffer revision. Results are keyed by tab path (not
+    /// index, which shifts on close), and an in-flight parse for the same
+    /// tab+revision is not restarted by unrelated renders.
+    fn schedule_preview_parse(&mut self, tab_index: usize, cx: &mut Context<Self>) {
+        let Some(request) = self.begin_preview_parse(tab_index) else {
+            return;
+        };
+        let path = request.path;
+        let revision = request.revision;
+        let generation = request.generation;
+        let text = request.text;
+        self.preview_parse_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(PREVIEW_PARSE_DEBOUNCE_MS))
+                .await;
+            // ParsedChatMarkdown is Send but not Sync (RefCell render caches),
+            // so parse on the background executor and wrap in Arc back on the
+            // main thread.
+            let parsed = cx
+                .background_executor()
+                .spawn(async move { ParsedChatMarkdown::parse(&text) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.apply_preview_parse_result(&path, revision, generation, parsed) {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    pub fn activate_tab_and_emit(&mut self, index: usize, cx: &mut Context<Self>) {
         self.activate_tab(index);
         if self.active_path().is_some() {
             cx.emit(ActiveFileChanged);
@@ -435,11 +1074,12 @@ impl EditorView {
             return true;
         }
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        self.file_tab_reveal_pending = true;
         self.scroll_handle = UniformListScrollHandle::new();
         false
     }
 
-    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
         }
@@ -678,8 +1318,16 @@ impl EditorView {
         event.button == MouseButton::Left && event.click_count == 2 && !event.modifiers.shift
     }
 
-    fn update_content_bounds(&mut self, bounds: Bounds<Pixels>) {
+    fn update_content_bounds(&mut self, bounds: Bounds<Pixels>) -> bool {
         self.content_bounds = Some(bounds);
+        if bounds.size.width <= px(0.0) || bounds.size.height <= px(0.0) {
+            return false;
+        }
+        if self.pending_source_scroll.take() == Some(self.open_generation) {
+            self.scroll_cursor_into_view();
+            return true;
+        }
+        false
     }
 
     fn point_hits_scrollbar(&self, point: Point<Pixels>) -> bool {
@@ -782,6 +1430,9 @@ impl EditorView {
     }
 
     fn ensure_lsp_for_path(&mut self, path: &Path) {
+        if editor_syntax::is_image_path(path) {
+            return;
+        }
         let path = path.to_path_buf();
         if self.lsp_clients.contains_key(&path) {
             return;
@@ -837,10 +1488,9 @@ impl EditorView {
                         .iter()
                         .find(|tab| tab.path == path)
                         .map(|tab| tab.buffer.text())
+                        && let Some(client) = this.lsp_clients.get(&path)
                     {
-                        if let Some(client) = this.lsp_clients.get(&path) {
-                            client.did_change(text);
-                        }
+                        client.did_change(text);
                     }
                 });
             }),
@@ -864,6 +1514,9 @@ impl EditorView {
     }
 
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.preview_active() || self.active_tab_is_image() {
+            return;
+        }
         if let Some(tab) = self.active_tab_mut() {
             tab.buffer.insert_text(text);
         }
@@ -872,6 +1525,9 @@ impl EditorView {
     }
 
     pub fn insert_newline(&mut self, cx: &mut Context<Self>) {
+        if self.preview_active() || self.active_tab_is_image() {
+            return;
+        }
         if let Some(tab) = self.active_tab_mut() {
             tab.buffer.insert_newline();
         }
@@ -880,6 +1536,9 @@ impl EditorView {
     }
 
     pub fn delete_backward(&mut self, cx: &mut Context<Self>) {
+        if self.preview_active() || self.active_tab_is_image() {
+            return;
+        }
         if let Some(tab) = self.active_tab_mut() {
             tab.buffer.delete_backward();
         }
@@ -888,6 +1547,9 @@ impl EditorView {
     }
 
     pub fn delete_forward(&mut self, cx: &mut Context<Self>) {
+        if self.preview_active() || self.active_tab_is_image() {
+            return;
+        }
         if let Some(tab) = self.active_tab_mut() {
             tab.buffer.delete_forward();
         }
@@ -896,6 +1558,9 @@ impl EditorView {
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.preview_active() || self.active_tab_is_image() {
+            return false;
+        }
         let undid = self.active_tab_mut().is_some_and(|tab| tab.buffer.undo());
         if undid {
             self.notify_lsp_active_did_change(cx);
@@ -1014,6 +1679,10 @@ impl EditorView {
             let Some(tab) = self.active_tab_mut() else {
                 return Ok(None);
             };
+            if tab.kind == EditorTabKind::Image {
+                // Image tabs are read-only and persist nothing.
+                return Ok(None);
+            }
             if !tab.save_enabled {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1028,6 +1697,9 @@ impl EditorView {
     }
 
     pub fn cut_selection(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        if self.preview_active() || self.active_tab_is_image() {
+            return None;
+        }
         let text = self
             .active_tab_mut()
             .and_then(|tab| tab.buffer.cut_selection());
@@ -1040,6 +1712,15 @@ impl EditorView {
 
     pub fn active_tab_ref(&self) -> Option<&EditorTab> {
         self.tabs.get(self.active_tab)
+    }
+
+    /// Returns true when the active tab is the read-only image viewer. Image
+    /// tabs have no editable text: editing, saving, LSP, and the markdown
+    /// preview toggle are all no-ops for them.
+    fn active_tab_is_image(&self) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .is_some_and(|tab| tab.kind == EditorTabKind::Image)
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -1097,37 +1778,6 @@ impl Focusable for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.cursor_blink.is_none() {
-            self.cursor_blink = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(550))
-                        .await;
-                    let _ = this.update(cx, |this, cx| {
-                        this.cursor_visible = !this.cursor_visible;
-                        cx.notify();
-                    });
-                }
-            }));
-        }
-        if self.lsp_event_pump.is_none() {
-            self.lsp_event_pump = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(120))
-                        .await;
-                    let _ = this.update(cx, |this, cx| {
-                        if this.drain_lsp_events() {
-                            cx.notify();
-                        }
-                    });
-                }
-            }));
-        }
-        if self.drain_lsp_events() {
-            cx.notify();
-        }
-
         let theme = cx.theme().clone();
         let fg = theme.foreground;
         let bg = theme.background;
@@ -1170,115 +1820,25 @@ impl Render for EditorView {
         let line_height = px(metrics.line_height);
         let gutter_bg = theme.muted.opacity(0.04);
         let gutter_color = theme.muted_foreground.opacity(0.42);
-        let tabs = self
-            .tabs
-            .iter()
-            .map(|tab| (tab.path.clone(), tab.buffer.is_dirty()))
-            .collect::<Vec<_>>();
-
-        let mut tab_bar = div()
-            .h(px(TAB_BAR_HEIGHT))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .px(px(6.0))
-            .bg(theme.tab_bar_segmented.opacity(0.72))
-            .overflow_x_scrollbar();
-
-        for (index, (path, dirty)) in tabs.iter().enumerate() {
-            let is_active = index == active_index;
-            let title = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
-            let label = if *dirty {
-                format!("● {title}")
-            } else {
-                title
+        let preview_active = self.preview_active();
+        let image_tab = self.tabs[active_index].kind == EditorTabKind::Image;
+        if preview_active {
+            let cache_stale = match &self.tabs[active_index].preview_cache {
+                Some((revision, _)) => *revision != self.tabs[active_index].buffer.revision(),
+                None => true,
             };
-            let activate_index = index;
-            let close_index = index;
-            let tab_active_bg = theme.tab_active;
-            let tab_transparent_bg = theme.transparent;
-            let hover_fg = fg;
-            let label_color = if is_active {
-                fg.opacity(0.92)
-            } else {
-                theme.muted_foreground
-            };
-            let mut tab_el = div()
-                .id(("editor-file-tab", index))
-                .h(px(22.0))
-                .max_w(px(180.0))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .pl(px(8.0))
-                .pr(px(3.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .bg(if is_active {
-                    tab_active_bg
-                } else {
-                    tab_transparent_bg
-                })
-                .hover(move |s| {
-                    s.bg(if is_active {
-                        tab_active_bg
-                    } else {
-                        hover_fg.opacity(0.08)
-                    })
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _event, window, cx| {
-                        this.focus_handle.focus(window, cx);
-                        this.activate_tab_and_emit(activate_index, cx);
-                    }),
-                )
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(px(12.0))
-                        .line_height(px(14.0))
-                        .font_family(ui_font.clone())
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(label_color)
-                        .child(SharedString::from(label)),
-                );
-
-            tab_el = tab_el.child(
-                div()
-                    .size(px(14.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.0))
-                    .text_size(px(11.0))
-                    .text_color(fg.opacity(if is_active { 0.55 } else { 0.42 }))
-                    .hover(|s| s.bg(gpui::black().opacity(0.08)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event, window, cx| {
-                            cx.stop_propagation();
-                            window.prevent_default();
-                            this.focus_handle.focus(window, cx);
-                            this.close_tab(close_index, cx);
-                        }),
-                    )
-                    .child(
-                        svg()
-                            .path("phosphor/x.svg")
-                            .size(px(8.0))
-                            .text_color(fg.opacity(if is_active { 0.55 } else { 0.42 })),
-                    ),
-            );
-
-            tab_bar = tab_bar.child(tab_el);
+            if cache_stale {
+                self.schedule_preview_parse(active_index, cx);
+            }
         }
-
+        let preview_document = if preview_active {
+            self.tabs[active_index]
+                .preview_cache
+                .as_ref()
+                .map(|(_, document)| document.clone())
+        } else {
+            None
+        };
         let diagnostic_count = diagnostics.len();
         let diagnostics_label = if diagnostic_count == 0 {
             String::new()
@@ -1287,15 +1847,25 @@ impl Render for EditorView {
         } else {
             format!(" — {diagnostic_count} issues")
         };
-        let status_text: SharedString = format!(
-            "{} lines — Ln {}, Col {}{} — {}",
-            line_count,
-            cursor.row + 1,
-            cursor_visual_column + 1,
-            diagnostics_label,
-            active.path.display()
-        )
-        .into();
+        let status_text: SharedString = if image_tab {
+            let (size_label, dimensions_label) =
+                image_labels(active.image_file_size, active.image_dimensions);
+            format!(
+                "{size_label} — {dimensions_label} — {}",
+                active.path.display()
+            )
+            .into()
+        } else {
+            format!(
+                "{} lines — Ln {}, Col {}{} — {}",
+                line_count,
+                cursor.row + 1,
+                cursor_visual_column + 1,
+                diagnostics_label,
+                active.path.display()
+            )
+            .into()
+        };
         let dirty_close_blocked = self.dirty_close_blocked_tab == Some(active_index);
         let mut status_bar = div()
             .h(px(22.0))
@@ -1494,7 +2064,114 @@ impl Render for EditorView {
             .flex_1()
             .min_h_0()
             .child(list)
-            .child(Scrollbar::new(&self.scroll_handle).scrollbar_show(ScrollbarShow::Always));
+            .child(Scrollbar::new(&self.scroll_handle).mode(ScrollbarMode::Always));
+
+        let body = if image_tab {
+            let path = active.path.clone();
+            let bg = theme.background;
+            let placeholder_fg = theme.muted_foreground.opacity(0.6);
+            let placeholder_font = ui_font.clone();
+            let make_placeholder = move |label: SharedString| {
+                let label = label.clone();
+                let font = placeholder_font.clone();
+                move || {
+                    div()
+                        .font_family(font.clone())
+                        .text_size(px(12.0))
+                        .text_color(placeholder_fg)
+                        .child(label.clone())
+                        .into_any_element()
+                }
+            };
+            if self.tabs[active_index].image_too_large {
+                // Refuse to decode oversized files: GPUI's `img` element keeps a
+                // full-resolution RGBA buffer in memory regardless of display
+                // size, so a large file is shown as a hint instead.
+                let (size_label, dimensions_label) = image_labels(
+                    self.tabs[active_index].image_file_size,
+                    self.tabs[active_index].image_dimensions,
+                );
+                let limit_mb = IMAGE_SIZE_LIMIT / (1024 * 1024);
+                let decoded_mb = IMAGE_MAX_DECODED_PIXELS * 4 / (1024 * 1024);
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.0))
+                    .bg(bg)
+                    .child(
+                        div()
+                            .font_family(ui_font.clone())
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg.opacity(0.85))
+                            .child("Image too large"),
+                    )
+                    .child(
+                        div()
+                            .font_family(ui_font.clone())
+                            .text_size(px(11.0))
+                            .text_color(theme.muted_foreground.opacity(0.6))
+                            .child(format!(
+                                "{size_label} / {dimensions_label}. Limits: {limit_mb} MB on disk or ~{decoded_mb} MB decoded"
+                            )),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(bg)
+                    .child(
+                        img(path)
+                            .object_fit(ObjectFit::Contain)
+                            .max_w_full()
+                            .max_h_full()
+                            .with_loading(make_placeholder("Loading image…".into()))
+                            .with_fallback(make_placeholder("Failed to load image".into())),
+                    )
+                    .into_any_element()
+            }
+        } else if preview_active {
+            match preview_document {
+                Some(document) => {
+                    let base_dir = active
+                        .path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    let namespace = format!("editor-preview-{}-{active_index}", self.view_id);
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(editor_preview::render_markdown_preview(
+                            &document,
+                            &base_dir,
+                            &theme,
+                            &self.preview_scroll_handle,
+                            &namespace,
+                        ))
+                        .into_any_element()
+                }
+                None => div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.muted_foreground.opacity(0.6))
+                    .child("Rendering preview…")
+                    .into_any_element(),
+            }
+        } else {
+            list_frame.into_any_element()
+        };
 
         let view_handle = cx.weak_entity();
 
@@ -1503,15 +2180,35 @@ impl Render for EditorView {
             .flex()
             .flex_col()
             .bg(theme.background)
-            .cursor(CursorStyle::IBeam)
+            .cursor(if image_tab {
+                CursorStyle::Arrow
+            } else {
+                CursorStyle::IBeam
+            })
             .track_focus(&self.focus_handle)
+            .drag_over::<ExternalPaths>(|style, _, _, _| style)
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                // Images dropped onto the editor pane open in the viewer;
+                // non-image drops are ignored (the terminal pane consumes
+                // those, pasting shell-escaped paths). Same pattern as the
+                // terminal's drop handler in ghostty_view.rs.
+                if this.open_dropped_paths(paths.paths(), cx) {
+                    window.focus(&this.focus_handle, cx);
+                }
+            }))
             .key_context("EditorView")
-            .on_children_prepainted(move |bounds_list, _window, cx| {
-                let Some(bounds) = bounds_list.get(1).copied() else {
+            .on_children_prepainted(move |bounds_list, window, cx| {
+                // Children are [body, status_bar] since the header moved to
+                // PaneTree's merged editor bar — body is index 0.
+                let Some(bounds) = bounds_list.first().copied() else {
                     return;
                 };
-                if let Some(view) = view_handle.upgrade() {
-                    view.update(cx, |this, _cx| this.update_content_bounds(bounds));
+                if let Some(view) = view_handle.upgrade()
+                    && view.update(cx, |this, _cx| this.update_content_bounds(bounds))
+                {
+                    window.on_next_frame(move |_window, cx| {
+                        view.update(cx, |_this, cx| cx.notify());
+                    });
                 }
             })
             .on_mouse_down(
@@ -1524,13 +2221,20 @@ impl Render for EditorView {
                         return;
                     }
                     this.focus_handle.focus(window, cx);
+                    if this.preview_active() || this.active_tab_is_image() {
+                        window.prevent_default();
+                        cx.notify();
+                        return;
+                    }
                     this.mouse_down(event);
                     window.prevent_default();
                     cx.notify();
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                if this.point_hits_scrollbar(event.position)
+                if this.preview_active()
+                    || this.active_tab_is_image()
+                    || this.point_hits_scrollbar(event.position)
                     || !this.point_in_content_bounds(event.position)
                 {
                     return;
@@ -1542,6 +2246,9 @@ impl Render for EditorView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    if this.preview_active() || this.active_tab_is_image() {
+                        return;
+                    }
                     if this.point_hits_scrollbar(event.position) {
                         this.mouse_up(event);
                         return;
@@ -1556,8 +2263,7 @@ impl Render for EditorView {
                     cx.notify();
                 }),
             )
-            .child(tab_bar)
-            .child(list_frame)
+            .child(body)
             .child(status_bar)
             .into_any_element()
     }
@@ -1566,7 +2272,246 @@ impl Render for EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext as _;
     use std::path::Path;
+
+    #[gpui::test]
+    fn tab_summaries_follow_buffer_dirty_state_and_tab_lifecycle(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            view.tabs = vec![
+                EditorTab::new(
+                    PathBuf::from("src/main.rs"),
+                    EditorBuffer::from_text("fn main() {}"),
+                ),
+                EditorTab::new(
+                    PathBuf::from("docs/notes.md"),
+                    EditorBuffer::from_text("# Notes"),
+                ),
+            ];
+            assert_eq!(
+                view.tab_summaries(),
+                vec![("main.rs".into(), false), ("notes.md".into(), false)]
+            );
+            view.tabs[1].buffer.insert_text("changed");
+            view.activate_tab_and_emit(1, cx);
+            assert_eq!(view.active_tab_index(), 1);
+            assert_eq!(
+                view.tab_summaries(),
+                vec![("main.rs".into(), false), ("notes.md".into(), true)]
+            );
+
+            // Closing a dirty tab keeps its dot and exposes the existing save prompt.
+            view.close_tab(1, cx);
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.dirty_close_blocked_tab, Some(1));
+            view.tabs[1].buffer.undo();
+            assert!(!view.tab_summaries()[1].1);
+            view.close_tab(1, cx);
+            assert_eq!(view.active_tab_index(), 0);
+            assert_eq!(view.tab_summaries(), vec![("main.rs".into(), false)]);
+        });
+    }
+
+    #[gpui::test]
+    fn preview_chrome_follows_active_file_and_excludes_image_tabs(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            assert!(!view.preview_available());
+            assert!(!view.preview_active());
+            view.tabs = vec![
+                EditorTab::new(
+                    PathBuf::from("notes.md"),
+                    EditorBuffer::from_text("# Notes"),
+                ),
+                EditorTab::new(
+                    PathBuf::from("main.rs"),
+                    EditorBuffer::from_text("fn main() {}"),
+                ),
+            ];
+            assert!(view.preview_available());
+            view.toggle_preview(cx);
+            assert!(view.preview_active());
+            view.activate_tab_and_emit(1, cx);
+            assert!(!view.preview_available());
+            assert!(!view.preview_active());
+            view.activate_tab_and_emit(0, cx);
+            assert!(view.preview_active());
+            view.tabs[0].kind = EditorTabKind::Image;
+            assert!(!view.preview_available());
+        });
+    }
+
+    #[gpui::test]
+    fn lsp_events_are_processed_without_rendering(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        let path = PathBuf::from("/tmp/con-unrendered-editor.rs");
+        view.update(cx, |view, _| {
+            view.lsp_event_tx
+                .send(LspClientEvent::Diagnostics {
+                    path: path.clone(),
+                    diagnostics: Vec::new(),
+                })
+                .unwrap();
+            assert!(!view.lsp_diagnostics.contains_key(&path));
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert!(view.lsp_diagnostics.contains_key(&path));
+            assert!(view.lsp_event_rx.is_empty());
+        });
+    }
+
+    #[test]
+    fn preview_toggle_only_applies_to_markdown() {
+        assert_eq!(
+            EditorView::preview_toggle_target(Path::new("notes.md"), false),
+            Some(true)
+        );
+        assert_eq!(
+            EditorView::preview_toggle_target(Path::new("README.markdown"), false),
+            Some(true)
+        );
+        assert_eq!(
+            EditorView::preview_toggle_target(Path::new("main.rs"), false),
+            None
+        );
+        assert_eq!(
+            EditorView::preview_toggle_target(Path::new("notes.md"), true),
+            Some(false)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)] // Match the UI-thread-only production API.
+    fn preview_parse_plan_skips_current_cache_and_duplicate_pending() {
+        let mut tab = EditorTab::new(
+            PathBuf::from("notes.md"),
+            EditorBuffer::from_text("# Notes\n\nbody"),
+        );
+        let revision = tab.buffer.revision();
+        assert_eq!(
+            EditorView::preview_parse_plan(&tab, None)
+                .map(|(path, revision, text)| { (path, revision, text.starts_with("# Notes")) }),
+            Some((PathBuf::from("notes.md"), revision, true))
+        );
+
+        assert!(
+            EditorView::preview_parse_plan(&tab, Some((Path::new("notes.md"), revision))).is_none()
+        );
+
+        tab.preview_cache = Some((revision, Arc::new(ParsedChatMarkdown::parse("cached"))));
+        assert!(EditorView::preview_parse_plan(&tab, None).is_none());
+
+        tab.buffer.insert_text("!");
+        assert!(EditorView::preview_parse_plan(&tab, None).is_some());
+    }
+
+    #[test]
+    fn preview_parse_result_requires_matching_generation_path_and_revision() {
+        let mut tabs = vec![EditorTab::new(
+            PathBuf::from("notes.md"),
+            EditorBuffer::from_text("# Notes"),
+        )];
+        let mut generation = 0;
+        let mut pending = None;
+
+        let request =
+            EditorView::begin_preview_parse_for_tabs(&tabs, 0, &mut pending, &mut generation)
+                .expect("parse request");
+        assert_eq!(request.path, PathBuf::from("notes.md"));
+        assert_eq!(pending, Some((PathBuf::from("notes.md"), request.revision)));
+        assert!(
+            EditorView::begin_preview_parse_for_tabs(&tabs, 0, &mut pending, &mut generation)
+                .is_none()
+        );
+
+        assert!(!EditorView::apply_preview_parse_result_to_tabs(
+            &mut tabs,
+            &mut pending,
+            generation,
+            Path::new("notes.md"),
+            request.revision,
+            request.generation.wrapping_add(1),
+            ParsedChatMarkdown::parse("wrong generation"),
+        ));
+        assert!(tabs[0].preview_cache.is_none());
+        assert_eq!(pending, Some((PathBuf::from("notes.md"), request.revision)));
+
+        assert!(!EditorView::apply_preview_parse_result_to_tabs(
+            &mut tabs,
+            &mut pending,
+            generation,
+            Path::new("other.md"),
+            request.revision,
+            request.generation,
+            ParsedChatMarkdown::parse("wrong path"),
+        ));
+        assert!(tabs[0].preview_cache.is_none());
+        assert!(pending.is_none());
+
+        let request =
+            EditorView::begin_preview_parse_for_tabs(&tabs, 0, &mut pending, &mut generation)
+                .expect("second parse request");
+        tabs[0].buffer.insert_text(" updated");
+        assert!(!EditorView::apply_preview_parse_result_to_tabs(
+            &mut tabs,
+            &mut pending,
+            generation,
+            Path::new("notes.md"),
+            request.revision,
+            request.generation,
+            ParsedChatMarkdown::parse("stale revision"),
+        ));
+        assert!(tabs[0].preview_cache.is_none());
+
+        let request =
+            EditorView::begin_preview_parse_for_tabs(&tabs, 0, &mut pending, &mut generation)
+                .expect("fresh parse request");
+        assert!(EditorView::apply_preview_parse_result_to_tabs(
+            &mut tabs,
+            &mut pending,
+            generation,
+            Path::new("notes.md"),
+            request.revision,
+            request.generation,
+            ParsedChatMarkdown::parse("# Notes"),
+        ));
+        assert_eq!(
+            tabs[0]
+                .preview_cache
+                .as_ref()
+                .map(|(revision, _)| *revision),
+            Some(request.revision)
+        );
+    }
+
+    #[gpui::test]
+    fn preview_mode_guards_edit_operations(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            let apply = view.open_file_from_content_with_activation(
+                PathBuf::from("notes.md"),
+                "hello".to_string(),
+                true,
+            );
+            assert!(apply.activated);
+            view.tabs[0].preview = true;
+            view.tabs[0].buffer.select_all();
+
+            view.insert_text("changed", cx);
+            view.insert_newline(cx);
+            view.delete_backward(cx);
+            view.delete_forward(cx);
+            assert!(!view.undo(cx));
+            assert!(view.cut_selection(cx).is_none());
+
+            assert_eq!(view.tabs[0].buffer.text(), "hello");
+            assert_eq!(view.tabs[0].buffer.revision(), 0);
+        });
+    }
 
     #[test]
     fn content_point_accounts_for_text_gutter() {
@@ -1913,6 +2858,421 @@ mod tests {
 
         assert!(!tab.save_enabled);
         assert!(tab.buffer.text().contains("Error reading file:"));
+    }
+
+    #[test]
+    fn image_tab_has_empty_buffer_and_no_save() {
+        let tab = EditorTab::image(
+            PathBuf::from("logo.png"),
+            ImageMetadata {
+                file_size: Some(1024),
+                dimensions: Some(ImageDimensions {
+                    width: 640,
+                    height: 480,
+                }),
+                too_large: false,
+            },
+        );
+
+        assert_eq!(tab.kind, EditorTabKind::Image);
+        assert!(!tab.save_enabled);
+        assert!(!tab.preview);
+        assert_eq!(tab.image_file_size, Some(1024));
+        assert_eq!(
+            tab.image_dimensions,
+            Some(ImageDimensions {
+                width: 640,
+                height: 480
+            })
+        );
+        assert!(!tab.buffer.is_dirty());
+        assert_eq!(tab.buffer.text(), "");
+    }
+
+    #[test]
+    fn oversized_image_tab_refuses_decode() {
+        let tab = EditorTab::image(
+            PathBuf::from("huge.png"),
+            ImageMetadata {
+                file_size: Some(IMAGE_SIZE_LIMIT + 1),
+                dimensions: None,
+                too_large: true,
+            },
+        );
+
+        assert_eq!(tab.kind, EditorTabKind::Image);
+        assert!(tab.image_too_large);
+        assert_eq!(tab.image_file_size, Some(IMAGE_SIZE_LIMIT + 1));
+        assert!(!tab.save_enabled);
+        assert_eq!(tab.buffer.text(), "");
+    }
+
+    #[test]
+    fn image_size_limit_is_20_mb() {
+        assert_eq!(IMAGE_SIZE_LIMIT, 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn image_file_size_and_limit_boundaries() {
+        let dir = std::env::temp_dir().join(format!(
+            "con-editor-size-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let small = dir.join("small.png");
+        let boundary = dir.join("boundary.png");
+        let large = dir.join("large.png");
+        std::fs::write(&small, [0u8; 4]).unwrap();
+        std::fs::write(&boundary, [0u8; 8]).unwrap();
+        // Sparse file: length says 1024 bytes, nothing is written to disk.
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(1024)
+            .unwrap();
+
+        assert_eq!(image_file_size(&small), Some(4));
+        assert_eq!(image_file_size(&boundary), Some(8));
+        assert_eq!(image_file_size(&large), Some(1024));
+        assert_eq!(image_file_size(&dir.join("missing.png")), None);
+        assert!(!image_exceeds_size_limit(Some(IMAGE_SIZE_LIMIT)));
+        assert!(image_exceeds_size_limit(Some(IMAGE_SIZE_LIMIT + 1)));
+        assert!(!image_exceeds_size_limit(None));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn huge_png_dimensions_are_refused_before_decode() {
+        let dir =
+            std::env::temp_dir().join(format!("con-editor-png-dim-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge-dimensions.png");
+        std::fs::write(
+            &path,
+            png_with_ihdr_dimensions(IMAGE_MAX_DIMENSION as u32 + 1, 16),
+        )
+        .unwrap();
+
+        let metadata = ImageMetadata::inspect(&path);
+
+        assert_eq!(metadata.file_size, Some(33));
+        assert_eq!(
+            metadata.dimensions,
+            Some(ImageDimensions {
+                width: IMAGE_MAX_DIMENSION + 1,
+                height: 16
+            })
+        );
+        assert!(metadata.too_large);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn svg_declared_dimensions_are_guarded() {
+        let normal = r#"<svg width="320em" height="200ex"></svg>"#;
+        let huge = r#"<svg viewBox="0 0 100000 100000"></svg>"#;
+
+        assert_eq!(
+            parse_svg_declared_dimensions(normal),
+            Some(ImageDimensions {
+                width: 320,
+                height: 200
+            })
+        );
+        let huge_dimensions = parse_svg_declared_dimensions(huge).unwrap();
+        assert!(image_dimensions_exceed_limit(huge_dimensions));
+    }
+
+    #[test]
+    fn svg_root_missing_from_probe_is_refused_before_decode() {
+        let dir =
+            std::env::temp_dir().join(format!("con-editor-svg-probe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hidden-root.svg");
+        let mut svg = " ".repeat(SVG_HEADER_PROBE_BYTES + 1);
+        svg.push_str(r#"<svg viewBox="0 0 100000 100000"></svg>"#);
+        std::fs::write(&path, svg).unwrap();
+
+        let metadata = ImageMetadata::inspect(&path);
+
+        assert_eq!(metadata.dimensions, None);
+        assert!(metadata.too_large);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn png_with_ihdr_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png.extend_from_slice(&13_u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&width.to_be_bytes());
+        png.extend_from_slice(&height.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+
+        let crc = crc32(&png[12..29]);
+        png.extend_from_slice(&crc.to_be_bytes());
+        png
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffff_u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = 0_u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    #[gpui::test]
+    fn terminal_file_location_applies_after_load_and_on_reopen(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("location.txt");
+        std::fs::write(&path, "first\n中文abc\nlast").unwrap();
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            view.open_file_at(path.clone(), Some((2, 3)), cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].buffer.cursor(), CursorPosition::new(1, 6));
+            view.tabs[0].buffer.insert_text("edited");
+            view.open_file_at(path.clone(), Some((99, 99)), cx);
+            assert_eq!(view.tabs.len(), 1);
+            assert!(view.tabs[0].buffer.is_dirty());
+            assert_eq!(view.tabs[0].buffer.cursor(), CursorPosition::new(2, 4));
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_file_location_newest_request_wins(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, "first\nsecond").unwrap();
+        std::fs::write(&second, "abc\nxyz").unwrap();
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            view.open_file_at(first, Some((2, 1)), cx);
+            view.open_file_at(second.clone(), Some((1, 3)), cx);
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _cx| {
+            assert_eq!(view.active_path(), Some(second.as_path()));
+            assert_eq!(
+                view.active_tab_ref().unwrap().buffer.cursor(),
+                CursorPosition::new(0, 2)
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    fn terminal_file_location_reuses_dirty_symlink_buffer(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("real.txt");
+        let alias = dir.path().join("alias.txt");
+        std::fs::write(&path, "original").unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| view.open_file(alias, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.active_tab_mut().unwrap().buffer.insert_text("unsaved");
+            view.open_file_at(path.canonicalize().unwrap(), Some((1, 2)), cx);
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].buffer.text(), "unsavedoriginal");
+            assert!(view.tabs[0].buffer.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn source_scroll_waits_for_first_layout_and_runs_once(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, _cx| {
+            view.open_file_from_content_with_activation(
+                PathBuf::from("long.txt"),
+                "a".repeat(200)
+                    .lines()
+                    .cycle()
+                    .take(250)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                true,
+            );
+            view.reveal_source_position(Some((200, 180)));
+            assert_eq!(view.tabs[0].buffer.cursor(), CursorPosition::new(199, 179));
+            assert_eq!(view.content_bounds, None);
+            assert_eq!(view.pending_source_scroll, Some(view.open_generation));
+            assert!(!view.update_content_bounds(Bounds::new(
+                gpui::point(px(0.0), px(0.0)),
+                gpui::size(px(0.0), px(0.0))
+            )));
+            let bounds = Bounds::new(
+                gpui::point(px(0.0), px(0.0)),
+                gpui::size(px(300.0), px(200.0)),
+            );
+            assert!(view.update_content_bounds(bounds));
+            assert!(view.scroll_handle.offset().x < px(0.0));
+            assert_eq!(view.pending_source_scroll, None);
+            assert!(!view.update_content_bounds(bounds));
+            view.reveal_source_position(Some((10, 1)));
+            view.open_generation += 1;
+            assert!(!view.update_content_bounds(bounds));
+        });
+    }
+
+    #[gpui::test]
+    fn source_scroll_makes_line_200_visible_in_new_editor(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let mut view = EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx);
+            view.open_file_from_content_with_activation(
+                PathBuf::from("long.txt"),
+                (1..=300)
+                    .map(|n| format!("line {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                true,
+            );
+            view.reveal_source_position(Some((200, 1)));
+            view
+        });
+        cx.refresh().unwrap();
+        // Test windows have no platform frame loop. Deliver the frame queued
+        // after the first content layout so the list consumes its scroll request.
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        view.read_with(cx, |view, _cx| {
+            let bounds = view.content_bounds.expect("editor content laid out");
+            let offset = f32::from(view.scroll_handle.offset().y);
+            let top = 199.0 * view.metrics.line_height + offset;
+            assert!(
+                top >= -1.0
+                    && top + view.metrics.line_height <= f32::from(bounds.size.height) + 1.0,
+                "line 200 outside viewport: top={top}, bounds={bounds:?}, offset={offset}"
+            );
+            assert_eq!(view.pending_source_scroll, None);
+        });
+    }
+
+    #[gpui::test]
+    fn open_file_routes_images_to_read_only_viewer(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            view.open_file(PathBuf::from("/tmp/con-test-photo.png"), cx);
+
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].path, PathBuf::from("/tmp/con-test-photo.png"));
+            assert_eq!(view.tabs[0].kind, EditorTabKind::Image);
+            assert!(!view.tabs[0].image_too_large);
+            assert!(view.active_tab_is_image());
+            assert!(view.save_active().unwrap().is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn open_file_refuses_oversized_images(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("con-editor-huge-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let huge = dir.join("huge.png");
+        // Sparse file: length is IMAGE_SIZE_LIMIT + 1, nothing on disk.
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(IMAGE_SIZE_LIMIT + 1)
+            .unwrap();
+
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            view.open_file(huge.clone(), cx);
+
+            assert_eq!(view.tabs.len(), 1);
+            assert_eq!(view.tabs[0].kind, EditorTabKind::Image);
+            assert!(view.tabs[0].image_too_large);
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn image_tab_rejects_text_edits_and_preview_toggle(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            let apply = view.open_file_from_image_with_activation(PathBuf::from("photo.png"), true);
+            assert!(apply.activated);
+            assert!(view.active_tab_is_image());
+
+            view.insert_text("changed", cx);
+            view.insert_newline(cx);
+            view.delete_backward(cx);
+            view.delete_forward(cx);
+            assert!(!view.undo(cx));
+            assert!(view.cut_selection(cx).is_none());
+            assert!(!view.tabs[0].buffer.is_dirty());
+            assert_eq!(view.tabs[0].buffer.revision(), 0);
+
+            // The markdown preview toggle is a no-op for image tabs.
+            view.toggle_preview(cx);
+            assert!(!view.preview_active());
+        });
+    }
+
+    #[gpui::test]
+    fn dropped_image_paths_open_in_editor(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            let opened = view.open_dropped_paths(
+                &[
+                    PathBuf::from("/tmp/drop-photo.png"),
+                    PathBuf::from("/tmp/notes.md"), // non-image → ignored
+                    PathBuf::from("/tmp/drop-logo.svg"),
+                ],
+                cx,
+            );
+
+            assert!(opened);
+            assert_eq!(view.tabs.len(), 2);
+            assert_eq!(view.tabs[0].path, PathBuf::from("/tmp/drop-photo.png"));
+            assert_eq!(view.tabs[1].path, PathBuf::from("/tmp/drop-logo.svg"));
+            assert_eq!(view.tabs[0].kind, EditorTabKind::Image);
+            assert_eq!(view.tabs[1].kind, EditorTabKind::Image);
+            // The last dropped image becomes the active tab.
+            assert_eq!(view.active_path(), Some(Path::new("/tmp/drop-logo.svg")));
+        });
+    }
+
+    #[gpui::test]
+    fn dropped_text_paths_do_not_open_tabs(cx: &mut gpui::TestAppContext) {
+        let view = cx.new(|cx| EditorView::new_with_font_size(EDITOR_FONT_SIZE, cx));
+        view.update(cx, |view, cx| {
+            let opened = view.open_dropped_paths(
+                &[
+                    PathBuf::from("/tmp/notes.md"),
+                    PathBuf::from("/tmp/main.rs"),
+                ],
+                cx,
+            );
+
+            assert!(!opened);
+            assert_eq!(view.tabs.len(), 0);
+        });
+    }
+
+    #[test]
+    fn format_file_size_renders_human_readable() {
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(1023), "1023 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1536), "1.5 KB");
+        assert_eq!(format_file_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_file_size(5 * 1024 * 1024), "5.0 MB");
     }
 
     #[test]

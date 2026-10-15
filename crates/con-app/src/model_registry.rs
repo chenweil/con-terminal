@@ -5,13 +5,17 @@
 //! the network is unavailable.
 
 use anyhow::{Context as _, anyhow};
-use con_agent::ProviderKind;
+use con_agent::chatgpt_subscription::{self, Catalog};
+use con_agent::{ProviderConfig, ProviderKind};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const API_URL: &str = "https://models.dev/api.json";
-const CHATGPT_CODEX_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_CODEX_API_BASE_URL: &str = chatgpt_subscription::API_BASE;
+// The Codex model catalog filters entries by client compatibility. Keep this
+// explicit and validate schema/visibility against representative subscription data.
+const CHATGPT_CODEX_MODELS_CLIENT_VERSION: &str = chatgpt_subscription::CATALOG_CLIENT_VERSION;
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 hour
 
 // ── Fallback model lists (used when API is unreachable) ──────────────
@@ -26,25 +30,18 @@ fn fallback_models(provider: &ProviderKind) -> &'static [&'static str] {
             "claude-haiku-4-5",
         ],
         ProviderKind::OpenAI => &[
-            "o4-mini",
-            "o3",
-            "o3-pro",
-            "o3-mini",
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4.1",
-            "gpt-4.1-mini",
-            "gpt-4.1-nano",
-        ],
-        ProviderKind::ChatGPT => &[
             "gpt-5.5",
+            "gpt-5.5-pro",
             "gpt-5.4",
+            "gpt-5.4-pro",
             "gpt-5.4-mini",
             "gpt-5.4-nano",
-            "gpt-5.3-codex",
-            "gpt-5.3-codex-spark",
-            "chat-latest",
+            "o3",
+            "o3-pro",
+            "gpt-4.1",
+            "gpt-4.1-mini",
         ],
+        ProviderKind::ChatGPT => &[],
         ProviderKind::GitHubCopilot => &[
             "gpt-5.4",
             "gpt-5.3-codex",
@@ -110,6 +107,18 @@ fn fallback_models(provider: &ProviderKind) -> &'static [&'static str] {
 
 fn pinned_models(provider: &ProviderKind) -> &'static [&'static str] {
     match provider {
+        ProviderKind::OpenAI => &[
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "o3",
+            "o3-pro",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+        ],
         ProviderKind::Moonshot => &["kimi-for-coding"],
         ProviderKind::DeepSeek => &["deepseek-v4-flash", "deepseek-v4-pro"],
         _ => &[],
@@ -199,11 +208,15 @@ struct CacheEntry {
     fetched_at: Instant,
 }
 
+/// Per-provider custom model IDs keyed by `(provider, model id)`.
+type CustomModelMap = HashMap<(ProviderKind, String), Vec<String>>;
+
 /// Shared, thread-safe model registry with background fetching.
 #[derive(Clone)]
 pub struct ModelRegistry {
     inner: Arc<Mutex<Option<CacheEntry>>>,
-    custom: Arc<Mutex<HashMap<(ProviderKind, String), Vec<String>>>>,
+    custom: Arc<Mutex<CustomModelMap>>,
+    codex_local: Arc<Mutex<Vec<String>>>,
 }
 
 impl ModelRegistry {
@@ -211,7 +224,26 @@ impl ModelRegistry {
         Self {
             inner: Arc::new(Mutex::new(None)),
             custom: Arc::new(Mutex::new(HashMap::new())),
+            codex_local: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn models_for_config(
+        &self,
+        provider: &ProviderKind,
+        config: &ProviderConfig,
+    ) -> Vec<String> {
+        if *provider == ProviderKind::ChatGPT {
+            return Catalog::load(config)
+                .map(|c| c.model_ids())
+                .unwrap_or_else(|| {
+                    chatgpt_subscription::fallback_models()
+                        .iter()
+                        .map(|m| m.id.clone())
+                        .collect()
+                });
+        }
+        self.models_for_base_url(provider, config.base_url.as_deref())
     }
 
     /// Returns the cached model list for a provider.
@@ -228,35 +260,38 @@ impl ModelRegistry {
         provider: &ProviderKind,
         base_url: Option<&str>,
     ) -> Vec<String> {
+        if *provider == ProviderKind::CodexLocal {
+            return self.codex_local.lock().unwrap().clone();
+        }
+        // Subscription availability and capabilities come from its dedicated
+        // catalog. Keep this compatibility path on the same fallback source so
+        // older callers cannot drift from `models_for_config`.
+        if *provider == ProviderKind::ChatGPT {
+            return chatgpt_subscription::fallback_models()
+                .iter()
+                .map(|model| model.id.clone())
+                .collect();
+        }
         let canonical = canonical_models_provider(provider);
         {
             let custom = self.custom.lock().unwrap();
-            if let Some(endpoint) = base_url.and_then(Self::custom_models_scope) {
-                if let Some(models) = custom.get(&(canonical.clone(), endpoint)) {
-                    if !models.is_empty() {
-                        let mut models = models.clone();
-                        append_missing_models(&mut models, pinned_models(provider));
-                        return models;
-                    }
-                }
-            }
-            if let Some(models) = custom.get(&(canonical.clone(), String::new())) {
-                if !models.is_empty() {
-                    let mut models = models.clone();
-                    append_missing_models(&mut models, pinned_models(provider));
-                    return models;
-                }
+            if let Some(endpoint) = base_url.and_then(Self::custom_models_scope)
+                && let Some(models) = custom.get(&(canonical.clone(), endpoint))
+                && !models.is_empty()
+            {
+                let mut models = models.clone();
+                append_missing_models(&mut models, pinned_models(provider));
+                return models;
             }
         }
         let guard = self.inner.lock().unwrap();
-        if let Some(entry) = guard.as_ref() {
-            if let Some(models) = entry.models.get(&canonical) {
-                if !models.is_empty() {
-                    let mut models = models.clone();
-                    append_missing_models(&mut models, pinned_models(provider));
-                    return models;
-                }
-            }
+        if let Some(entry) = guard.as_ref()
+            && let Some(models) = entry.models.get(&canonical)
+            && !models.is_empty()
+        {
+            let mut models = models.clone();
+            append_missing_models(&mut models, pinned_models(provider));
+            return models;
         }
         // Fallback
         let mut models: Vec<String> = fallback_models(provider)
@@ -267,13 +302,9 @@ impl ModelRegistry {
         models
     }
 
-    /// Stores models discovered from a provider-managed endpoint.
-    pub fn set_provider_models(&self, provider: ProviderKind, models: Vec<String>) {
-        let canonical = canonical_models_provider(&provider);
-        self.custom
-            .lock()
-            .unwrap()
-            .insert((canonical, String::new()), models);
+    /// Local Codex availability is independent of the public API catalog.
+    pub fn set_codex_local_models(&self, models: Vec<String>) {
+        *self.codex_local.lock().unwrap() = models;
     }
 
     /// Stores models discovered from a specific user-configured endpoint.
@@ -415,6 +446,24 @@ impl ModelRegistry {
 
         parsed.set_path(&path);
         parsed.set_fragment(None);
+        let query_pairs = parsed
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        if !query_pairs
+            .iter()
+            .any(|(key, value)| key == "client_version" && !value.trim().is_empty())
+        {
+            parsed.set_query(None);
+            parsed
+                .query_pairs_mut()
+                .extend_pairs(
+                    query_pairs
+                        .iter()
+                        .filter(|(key, _)| key != "client_version"),
+                )
+                .append_pair("client_version", CHATGPT_CODEX_MODELS_CLIENT_VERSION);
+        }
         Ok(parsed.to_string())
     }
 
@@ -472,19 +521,23 @@ impl ModelRegistry {
     }
 
     pub async fn fetch_chatgpt_subscription_models(
-        access_token: &str,
-        base_url: Option<&str>,
+        config: &ProviderConfig,
     ) -> anyhow::Result<Vec<String>> {
-        let endpoint = Self::chatgpt_subscription_models_url(base_url)?;
+        let auth = chatgpt_subscription::authorize_for_discovery(config).await?;
+        let endpoint = Self::chatgpt_subscription_models_url(config.base_url.as_deref())?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
 
-        let resp = client
+        let mut request = client
             .get(&endpoint)
-            .bearer_auth(access_token)
-            .send()
-            .await?;
+            .bearer_auth(&auth.access_token)
+            .header("originator", "con")
+            .header("User-Agent", concat!("con/", env!("CARGO_PKG_VERSION")));
+        if let Some(account_id) = &auth.account_id {
+            request = request.header("ChatGPT-Account-Id", account_id);
+        }
+        let resp = request.send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -508,41 +561,33 @@ impl ModelRegistry {
             .json()
             .await
             .context("Response was not a ChatGPT Subscription model list")?;
-        let mut models = extract_model_ids(&raw);
-        models.sort();
-        models.dedup();
-        Ok(models)
+        let catalog = Catalog::parse(&raw, auth.scope, config.base_url.as_deref())?;
+        catalog.save()?;
+        Ok(catalog.model_ids())
     }
-}
-
-fn extract_model_ids(raw: &serde_json::Value) -> Vec<String> {
-    let entries = raw
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .or_else(|| raw.get("models").and_then(serde_json::Value::as_array))
-        .into_iter()
-        .flatten();
-
-    entries
-        .filter_map(|entry| match entry {
-            serde_json::Value::String(value) => Some(value.as_str()),
-            serde_json::Value::Object(object) => object
-                .get("id")
-                .or_else(|| object.get("slug"))
-                .or_else(|| object.get("name"))
-                .and_then(serde_json::Value::as_str),
-            _ => None,
-        })
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use con_agent::ProviderKind;
+
+    #[test]
+    fn codex_models_stay_separate_from_api_models_and_allow_a_default() {
+        let registry = ModelRegistry::new();
+        assert!(registry.models_for(&ProviderKind::CodexLocal).is_empty());
+        let api_models = registry.models_for(&ProviderKind::OpenAI);
+        registry.set_codex_local_models(vec!["local-only-model".into()]);
+        assert_eq!(
+            registry.models_for(&ProviderKind::CodexLocal),
+            vec!["local-only-model"]
+        );
+        assert_eq!(registry.models_for(&ProviderKind::OpenAI), api_models);
+        assert_eq!(
+            registry.clone().models_for(&ProviderKind::CodexLocal),
+            vec!["local-only-model"]
+        );
+    }
 
     #[test]
     fn anthropic_variants_share_canonical_models_family() {
@@ -599,13 +644,10 @@ mod tests {
         assert_eq!(
             registry.models_for(&ProviderKind::ChatGPT),
             vec![
-                "gpt-5.5".to_string(),
-                "gpt-5.4".to_string(),
-                "gpt-5.4-mini".to_string(),
-                "gpt-5.4-nano".to_string(),
-                "gpt-5.3-codex".to_string(),
-                "gpt-5.3-codex-spark".to_string(),
-                "chat-latest".to_string(),
+                "gpt-6-astra".to_string(),
+                "gpt-5.6-sol".to_string(),
+                "gpt-5.6-terra".to_string(),
+                "gpt-5.6-luna".to_string(),
             ]
         );
     }
@@ -614,6 +656,7 @@ mod tests {
     fn pinned_models_are_merged_into_live_cache() {
         let registry = ModelRegistry::new();
         let mut models = HashMap::new();
+        models.insert(ProviderKind::OpenAI, vec!["gpt-5.5".to_string()]);
         models.insert(ProviderKind::Moonshot, vec!["kimi-k2.5".to_string()]);
         models.insert(ProviderKind::DeepSeek, vec!["deepseek-chat".to_string()]);
         *registry.inner.lock().unwrap() = Some(CacheEntry {
@@ -621,6 +664,21 @@ mod tests {
             fetched_at: Instant::now(),
         });
 
+        assert_eq!(
+            registry.models_for(&ProviderKind::OpenAI),
+            vec![
+                "gpt-5.5".to_string(),
+                "gpt-5.5-pro".to_string(),
+                "gpt-5.4".to_string(),
+                "gpt-5.4-pro".to_string(),
+                "gpt-5.4-mini".to_string(),
+                "gpt-5.4-nano".to_string(),
+                "o3".to_string(),
+                "o3-pro".to_string(),
+                "gpt-4.1".to_string(),
+                "gpt-4.1-mini".to_string(),
+            ]
+        );
         assert_eq!(
             registry.models_for(&ProviderKind::Moonshot),
             vec!["kimi-k2.5".to_string(), "kimi-for-coding".to_string()]
@@ -675,58 +733,60 @@ mod tests {
     fn chatgpt_subscription_models_url_uses_codex_models_endpoint() {
         assert_eq!(
             ModelRegistry::chatgpt_subscription_models_url(None).unwrap(),
-            "https://chatgpt.com/backend-api/codex/models"
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.155.0"
         );
         assert_eq!(
             ModelRegistry::chatgpt_subscription_models_url(Some(
                 "https://chatgpt.com/backend-api/codex"
             ))
             .unwrap(),
-            "https://chatgpt.com/backend-api/codex/models"
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.155.0"
         );
         assert_eq!(
             ModelRegistry::chatgpt_subscription_models_url(Some(
                 "https://chatgpt.com/backend-api/codex/models"
             ))
             .unwrap(),
-            "https://chatgpt.com/backend-api/codex/models"
-        );
-    }
-
-    #[test]
-    fn extract_model_ids_accepts_data_and_models_shapes() {
-        assert_eq!(
-            extract_model_ids(&serde_json::json!({
-                "data": [
-                    {"id": "gpt-5.5"},
-                    {"slug": "gpt-5.4"},
-                    {"name": "chat-latest"},
-                    {"id": " "}
-                ]
-            })),
-            vec![
-                "gpt-5.5".to_string(),
-                "gpt-5.4".to_string(),
-                "chat-latest".to_string(),
-            ]
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.155.0"
         );
         assert_eq!(
-            extract_model_ids(&serde_json::json!({
-                "models": ["gpt-5.5", {"id": "gpt-5.4-mini"}]
-            })),
-            vec!["gpt-5.5".to_string(), "gpt-5.4-mini".to_string()]
+            ModelRegistry::chatgpt_subscription_models_url(Some(
+                "https://chatgpt.com/backend-api/codex?region=us"
+            ))
+            .unwrap(),
+            "https://chatgpt.com/backend-api/codex/models?region=us&client_version=0.155.0"
+        );
+        assert_eq!(
+            ModelRegistry::chatgpt_subscription_models_url(Some(
+                "https://chatgpt.com/backend-api/codex/models?client_version=0.200.0"
+            ))
+            .unwrap(),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.200.0"
+        );
+        assert_eq!(
+            ModelRegistry::chatgpt_subscription_models_url(Some(
+                "https://chatgpt.com/backend-api/codex?region=us&client_version="
+            ))
+            .unwrap(),
+            "https://chatgpt.com/backend-api/codex/models?region=us&client_version=0.155.0"
         );
     }
 
     #[test]
     fn custom_models_override_fallback_for_openai_compatible() {
         let registry = ModelRegistry::new();
-        registry.set_provider_models(
-            ProviderKind::OpenAICompatible,
-            vec!["custom-a".to_string(), "custom-b".to_string()],
-        );
+        registry
+            .set_provider_models_for_base_url(
+                ProviderKind::OpenAICompatible,
+                "https://api.example.com/v1",
+                vec!["custom-a".to_string(), "custom-b".to_string()],
+            )
+            .unwrap();
         assert_eq!(
-            registry.models_for(&ProviderKind::OpenAICompatible),
+            registry.models_for_base_url(
+                &ProviderKind::OpenAICompatible,
+                Some("https://api.example.com/v1"),
+            ),
             vec!["custom-a".to_string(), "custom-b".to_string()]
         );
     }
