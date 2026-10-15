@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>con Flatpak Repository</title>
+  <meta name="description" content="Official Flatpak repository for con terminal emulator.">
+  <link rel="icon" href="https://con.nowledge.co/assets/icon_con_192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+       
+      --bg-ink: #0b0b0d;
+      --bg-gradient: linear-gradient(180deg, #17110f 0%, #0d0b0b 42%, #09090b 100%);
+      --bg-glow: radial-gradient(ellipse 600px 300px at 80% -50px, rgba(255, 199, 152, 0.07), transparent 70%);
+
+       
+      --cream: #f7f1ea;
+      --cream-88: rgba(247, 241, 234, 0.88);
+      --cream-82: rgba(247, 241, 234, 0.82);
+      --cream-70: rgba(247, 241, 234, 0.70);
+      --cream-64: rgba(247, 241, 234, 0.64);
+      --cream-55: rgba(247, 241, 234, 0.55);
+      --cream-38: rgba(247, 241, 234, 0.38);
+
+       
+      --white: #ffffff;
+      --white-04: rgba(255, 255, 255, 0.04);
+      --white-07: rgba(255, 255, 255, 0.07);
+      --white-08: rgba(255, 255, 255, 0.08);
+      --white-13: rgba(255, 255, 255, 0.13);
+      --white-14: rgba(255, 255, 255, 0.14);
+
+       
+      --peach: #ffc798;
+      --peach-light: #ffe1c6;
+      --peach-11: rgba(255, 199, 152, 0.11);
+      --peach-18: rgba(255, 199, 152, 0.18);
+      --peach-ring: rgba(255, 199, 152, 0.70);
+      --link-underline: rgba(255, 199, 152, 0.25);
+
+       
+      --green-live: #86d197;
+      --green-live-glow: rgba(134, 209, 151, 0.45);
+
+       
+      --font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, sans-serif;
+      --font-display: 'Instrument Serif', 'Times New Roman', serif;
+      --font-mono: 'JetBrains Mono', monospace;
+
+       
+      --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+      --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+      --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+
+      --maxw: 860px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg-ink) var(--bg-gradient) no-repeat;
+      color: var(--cream-88);
+      font-family: var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      font-feature-settings: 'ss01', 'cv11';
+      line-height: 1.55;
+      padding: 0 24px 80px;
+      min-height: 100vh;
+      position: relative;
+    }
+
+    body::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 360px;
+      background: var(--bg-glow);
+      pointer-events: none;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--peach-ring);
+      outline-offset: 3px;
+    }
+
+    a {
+      color: var(--peach);
+      text-decoration: none;
+      border-bottom: 1px solid var(--link-underline);
+      transition: color 0.15s var(--ease-out-quart), border-bottom-color 0.15s var(--ease-out-quart);
+    }
+    a:hover {
+      color: var(--peach-light);
+      border-bottom-color: var(--peach);
+    }
+
+    .wrap { max-width: var(--maxw); margin: 0 auto; }
+
+    header.nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 72px;
+      border-bottom: 1px solid var(--white-08);
+      margin-bottom: 48px;
+      position: relative;
+      z-index: 1;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+      font-size: 15px;
+      color: var(--cream);
+      border-bottom: none;
+    }
+    .brand:hover { border-bottom: none; color: var(--white); }
+    .brand img { width: 24px; height: 24px; border-radius: 6px; }
+    .brand-tag {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--cream-55);
+      background: var(--white-07);
+      padding: 2px 8px;
+      border-radius: 9999px;
+      border: 1px solid var(--white-08);
+      margin-left: 2px;
+    }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .nav-links a { color: var(--cream-70); border-bottom: none; }
+    .nav-links a:hover { color: var(--cream); border-bottom: none; }
+
+    .hero { margin-bottom: 48px; position: relative; z-index: 1; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--cream-55);
+      margin-bottom: 16px;
+    }
+    .eyebrow .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--green-live);
+      box-shadow: 0 0 10px var(--green-live-glow);
+    }
+    .hero h1 {
+      font-size: clamp(32px, 5vw, 44px);
+      font-weight: 500;
+      line-height: 1.05;
+      margin-bottom: 16px;
+      letter-spacing: -0.02em;
+      color: var(--cream);
+    }
+    .hero h1 em {
+      font-family: var(--font-display);
+      font-style: italic;
+      font-weight: 400;
+      color: var(--cream);
+    }
+    .hero p {
+      font-size: 16px;
+      line-height: 1.6;
+      color: var(--cream-70);
+      max-width: 620px;
+    }
+
+    .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 500;
+      color: var(--cream-64);
+      background: var(--white-04);
+      border: 1px solid var(--white-08);
+      padding: 5px 12px;
+      border-radius: 9999px;
+    }
+    .badge code { font-family: var(--font-mono); color: var(--cream); }
+    .badge.signed {
+      color: var(--green-live);
+      border-color: rgba(134, 209, 151, 0.25);
+      background: rgba(134, 209, 151, 0.06);
+    }
+    .badge .check { width: 13px; height: 13px; }
+
+    section { margin-bottom: 40px; position: relative; z-index: 1; }
+    .section-eyebrow {
+      display: block;
+      font-family: var(--font-mono);
+      font-size: 10.5px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      color: var(--cream-38);
+      margin-bottom: 6px;
+    }
+    h2 {
+      font-size: 20px;
+      font-weight: 500;
+      color: var(--cream);
+      margin-bottom: 16px;
+      letter-spacing: -0.01em;
+    }
+
+     
+    .card {
+      background: rgba(15, 12, 10, 0.40);
+      border: 1px solid var(--white-08);
+      border-radius: 20px;
+      padding: 28px;
+      margin-bottom: 24px;
+      backdrop-filter: blur(40px) saturate(1.4);
+      -webkit-backdrop-filter: blur(40px) saturate(1.4);
+      box-shadow: 0 30px 80px rgba(0, 0, 0, 0.28), inset 0 1px 0 var(--white-08);
+    }
+    
+    .step { display: grid; gap: 10px; }
+    .step + .step { margin-top: 24px; }
+    .step .label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--cream);
+    }
+    .step .label .n {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: var(--peach);
+      color: #0b0b0d;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 600;
+      display: grid;
+      place-items: center;
+      flex: none;
+    }
+    .note { font-size: 13.5px; color: var(--cream-64); line-height: 1.5; }
+    .note code {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      background: var(--white-08);
+      padding: 2px 6px;
+      border-radius: 5px;
+      color: var(--peach);
+    }
+
+    .code-box {
+      position: relative;
+      background: rgba(0, 0, 0, 0.38);
+      border: 1px solid var(--white-08);
+      border-radius: 8px;
+      padding: 14px 60px 14px 16px;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.55;
+      color: #e8e2dc;
+    }
+    .code-box code { white-space: pre; font-family: inherit; }
+    .copy-btn {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      font-family: var(--font-sans);
+      font-size: 11.5px;
+      font-weight: 500;
+      cursor: pointer;
+      color: var(--cream-64);
+      background: var(--white-07);
+      border: 1px solid var(--white-08);
+      border-radius: 7px;
+      padding: 4px 9px;
+      transition: all 0.15s var(--ease-out-quart);
+      line-height: 1.2;
+    }
+    .copy-btn:hover {
+      color: var(--cream);
+      background: var(--white-13);
+      transform: translateY(-1px);
+    }
+    .copy-btn.ok {
+      color: var(--green-live);
+      border-color: rgba(134, 209, 151, 0.4);
+      background: rgba(134, 209, 151, 0.08);
+    }
+
+     
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-family: var(--font-sans);
+      font-weight: 500;
+      font-size: 13.5px;
+      cursor: pointer;
+      padding: 9px 18px;
+      border-radius: 9999px;
+      border: 1px solid transparent;
+      transition: all 0.15s var(--ease-out-quart);
+      text-decoration: none;
+      line-height: 1.2;
+    }
+    .btn:hover { text-decoration: none; border-bottom: 1px solid transparent; }
+    .btn.primary {
+      background: var(--cream);
+      color: #0b0b0d;
+      border-color: var(--cream);
+    }
+    .btn.primary:hover {
+      background: var(--white);
+      border-color: var(--white);
+      color: #0b0b0d;
+      transform: translateY(-1px);
+    }
+    .btn.ghost {
+      background: var(--white-07);
+      border-color: var(--white-08);
+      color: var(--cream-88);
+    }
+    .btn.ghost:hover {
+      background: var(--white-14);
+      border-color: rgba(255, 255, 255, 0.16);
+      color: var(--white);
+      transform: translateY(-1px);
+    }
+    .btn.subtle-accent {
+      background: var(--peach-11);
+      border-color: rgba(255, 199, 152, 0.2);
+      color: var(--peach);
+    }
+    .btn.subtle-accent:hover {
+      background: var(--peach-18);
+      border-color: rgba(255, 199, 152, 0.35);
+      color: var(--peach-light);
+      transform: translateY(-1px);
+    }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .setup-actions { margin-top: 20px; }
+
+     
+    .app-head { display: flex; align-items: center; gap: 16px; margin-bottom: 14px; }
+    .app-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: 10px;
+      flex: none;
+      overflow: hidden;
+      display: grid;
+      place-items: center;
+      font-size: 24px;
+      background: var(--white-04) center / contain no-repeat;
+      border: 1px solid var(--white-08);
+    }
+    .app-name { font-size: 18px; font-weight: 500; color: var(--cream); letter-spacing: -0.01em; }
+    .app-id { font-family: var(--font-mono); font-size: 12px; color: var(--cream-55); margin-top: 2px; }
+    .app-summary { color: var(--cream-70); font-size: 14px; line-height: 1.55; margin-bottom: 20px; }
+
+    .releases {
+      border-left: 2px solid var(--white-08);
+      padding-left: 18px;
+      margin-left: 6px;
+      display: grid;
+      gap: 24px;
+    }
+    .release { position: relative; }
+    .release::before {
+      content: '';
+      position: absolute;
+      left: -24px;
+      top: 6px;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--peach);
+      box-shadow: 0 0 0 3px #0d0b0b;
+    }
+    .release.old::before { background: var(--cream-38); }
+    .release-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+    .pill {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--cream-64);
+      background: var(--white-07);
+      border: 1px solid var(--white-08);
+      padding: 2px 9px;
+      border-radius: 9999px;
+    }
+    .pill.primary {
+      color: #0b0b0d;
+      background: var(--peach);
+      border-color: var(--peach);
+    }
+    .release-date { margin-left: auto; font-size: 12px; color: var(--cream-55); font-family: var(--font-mono); }
+    .release-meta { font-family: var(--font-mono); font-size: 12px; color: var(--cream-55); margin: 8px 0; }
+    .release .actions { margin: 12px 0 10px; }
+
+    .empty { text-align: center; padding: 48px 24px; color: var(--cream-55); }
+    
+    footer {
+      border-top: 1px solid var(--white-08);
+      margin-top: 64px;
+      padding-top: 28px;
+      font-size: 13px;
+      color: var(--cream-55);
+      position: relative;
+      z-index: 1;
+    }
+    footer .wrap {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    footer a { color: var(--cream-64); border-bottom: none; }
+    footer a:hover { color: var(--cream); border-bottom: none; }
+    footer .links { display: flex; gap: 20px; align-items: center; }
+    footer .tagline { color: var(--cream-38); font-style: normal; margin-left: 8px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="nav">
+      <a class="brand" href="https://con.nowledge.co/">
+        <img src="https://con.nowledge.co/assets/icon_con_192.png" alt="con logo">
+        <span>con</span>
+        <span class="brand-tag">flatpak</span>
+      </a>
+      <nav class="nav-links">
+        <a href="https://con.nowledge.co/">Home</a>
+        <a href="https://con.nowledge.co/docs/">Docs</a>
+        <a href="https://con.nowledge.co/docs/install/">Install</a>
+        <a href="https://github.com/nowledge-co/con-terminal" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <span class="eyebrow"><span class="dot"></span> Official Flatpak repository</span>
+        <h1>con: GPU fast. <em>Agent built in.</em></h1>
+        <p>Official Flatpak repository for con terminal emulator. A fast, humane terminal for the agent era with native AI harness and developer workflows.</p>
+        <div class="badges">
+          
+          <span class="badge">Remote: <code>con-terminal</code></span>
+          <span class="badge">1 app</span>
+        </div>
+      </section>
+
+      <section id="setup">
+        <span class="section-eyebrow">Setup</span>
+        <h2>Add this repository</h2>
+        <div class="card">
+          
+          <div class="step">
+            <span class="label"><span class="n">1</span> Add the remote (unsigned)</span>
+            <div class="code-box"><button class="copy-btn">Copy</button><code>flatpak remote-add --if-not-exists --user --no-gpg-verify \
+  con-terminal \
+  oci+https://con-releases.nowledge.co/flatpak</code></div>
+          </div>
+          <div class="actions setup-actions">
+            <a class="btn primary" href="con-terminal.flatpakrepo" download>Download .flatpakrepo</a>
+            <a class="btn ghost" href="index/static" target="_blank" rel="noopener">View OCI index</a>
+          </div>
+          
+        </div>
+      </section>
+
+      <section id="apps">
+        <span class="section-eyebrow">Catalog</span>
+        <h2>Applications</h2>
+        
+        <div class="apps-list">
+          
+          <article class="card">
+            <div class="app-head">
+              <span class="app-icon" role="img" aria-label="con icon">
+                
+                  <i class="ic" hidden>data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAQ6UlEQVR4nO1bWYwdV5n&#43;zl369r5c9&#43;01ttuO3XHbScfxOg7OxBmHEMcBhyRkYMQoY6IBhUEaaeBlHmYiNJqHeWJmBA8gEUuREIGwCAXLICDg4JA4nZXEbTtO4vZ23e1ud9u936Xq8J&#43;1Tt2u2&#43;5rJB5wTqu6qk7VOXX&#43;79//qhvDDd5iuMHbRwDgBm8fAYAbvCXwZ7Tj&#43;7fEaddFWw847wBYGuD1YKyGjqvoOAGOOBj9UQfdI3byTHTIU9nUgb6guxlnMbrA4dFJkfZ5um&#43;Ohk/THePUN0zHQ3Rvtu/pAQ/X2VglN594Yhs9m7fTv8/S6R7attLWcu159GVBGnP7ePR99hLXh6aDCfgC4JgEaIJOB6j7EF15loR6pO/Aq1hqWzIAx/dvbaDd12nEl&#43;ihtZqikqnCBOklW3abhUsizLWlrkaCx4KJQ8/hZvAsbd&#43;mnqfWH3htCktoSwKAiF9Ju4O0bSh99JKmNwCUXjVIIGDpAhwjBIW7s7sSEdxxjP7tJRDOYGkrLN8051&#43;mOzcEQLvP4otOzR1xNjznLv9D16PnKCE5dHnhUHtCILAd6w8MLCoJi3oBofMQYg&#43;&#43;wRLKo57lrMjsDfPlOGPk1DEzx4FqI5oXPOI8mE8dRtkRuQlp/frxL2zFYm1RAKTBA&#43;l8aAlcPdQhbOECopcUzGEfoM64cxq1Dr3FG5pRs2YDUp0rNPe5YyxdcOz2JZqzHYu0xd0gB1l7Xut2sGsMiALAFWBLY8icc9sV3Bn0x2vrkfn0P6F&#43;498IpkjCc9mzGH3uuyhcOK34wUqXIP&#43;JtQuP9X8o064RCPE9wXE50ln5Lr0QFtBipUGeBhTDhYI7PbHaWnR/&#43;SnU3b4dxcI8CrkZFHNzSLS2of2JryLZvcohmOk5Q2vag0VaWQAGKcjhys9jofHRBg7GoLmtVD8D7gZ3smtqvDnOPPwEEpl2SfjIpVEc/M2reP2dUygW82DJBNKP7gdLVCFaHeXKt5Ihj6NMK6sCTEV4Le6C2MJ7nBNHpHnpGGaB4tpAGqmIXrbqTa1ci7r&#43;rZLz2eEx/Of//hjT03Ny8N8/uAP77t2CRHoZ6rbuxPQfXlDjwosSPUQDF7Sci3pSWQmghfaEZNRZKtdBTdj7BILLrSCz0GKAsHaHiTduQ0lHLJlCy65PgvseuOfhxYGTckCCuJ6IJ/CzX72BsfGr1OejdstdNCwmV8tK51Nw96BMW8wIdihlNQtngW5GBCYR8YodofgekE5RvpyW6fkFYIn6RtSt34TaW/qRWnEzki2t8gbuF5FM1eDzD&#43;/GPzx0D2Zm53AuO4ZTQxcxPDaJ1pZGxJuXIdG9EoXzp8M8s4CKPKViAHja5VfI/jO3v8TmLQBB3W89p7WICoGaNevRfNcDRPxGYntcR4xCwnzA962xFFFjPMbQ0FCP9b116OtdoXhBAJGOIEXzSACcJTprTqNyAFDvrNhqcRDbG8ICJ&#43;caxJqeXrTc8yni5mryYwkUx0cx9947mHztRRRGLyLVtRKt&#43;x6Xfl2IsQRTECPVS1IWdp&#43;huINZYBnNnSTg0rseAJ&#43;exMzrR6AgNjInYajHdQBQY5&#43;OgNCQZltjx6x7E4uq37QT7Z97UhLEJRdJxDu60Nh5E5p27UXu7IcSIMQo3&#43;XqHgmCId4EW4j2DCQaWiW5lAwpHTW1yDyyH1WdyzHx8&#43;8jJJ1M01IJADSwKrJfc5&#43;XLM1IhwxaHt4Pv5gjyczjyuQURi9PorOtBQ31dUhU1aBmVa8a4xWkqEsANNHcdSHG6oQCJPUkE5FybiyfMoJNd94rVWf84LNaU6UliqRlUQDkNSf9ZI6Z4xGxnRG3aiHSZKm9/DyOvnkS33zml8gXimhurMX//9eTaKiOKcvOFdd934cbEbqwhi16AFDY4AqjKvaexazxY7uRu3gWs2/&#43;IaClLJFlG4svXIm2ByW6z5zlxBuaiLNFIszDwRfeRKHoo6qqCv/2xUdQX1endFsCoA3dgjSZI4r4sYlpDJ66gOylCUxNz8k1NNRVo6utCb2rOpFZ1hjYV2otDzyG3PuD8KeuiBVWHggJprOo6AeGYa5fDxywPzcjR0ufHI&#43;R/Yvj8c/sxm3rVtE4D77mPHcSKmvkSkJjcTY6MYUfHRrA28fPwvOU5KihapyYT4Cxenkb9uy6HRvXrZCjY6kUGu5&#43;AFee/x6iqbgGAEDIdTsL4zZYCfSUWWRy2TMWoPVrulFbU4P7d20WS9WGLky85b9CAQGeDIPvZ/GdZ3&#43;L6Zl5&#43;J6WGrMOHrYZ752&#43;KLdtt9&#43;M/Y/&#43;LVKJGGr6t2DyNz&#43;jSuJM5QCwqBPDeU0z14EMc4KjwvAFFK&#43;MIUaqsPtOsgfxaslYoRILiTfzhZVAzPnqO6dx4LnDyOULcqzvcwcnTTgP2wLRXnnzFObmc/jXx&#43;&#43;jHCGBVN9GzGvXWBEAYNbglzTt9LhzrDMdaaCIyKnXjqD57x4kvWwhq18trTK0O3SJ94iokdGruDo1K42hIGz86gzeOHYG7548J/tMv9imZ2bgFT0ZDDGde6hluC6P0fghDPzxQ2y&#43;dQWqyOPMvX6kcgng0ea4BAh7qMRWS8j00cNo2LEbSQpvoaM6RbwKbibJiP3i8Ds4&#43;vYH0qBJTwBYQg2YkjABAu1FCHw&#43;e1HOly8U0Jpukf1qfgTj9ZLeIpuxecMKJCkuEHlCxQAYtyZp44GRY6HA13CThYyhPzOJyd//Aq17P6dvCeLgtwbP4JmfHMHUzJwizvfDEYW81bcnVte1x5Dza1ACOxAM5gictWQSeR4mpLBSAAJ35OYAWABTqFqtDZnczSlXJVyeDiRkRve9n76EIhk0YdRKiWCmziAJ1JZez1lbU432tgzVATw0NTZIEEyNIQiTmR2z44412pWRJ&#43;q4CeXaIulwucZC&#43;1DyZaJY2lW1d4f0/diprCS&#43;UCxKd&#43;Zp7ufzeYxfuYJcLu/oPIKxJvWmraG&#43;Hi3NTTYOMe7QXU&#43;SrP8/PrQTt67tVl0Ubqf6&#43;stSs4gKsGtAw8OnwUA5MtHYbO38fK6Ap3/4O6m7kkDft6J&#43;PpuVIMTjcazuWQnjFcy0k1NTKr&#43;oq7Xq5GtVYNpSJynWuKkjjdtuWY67t61DJt1g1SgmMs7&#43;rZUDgFIX4Lh7hEG3F5kzkCWSVodfeHmQuDwVcNgAQFbT0zbA83zpFSjjJSkp4PL4hIwgr05SHtHeYdSfJKAeN69sQ093Bss70&#43;hobUIbRYGJeCDMKkgK7Fa8quo6AOARlPMScErdt2MOfUqEuPb7RwZOaIOn/bkjvp3t7VTmmkYtFT&#43;Nj09QeltH5wWSmM62Nqzt6cD2jWuwaUMPutuaHbVzY4FAInV4Erjrsk5wcQnQ80bFwgtvDoNANQqKwQWRM7M5ZEfGNee5dXVGd1PEnVRa1Stcg9hIvv7OTWtx3139WHVTJlgOL1FBZoIj5lDvrIsZn1opAFHI2cmjYTU5umiFkQvyvtm53EK3pTfXmFmXS9udm3vxmT3b0U7i7bA4ooV1Ulh8lVNwFXnbGcub9MVyAe4mwPaBOsdeYAdMMKSvzZ9&#43;T4p9U0M1EmSZc/NFuTjfibBskUXvV3S34guP3k3ZXYfu90OTszLE89B8HC7dOn64DgnQMhcULp21qOvOrUrU3McUxoZlYlRFPnhb/2ocPnoc5QgXVnzfxzfjU7s3kTGLB1LGHJfLg6ILd9SBMfeFq7sGmSuGaIlq5WNE9WVGMFfY/ZdIVbReTh/9nVzkZ6mG30N6DIdwE7D0r1uO//7qY/g0AaAsOQ8Rbx&#43;t3/jwEvULxQLcdthnsVJaStpiKlAM0&#43;dwhIn6C8NYrB4zLAXxHUyzP4sG8QWLGUP3zr59FLXbd6E204H/&#43;Mo&#43;mamd&#43;PAixQMeOjPN2HRrD3q6lkU/3a0JslLUedgYah/J9doWjHdpWTIADPmQNGlvkGdJvJLowR9ZG&#43;bl5z/K&#43;Aj/3YQcer0R3MGHUVuclS80rh78AdKf/xcKdGLYScZt55Zb9JSOcVrEuMqe0pg/dNUZ6up/YAQEXHlUDAAndtrVqXYV1Xgu0Y/LfpV2aUUtmSoiG6PKk9fci09&#43;8WtInBnE5Eu/wvzQSUwdPoQGKlsr1VArdPKrwIVz58QpuvASv19mvc5EjjbIvaGlEgBIhZ3ZyZzE8NN4H0YLCXJrRVuUMBGXxIHE4LG9OyhZqQGj8LO&#43;fxvyl7KYoeJkYXSY3ui2y3uMXlt7yiL8rUtrSbwfNriOV0Fps15hGpUCQIsadzlyjGVwvlBFxBcAx51ZAIiIvtVduK23y74LEH1J0v&#43;WTzyCHx58BSfeP4aVXS3obm9B&#43;7IGpJvqKMGpll7AVF&#43;YLcNEWlst6YGfC0mN7dNSFsQe46gUABo47Jr/d/20rMb4TlmLK6CslRYlMEW8KlRCFCJoP5cv4sWjg5T0FHBheNxadJWsUbJSncS/P/kQWppqYfTW5AymlOZCEBDNLRgmAg3UwLc6wMU3hZUCQKOGhPUxtn&#43;4mKRkxdN1fON3g4ysjkrUG9bQW2hR8jYlMqaAOPH&#43;eVnRCRxJoDai5SgbnJyeRbq5zlZvYk4hW4DgUYLkFwuhGCKQFcc72CPrbsVKhlAxAAxZ&#43;j/B9ItFkanZ&#43;pwsYTGtqsoO3LK6k/w4s9GYYhKT&#43;fiHZ0eokFEEc3hkRT6m&#43;kbGrpB6pIEIeyDfOFF2Gaf3gAII8XGEmiewJK5NcQuvtE3QebYcmWUDob4Dr4ngYcCcN5PTM&#43;msL22Ab7M90SdSU&#43;UZfFf3ZEXo0uWrqghit6IEROyFWonjofOX5L2&#43;fqli935RGV39TiBGopFMpgi4GNwXK0EwZBigWEP9A5l1u72KAdDoH9IWDmtikzKV5VoKRPO1VIgHpunVF3fL3joOF9vM7LzsNyokxqn837d9Jz&#43;4oK958s2S&#43;TCCewoMeW42mktIgwDD1&#43;8Wrcgr0VDPV2s9tBiF1/pI6lmoz0&#43;xJXGZ3jAWba3OLVcLiUhVxcHtiw9n01KhwOOBEdXW2kjVqaFhqhDPaK4bSQveJCmp8BRAehP2JWYyQLn5lkH6FTtFY5KG6wSAsRHIb2/pBTsr4v7qkZCIu6IuipW2zw/UQxBak0rClMbNO0F7n15wgTzEq1TLt2PNNQ2I8ghFvSkwbMEVDkMAVzW&#43;zRQN1wdA39PSBDxFM4lvb7EjOYGPVU8sAEBwdmJyRldzw8QJzre21DtE&#43;CW2JKj9//qld4kwc80pnxnV8F3QfEeaBL2eU26TknaMDp7K9N2L6wZAgqC&#43;td0L&#43;e0txz6Sgk/UjEp3Z1AXunwuexnmsxZXjAWXVggDqYmV/Z4iJgQK9Z0&#43;dwlvDA6p65rDvt4MwcrueKGx3A9UTamHJH5v2/qPX/OL8SX9YoRAOEM47yD6v0Gns/dWj&#43;PLTefRmcgpUaPt&#43;AdZaeEVp3zJESOaa1dm5Pc9C70It1KgwOH4/vOvyIDJSIC7BSrhBQbTltIlCLM05zdov4OIP7MU2uJYYvvWW9n8V&#43;7o/iU96bt0er4lXmTbqyfTmXi&#43;esJLsovTRWzsW46m&#43;mrYaE2DI/L8k6dH5Fdd6pp5FQa9D8Jd8dqsQEBuuLlT2Qxf67UV&#43;5CNEW2Crr5I&#43;2/SlX8mnf9J&#43;6335ZdKF8Of0cTXpLSKLor3ep6fy3Rk7ron/eCufvuTGaYCLRHos1&#43;/fII9Qy9G6H6m8oSYTqVZiFBBqwiP/&#43;drj/D21kauihmsSATnacAcBUXTXMb2fJiJn8xwZDtvu/8v85OZv8b20c/mcIO3jwDADd5ueAD&#43;BJ9YVBAWA594AAAAAElFTkSuQmCC</i>
+                
+              </span>
+              <div>
+                <div class="app-name">con</div>
+                <div class="app-id">co.nowledge.con</div>
+              </div>
+            </div>
+            <p class="app-summary">GPU-accelerated terminal emulator with a built-in AI agent harness</p>
+            <div class="releases">
+              
+              <div class="release ">
+                <div class="release-head">
+                  <span class="pill primary">nightly</span>
+                  <span class="pill">aarch64</span><span class="pill">x86_64</span>
+                  <span class="release-date">latest &bull; released Oct 15, 2026</span>
+                </div>
+                <div class="release-meta">136 MB installed &bull; 51 MB download &bull; 5b55a0ebcf</div>
+                <div class="actions">
+                  <a class="btn primary" href="refs/co.nowledge.con-nightly.flatpakref" download>Install (nightly)</a>
+                </div>
+                <div class="code-box"><button class="copy-btn">Copy</button><code>flatpak install --user con-terminal co.nowledge.con//nightly</code></div>
+              </div>
+              
+              <div class="release old">
+                <div class="release-head">
+                  <span class="pill primary">beta</span>
+                  <span class="pill">aarch64</span><span class="pill">x86_64</span>
+                  <span class="release-date">released Oct 14, 2026</span>
+                </div>
+                <div class="release-meta">136 MB installed &bull; 51 MB download &bull; 72979b10d1</div>
+                <div class="actions">
+                  <a class="btn primary" href="refs/co.nowledge.con-beta.flatpakref" download>Install (beta)</a>
+                </div>
+                <div class="code-box"><button class="copy-btn">Copy</button><code>flatpak install --user con-terminal co.nowledge.con//beta</code></div>
+              </div>
+              
+              <div class="release old">
+                <div class="release-head">
+                  <span class="pill primary">unstable</span>
+                  <span class="pill">aarch64</span><span class="pill">x86_64</span>
+                  <span class="release-date">released Oct 14, 2026</span>
+                </div>
+                <div class="release-meta">136 MB installed &bull; 51 MB download &bull; 691fce153d</div>
+                <div class="actions">
+                  <a class="btn primary" href="refs/co.nowledge.con-unstable.flatpakref" download>Install (unstable)</a>
+                </div>
+                <div class="code-box"><button class="copy-btn">Copy</button><code>flatpak install --user con-terminal co.nowledge.con//unstable</code></div>
+              </div>
+              
+            </div>
+          </article>
+          
+        </div>
+        
+      </section>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <div>
+          <span>&copy; 2026 Nowledge Labs, Inc.</span>
+          <span class="tagline">&mdash; we build the knowledge layer.</span>
+        </div>
+        <div class="links">
+          <a href="https://con.nowledge.co/">con</a>
+          <a href="https://con.nowledge.co/docs/">docs</a>
+          <a href="https://github.com/nowledge-co/con-terminal" target="_blank" rel="noopener">GitHub</a>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    document.querySelectorAll('.app-icon .ic').forEach(function (ic) {
+      var src = ic.textContent.trim();
+      var el = ic.parentElement;
+      if (!src) return;
+      var img = new Image();
+      img.onload = function () {
+        el.textContent = '';
+        el.style.backgroundImage = 'url("' + src + '")';
+      };
+      img.src = src;
+    });
+
+    document.querySelectorAll('.copy-btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var code = btn.parentElement.querySelector('code');
+        if (!code || !navigator.clipboard) return;
+        navigator.clipboard.writeText(code.textContent).then(function () {
+          var prev = btn.textContent;
+          btn.textContent = 'Copied';
+          btn.classList.add('ok');
+          setTimeout(function () { btn.textContent = prev; btn.classList.remove('ok'); }, 1400);
+        });
+      });
+    });
+  </script>
+</body>
+</html>
