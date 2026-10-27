@@ -521,6 +521,7 @@ pub struct AgentPanel {
     follow_output: FollowOutputState,
     /// Currently highlighted skill in inline autocomplete
     inline_skill_selection: usize,
+    inline_skill_popup_scroll: ScrollHandle,
     ui_opacity: f32,
 }
 
@@ -1054,6 +1055,7 @@ impl AgentPanel {
             inline_input_has_skills: false,
             follow_output: FollowOutputState::Auto,
             inline_skill_selection: 0,
+            inline_skill_popup_scroll: ScrollHandle::new(),
             ui_opacity: 0.90,
         };
         panel.message_list_state.set_follow_mode(FollowMode::Tail);
@@ -1184,6 +1186,7 @@ impl AgentPanel {
             inline_input_has_skills: false,
             follow_output: FollowOutputState::Auto,
             inline_skill_selection: 0,
+            inline_skill_popup_scroll: ScrollHandle::new(),
             ui_opacity: 0.90,
         };
         panel.message_list_state.set_follow_mode(FollowMode::Tail);
@@ -1355,10 +1358,14 @@ impl AgentPanel {
                     let previous_skill_selection = this.inline_skill_selection;
                     if skills.is_empty() {
                         this.inline_skill_selection = 0;
+                        this.inline_skill_popup_scroll
+                            .scroll_to_item(this.inline_skill_selection);
                     } else {
                         this.inline_skill_selection = this
                             .inline_skill_selection
                             .min(skills.len().saturating_sub(1));
+                        this.inline_skill_popup_scroll
+                            .scroll_to_item(this.inline_skill_selection);
                     }
                     if this.inline_skill_selection != previous_skill_selection {
                         needs_notify = true;
@@ -1414,10 +1421,14 @@ impl AgentPanel {
         let completions_len = self.filtered_inline_skills(cx).len();
         if completions_len == 0 {
             self.inline_skill_selection = 0;
+            self.inline_skill_popup_scroll
+                .scroll_to_item(self.inline_skill_selection);
         } else {
             self.inline_skill_selection = self
                 .inline_skill_selection
                 .min(completions_len.saturating_sub(1));
+            self.inline_skill_popup_scroll
+                .scroll_to_item(self.inline_skill_selection);
         }
 
         if visual_changed
@@ -1525,6 +1536,10 @@ impl AgentPanel {
             .collect()
     }
 
+    pub(crate) fn inline_skill_popup_scroll_handle(&self) -> ScrollHandle {
+        self.inline_skill_popup_scroll.clone()
+    }
+
     pub fn inline_skill_selection(&self) -> usize {
         self.inline_skill_selection
     }
@@ -1546,9 +1561,12 @@ impl AgentPanel {
         if let Some(ref input) = self.inline_input_state {
             input.update(cx, |s, cx| {
                 s.set_value(format!("/{name} "), window, cx);
+                s.focus_handle(cx).focus(window, cx);
             });
         }
         self.inline_skill_selection = 0;
+        self.inline_skill_popup_scroll
+            .scroll_to_item(self.inline_skill_selection);
         cx.emit(InlineSkillAutocompleteChanged);
         cx.notify();
     }
@@ -1591,6 +1609,8 @@ impl AgentPanel {
             state.set_cursor_position(Position::new(0, cursor), window, cx);
         });
         self.inline_skill_selection = 0;
+        self.inline_skill_popup_scroll
+            .scroll_to_item(self.inline_skill_selection);
         cx.emit(InlineSkillAutocompleteChanged);
         cx.notify();
         true
@@ -1644,6 +1664,8 @@ impl AgentPanel {
         match key {
             "up" if has_completions => {
                 self.inline_skill_selection = self.inline_skill_selection.saturating_sub(1);
+                self.inline_skill_popup_scroll
+                    .scroll_to_item(self.inline_skill_selection);
                 cx.emit(InlineSkillAutocompleteChanged);
                 cx.notify();
                 true
@@ -1651,6 +1673,8 @@ impl AgentPanel {
             "down" if has_completions => {
                 let max = self.filtered_inline_skills(cx).len().saturating_sub(1);
                 self.inline_skill_selection = (self.inline_skill_selection + 1).min(max);
+                self.inline_skill_popup_scroll
+                    .scroll_to_item(self.inline_skill_selection);
                 cx.emit(InlineSkillAutocompleteChanged);
                 cx.notify();
                 true
@@ -5135,6 +5159,8 @@ impl Render for AgentPanel {
                                 input.update(cx, |s, cx| s.set_value("", window, cx));
                             }
                             this.inline_skill_selection = 0;
+                            this.inline_skill_popup_scroll
+                                .scroll_to_item(this.inline_skill_selection);
                             cx.emit(InlineSkillAutocompleteChanged);
                             cx.notify();
                             window.prevent_default();
@@ -5994,10 +6020,12 @@ mod tests {
             let mut panel = AgentPanel::new(window, cx);
             panel.set_show_inline_input(true, cx);
             panel.set_skills(
-                vec![crate::input_bar::SkillEntry {
-                    name: "build".into(),
-                    description: "Build".into(),
-                }],
+                (0..8)
+                    .map(|index| crate::input_bar::SkillEntry {
+                        name: format!("build-{index}"),
+                        description: "Build".into(),
+                    })
+                    .collect(),
                 cx,
             );
             panel
@@ -6016,18 +6044,18 @@ mod tests {
             .detach();
         });
         cx.simulate_input("/bu");
-        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("down down down down down down down enter");
         cx.update(|_, cx| {
             let panel = panel.read(cx);
             assert_eq!(
                 panel.inline_input_state.as_ref().unwrap().read(cx).value(),
-                "/build "
+                "/build-7 "
             );
             assert!(panel.filtered_inline_skills(cx).is_empty());
             assert!(submits.borrow().is_empty());
         });
         cx.simulate_keystrokes("enter");
-        assert_eq!(*submits.borrow(), vec!["/build ".to_string()]);
+        assert_eq!(*submits.borrow(), vec!["/build-7 ".to_string()]);
     }
 
     #[gpui::test]

@@ -581,6 +581,17 @@ scaling. Mode, pane scope, and submission controls align on the same 28-point
 row. Input typography, multiline growth, completion overlays, and panel motion
 are independent of control styling.
 
+Skill completion in the command bar and inline agent input uses the same
+bounded component list. Keep names and one-line summaries in fixed-height rows;
+full descriptions belong in tooltips rather than expanding the menu. Keyboard
+selection must reveal the selected row, pointer selection must retain editor
+focus, and choosing a skill inserts text without submitting it. Publish newly
+scanned catalogs to both editors directly. Fit the borderless popup to the
+available viewport and keep its scroll area separate from its anchored frame.
+The scrollbar stays in the fixed frame; wheel and thumb dragging must both work
+without propagating into the underlying editor or choosing a candidate. A hidden
+editor must not leave its completion popup visible.
+
 Use quiet neutral fills for the mode and pane-target controls. Mode icons keep
 their semantic color; pane-target labels use the UI font and solid theme-derived
 ink rather than translucent glyphs. Both controls use component buttons and

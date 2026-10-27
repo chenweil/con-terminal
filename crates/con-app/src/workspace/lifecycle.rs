@@ -794,6 +794,7 @@ impl ConWorkspace {
                             workspace.spawn_skill_scan_job(job);
                         }
                         if applied {
+                            workspace.sync_skill_catalog(cx);
                             cx.notify();
                         }
                     }
@@ -1519,6 +1520,22 @@ impl ConWorkspace {
         };
 
         self.spawn_skill_scan_job(job);
+    }
+
+    /// Catalog arrival updates both editors immediately, independent of cached
+    /// chrome preparation and without requiring another input edit.
+    pub(super) fn sync_skill_catalog(&mut self, cx: &mut Context<Self>) {
+        let entries: Vec<_> = self
+            .harness
+            .skill_summaries()
+            .into_iter()
+            .map(|(name, description)| crate::input_bar::SkillEntry { name, description })
+            .collect();
+        self.input_bar
+            .update(cx, |bar, cx| bar.set_skills(entries.clone(), cx));
+        self.agent_panel
+            .update(cx, |panel, cx| panel.set_skills(entries, cx));
+        self.chrome_preparation_dirty = true;
     }
 
     pub(super) fn spawn_skill_scan_job(&self, job: SkillScanJob) {

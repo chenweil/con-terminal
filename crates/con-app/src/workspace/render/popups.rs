@@ -1,5 +1,4 @@
 use super::super::*;
-use gpui_component::scroll::ScrollableElement;
 
 use super::super::chrome_actions::PANE_SCOPE_GAP;
 
@@ -152,11 +151,12 @@ impl ConWorkspace {
         &self,
         terminal_content_left: f32,
         terminal_content_width: f32,
-        elevated_ui_surface_opacity: f32,
+        _elevated_ui_surface_opacity: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = cx.theme();
-        let popup_available_width = (terminal_content_width - 48.0).max(240.0);
+        let popup_available_width = (terminal_content_width - 24.0).max(1.0);
         let popup_width = px((terminal_content_width * 0.34)
             .clamp(320.0, 480.0)
             .min(popup_available_width));
@@ -169,86 +169,45 @@ impl ConWorkspace {
             .read(cx)
             .filtered_skills(cx)
             .into_iter()
-            .map(|s| (s.name.clone(), s.description.clone()))
+            .cloned()
             .collect::<Vec<_>>();
-        let sel = self.input_bar.read(cx).skill_selection();
-        let sel = sel.min(skills.len().saturating_sub(1));
-
-        let scroll = self.input_bar.read(cx).skill_popup_scroll_handle();
-        let mut popup = div()
-            .id("skill-popup")
-            .role(Role::ListBox)
-            .debug_selector(|| "skill-popup".into())
-            .absolute()
-            .bottom(popup_bottom)
-            .left(px(terminal_content_left + 24.0))
-            .w(popup_width)
-            .max_h(px(320.0))
-            .flex()
-            .flex_col()
-            .rounded(px(10.0))
-            .bg(theme.background.opacity(elevated_ui_surface_opacity))
-            .border_1()
-            .border_color(theme.muted.opacity(0.16))
-            .py(px(6.0))
-            .overflow_y_scroll()
-            .track_scroll(&scroll)
-            .occlude()
-            .font_family(theme.font_family.clone());
-
-        for (i, (name, desc)) in skills.iter().enumerate() {
-            let is_sel = i == sel;
-            let name_clone = name.clone();
-            popup = popup.child(
-                div()
-                    .id(SharedString::from(format!("skill-{name}")))
-                    .role(Role::ListBoxOption)
-                    .aria_selected(is_sel)
-                    .aria_label(format!("/{name}"))
-                    .flex()
-                    .flex_col()
-                    .flex_shrink_0()
-                    .gap(px(2.0))
-                    .mx(px(6.0))
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .rounded(px(8.0))
-                    .cursor_pointer()
-                    .bg(if is_sel {
-                        theme.primary.opacity(0.10)
-                    } else {
-                        theme.transparent
-                    })
-                    .hover(|s| s.bg(theme.primary.opacity(0.08)))
-                    .on_mouse_down(MouseButton::Left, {
-                        let input_bar = self.input_bar.clone();
-                        cx.listener(move |_this, _, window, cx| {
-                            input_bar.update(cx, |bar, cx| {
-                                bar.complete_skill(&name_clone, window, cx);
-                            });
-                        })
-                    })
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if is_sel {
-                                theme.primary
-                            } else {
-                                theme.foreground
-                            })
-                            .child(format!("/{name}")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(16.0))
-                            .text_color(theme.muted_foreground.opacity(0.68))
-                            .child(desc.clone()),
-                    ),
-            );
+        if skills.is_empty() {
+            return None;
         }
-        Some(popup.vertical_scrollbar(&scroll).into_any_element())
+        let selected = self
+            .input_bar
+            .read(cx)
+            .skill_selection()
+            .min(skills.len() - 1);
+        let scroll = self.input_bar.read(cx).skill_popup_scroll_handle();
+        let input_bar = self.input_bar.clone();
+        let choose: crate::skill_picker::ChooseSkill = std::rc::Rc::new(move |name, window, cx| {
+            input_bar.update(cx, |bar, cx| bar.complete_skill(name, window, cx));
+        });
+        let available = (window.viewport_size().height - popup_bottom - px(16.0)).max(px(48.0));
+        Some(
+            div()
+                .id("skill-popup")
+                .debug_selector(|| "skill-popup".into())
+                .absolute()
+                .bottom(popup_bottom)
+                .left(px(terminal_content_left + 12.0))
+                .w(popup_width)
+                .rounded(px(10.0))
+                .bg(theme.popover)
+                .p(px(4.0))
+                .overflow_hidden()
+                .occlude()
+                .child(crate::skill_picker::skill_list(
+                    &skills,
+                    selected,
+                    &scroll,
+                    available.min(px(288.0)),
+                    choose,
+                    cx,
+                ))
+                .into_any_element(),
+        )
     }
 
     pub(super) fn render_path_popup(
@@ -572,7 +531,7 @@ impl ConWorkspace {
 
     pub(super) fn render_inline_skill_popup(
         &self,
-        elevated_ui_surface_opacity: f32,
+        _elevated_ui_surface_opacity: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -589,75 +548,46 @@ impl ConWorkspace {
             .read(cx)
             .filtered_inline_skills(cx)
             .into_iter()
-            .map(|s| (s.name.clone(), s.description.clone()))
+            .cloned()
             .collect::<Vec<_>>();
-        let sel = self.agent_panel.read(cx).inline_skill_selection();
-        let sel = sel.min(skills.len().saturating_sub(1));
-
-        let mut popup = div()
-            .absolute()
-            .bottom(popup_bottom)
-            .left(popup_left)
-            .w(popup_width)
-            .max_h(px(280.0))
-            .flex()
-            .flex_col()
-            .rounded(px(10.0))
-            .bg(theme.background.opacity(elevated_ui_surface_opacity))
-            .border_1()
-            .border_color(theme.muted.opacity(0.16))
-            .py(px(6.0))
-            .overflow_hidden()
-            .font_family(theme.font_family.clone());
-
-        for (i, (name, desc)) in skills.iter().enumerate() {
-            let is_sel = i == sel;
-            let name_clone = name.clone();
-            popup = popup.child(
-                div()
-                    .id(SharedString::from(format!("inline-skill-{name}")))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .mx(px(6.0))
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .rounded(px(8.0))
-                    .cursor_pointer()
-                    .bg(if is_sel {
-                        theme.primary.opacity(0.10)
-                    } else {
-                        theme.transparent
-                    })
-                    .hover(|s| s.bg(theme.primary.opacity(0.08)))
-                    .on_mouse_down(MouseButton::Left, {
-                        let agent_panel = self.agent_panel.clone();
-                        cx.listener(move |_this, _, window, cx| {
-                            agent_panel.update(cx, |panel, cx| {
-                                panel.complete_inline_skill(&name_clone, window, cx);
-                            });
-                        })
-                    })
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if is_sel {
-                                theme.primary
-                            } else {
-                                theme.foreground
-                            })
-                            .child(format!("/{name}")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(16.0))
-                            .text_color(theme.muted_foreground.opacity(0.68))
-                            .child(desc.clone()),
-                    ),
-            );
+        if skills.is_empty() {
+            return None;
         }
-        Some(popup.into_any_element())
+        let selected = self
+            .agent_panel
+            .read(cx)
+            .inline_skill_selection()
+            .min(skills.len() - 1);
+        let scroll = self.agent_panel.read(cx).inline_skill_popup_scroll_handle();
+        let panel = self.agent_panel.clone();
+        let choose: crate::skill_picker::ChooseSkill = std::rc::Rc::new(move |name, window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.complete_inline_skill(name, window, cx)
+            });
+        });
+        let available = (window.viewport_size().height - popup_bottom - px(16.0)).max(px(48.0));
+        Some(
+            div()
+                .id("inline-skill-popup")
+                .debug_selector(|| "inline-skill-popup".into())
+                .absolute()
+                .bottom(popup_bottom)
+                .left(popup_left)
+                .w(popup_width)
+                .rounded(px(10.0))
+                .bg(theme.popover)
+                .p(px(4.0))
+                .overflow_hidden()
+                .occlude()
+                .child(crate::skill_picker::skill_list(
+                    &skills,
+                    selected,
+                    &scroll,
+                    available.min(px(288.0)),
+                    choose,
+                    cx,
+                ))
+                .into_any_element(),
+        )
     }
 }
