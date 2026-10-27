@@ -835,6 +835,7 @@ impl InputBar {
     pub fn complete_skill(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.current_input_state().update(cx, |s, cx| {
             s.set_value(format!("/{name} "), window, cx);
+            s.focus_handle(cx).focus(window, cx);
         });
         self.skill_selection = 0;
         self.clear_completion_ui();

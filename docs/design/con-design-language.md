@@ -237,6 +237,23 @@ It should feel like the best place to do terminal-native work in the AI era.
   at larger UI font sizes. Reserve only one trailing action slot so long
   titles do not lose width to invisible controls. Use the same identity assets
   in the sidebar drag preview.
+- Expanded tooltips and compact hover cards share one continuous rounded surface,
+  with a very slight neutral light falloff, no header slab, borders or shadows.
+  A single-pane detail groups the full name, application logo and graphical
+  state, followed by its explanation and working directory. A multi-pane card
+  shows one compact, spatially ordered row per physical pane: application icon,
+  meaningful task/context or application/folder name, its own state and directory.
+  Include editors by filename and parent directory. Do not substitute a pane
+  count or only the aggregate winner for this overview. Do not dump raw commands
+  or internal pane/surface numbers into it. Keep the stack on the tab itself.
+  Known activity uses the shared retained painter instead of prose status;
+  completion remains a notification dot and determinate progress retains its
+  percentage. Idle rows need no status glyph. Preserve exact accessibility labels.
+  Open cards follow every pane's retained facts, including non-winning changes;
+  use one retained activity layer for all rows and bound long lists by scrolling.
+  Paths wrap; prose uses the system font and paths use the mono font.
+  Keep timestamps and group headers out of default rows unless they represent
+  a feature with reliable source data and persistence semantics.
 - Close uses a hover-only component button with a small circular fill and thin
   cross. Keep rename available through double-click and the context menu, and
   preserve the existing tooltip,
@@ -563,6 +580,17 @@ The bottom input bar retains its 44-point minimum height and shared density
 scaling. Mode, pane scope, and submission controls align on the same 28-point
 row. Input typography, multiline growth, completion overlays, and panel motion
 are independent of control styling.
+
+Skill completion in the command bar and inline agent input uses the same
+bounded component list. Keep names and one-line summaries in fixed-height rows;
+full descriptions belong in tooltips rather than expanding the menu. Keyboard
+selection must reveal the selected row, pointer selection must retain editor
+focus, and choosing a skill inserts text without submitting it. Publish newly
+scanned catalogs to both editors directly. Fit the borderless popup to the
+available viewport and keep its scroll area separate from its anchored frame.
+The scrollbar stays in the fixed frame; wheel and thumb dragging must both work
+without propagating into the underlying editor or choosing a candidate. A hidden
+editor must not leave its completion popup visible.
 
 Use quiet neutral fills for the mode and pane-target controls. Mode icons keep
 their semantic color; pane-target labels use the UI font and solid theme-derived

@@ -244,7 +244,8 @@ impl Render for ConWorkspace {
 
         // If a modal was dismissed internally (escape/backdrop), restore terminal focus
         let is_modal_open = self.is_modal_open(cx);
-        let has_skill_popup = !self.input_bar.read(cx).filtered_skills(cx).is_empty();
+        let has_skill_popup =
+            self.input_bar_visible && !self.input_bar.read(cx).filtered_skills(cx).is_empty();
         let has_path_popup = self.input_bar.read(cx).has_path_completion_candidates();
         let has_inline_skill_popup = self.agent_panel_open
             && !self.input_bar_visible
@@ -1866,6 +1867,7 @@ impl Render for ConWorkspace {
                 terminal_content_left,
                 terminal_content_width,
                 elevated_ui_surface_opacity,
+                window,
                 cx,
             )
         {

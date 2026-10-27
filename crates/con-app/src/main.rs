@@ -82,6 +82,7 @@ mod reduced_motion;
 mod settings_panel;
 mod sidebar;
 mod sidebar_search_view;
+mod skill_picker;
 mod startup_args;
 mod tab_activity;
 mod tab_colors;

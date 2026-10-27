@@ -297,7 +297,8 @@ fn native_agent<'a>(
 pub(super) struct TerminalPresentation {
     surfaces: HashMap<u64, Surface>,
     pub(super) tabs: HashMap<u64, Option<con_core::terminal_status::Status>>,
-    program_details: HashMap<u64, Option<String>>,
+    program_details: HashMap<u64, Option<crate::sidebar::ProgramStatusDetail>>,
+    pub(super) pane_details: HashMap<u64, Vec<crate::sidebar::PaneHoverDetail>>,
     in_flight: bool,
     last_query: Option<Instant>,
     sequence: u64,
@@ -505,6 +506,13 @@ impl ConWorkspace {
                 );
                 changed |= terminal.set_presentation_icon(icon);
             }
+            let pane_details = if tab.pane_tree.pane_count() > 1 {
+                collect_pane_hover_details(&tab.pane_tree, &state.surfaces, now, cx)
+            } else {
+                Vec::new()
+            };
+            changed |=
+                retain_pane_hover_details(&mut state.pane_details, tab.summary_id, pane_details);
             let focused = tab
                 .pane_tree
                 .focused_terminal_entity_id()
@@ -547,17 +555,18 @@ impl ConWorkspace {
                         .surfaces
                         .get(&status.surface_id)?
                         .status
-                        .program_detail()?;
-                    let source = tab
-                        .pane_tree
-                        .surface_infos(None)
+                        .program_detail_parts()?;
+                    let sources = tab.pane_tree.surface_infos(None);
+                    let source = sources
                         .into_iter()
                         .find(|source| source.terminal.entity_id().as_u64() == status.surface_id)?;
-                    Some(program_detail_with_source(
-                        source.pane_index,
-                        source.surface_index,
-                        &detail,
-                    ))
+                    Some(crate::sidebar::ProgramStatusDetail {
+                        content: detail,
+
+                        source_path: super::tab_presentation::cwd_subtitle(
+                            source.terminal.current_dir(cx).as_deref(),
+                        ),
+                    })
                 });
             changed |= retain_program_detail(&mut state.program_details, tab.summary_id, detail);
             if state.tabs.get(&tab.summary_id) != Some(&status) {
@@ -571,6 +580,9 @@ impl ConWorkspace {
         state
             .program_details
             .retain(|id, _| self.tabs.iter().any(|tab| tab.summary_id == *id));
+        state
+            .pane_details
+            .retain(|id, _| self.tabs.iter().any(|tab| tab.summary_id == *id));
         if changed {
             self.sync_sidebar(cx);
             cx.notify();
@@ -580,6 +592,14 @@ impl ConWorkspace {
     /// The winning program-status record, when that record owns the tab
     /// indicator. Heuristic activity does not borrow this text.
     pub(super) fn program_status_detail(&self, summary_id: u64) -> Option<String> {
+        self.program_status_context(summary_id)
+            .map(|detail| detail.content.to_text())
+    }
+
+    pub(super) fn program_status_context(
+        &self,
+        summary_id: u64,
+    ) -> Option<crate::sidebar::ProgramStatusDetail> {
         self.terminal_presentation
             .program_details
             .get(&summary_id)
@@ -732,15 +752,128 @@ fn nonempty(text: &str) -> Option<&str> {
     (!text.is_empty()).then_some(text)
 }
 
-// PaneSurfaceInfo already uses the one-based indices shown by the UI/CLI.
-fn program_detail_with_source(pane_index: usize, surface_index: usize, detail: &str) -> String {
-    format!("{detail}\nPane {pane_index} · Surface {surface_index}")
+fn collect_pane_hover_details(
+    tree: &crate::pane_tree::PaneTree,
+    surfaces: &HashMap<u64, Surface>,
+    now: Instant,
+    cx: &App,
+) -> Vec<crate::sidebar::PaneHoverDetail> {
+    let sources = tree.surface_infos(None);
+    tree.pane_ids()
+        .into_iter()
+        .filter_map(|pane_id| {
+            let pane_sources: Vec<_> = sources
+                .iter()
+                .filter(|source| source.pane_id == pane_id)
+                .collect();
+            let active = pane_sources.iter().find(|source| source.is_active).copied();
+            if let Some(active) = active {
+                let status = con_core::terminal_status::aggregate(
+                    pane_sources.iter().filter_map(|source| {
+                        surfaces
+                            .get(&source.terminal.entity_id().as_u64())
+                            .and_then(|surface| surface.status.status(now))
+                    }),
+                    Some(active.terminal.entity_id().as_u64()),
+                );
+                let source = status
+                    .and_then(|status| {
+                        pane_sources
+                            .iter()
+                            .find(|source| {
+                                source.terminal.entity_id().as_u64() == status.surface_id
+                            })
+                            .copied()
+                    })
+                    .unwrap_or(active);
+                let retained = surfaces.get(&source.terminal.entity_id().as_u64());
+                let detail = status
+                    .filter(|status| {
+                        status.evidence == con_core::terminal_status::Evidence::ProgramStatus
+                    })
+                    .and_then(|_| retained?.status.program_detail_parts());
+                let application = detail
+                    .as_ref()
+                    .and_then(|detail| detail.application.as_deref())
+                    .or_else(|| retained?.status.identity().map(|identity| identity.agent));
+                let icon = crate::assets::agent_cli_icon(application)
+                    .unwrap_or_else(|| source.terminal.presentation_icon());
+                let directory = super::tab_presentation::cwd_subtitle(
+                    source.terminal.current_dir(cx).as_deref(),
+                );
+                let title = detail
+                    .as_ref()
+                    .and_then(|detail| detail.context.clone())
+                    .or_else(|| application.map(str::to_owned))
+                    .or_else(|| icon.strip_prefix("program:").map(str::to_owned))
+                    .unwrap_or_else(|| {
+                        directory
+                            .as_deref()
+                            .map(|dir| {
+                                dir.trim_end_matches(['/', '\\'])
+                                    .rsplit(['/', '\\'])
+                                    .next()
+                                    .filter(|name| !name.is_empty())
+                                    .unwrap_or(dir)
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "Terminal".into())
+                    });
+                let status_label = detail.map(|detail| detail.status).unwrap_or_else(|| {
+                    status.map_or("Terminal".into(), |status| format!("{:?}", status.activity))
+                });
+                Some(crate::sidebar::PaneHoverDetail {
+                    id: pane_id as u64,
+                    icon,
+                    title,
+                    directory,
+                    status,
+                    status_label,
+                })
+            } else {
+                let editor = tree.editor_view_for_pane(pane_id)?;
+                let path = editor
+                    .read(cx)
+                    .active_path()
+                    .map(std::path::Path::to_path_buf);
+                let title = path
+                    .as_deref()
+                    .and_then(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Editor".into());
+                let directory = path
+                    .as_deref()
+                    .and_then(|path| path.parent())
+                    .and_then(|path| super::tab_presentation::cwd_subtitle(path.to_str()));
+                Some(crate::sidebar::PaneHoverDetail {
+                    id: pane_id as u64,
+                    icon: "phosphor/file-code.svg",
+                    title,
+                    directory,
+                    status: None,
+                    status_label: "Editor".into(),
+                })
+            }
+        })
+        .collect()
+}
+
+fn retain_pane_hover_details(
+    details: &mut HashMap<u64, Vec<crate::sidebar::PaneHoverDetail>>,
+    tab: u64,
+    next: Vec<crate::sidebar::PaneHoverDetail>,
+) -> bool {
+    if details.get(&tab) == Some(&next) {
+        return false;
+    }
+    details.insert(tab, next);
+    true
 }
 
 fn retain_program_detail(
-    details: &mut HashMap<u64, Option<String>>,
+    details: &mut HashMap<u64, Option<crate::sidebar::ProgramStatusDetail>>,
     tab: u64,
-    detail: Option<String>,
+    detail: Option<crate::sidebar::ProgramStatusDetail>,
 ) -> bool {
     if details.get(&tab) == Some(&detail) {
         return false;
@@ -751,37 +884,98 @@ fn retain_program_detail(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn program_detail_preserves_one_based_surface_info_indices() {
-        assert_eq!(
-            super::program_detail_with_source(2, 1, "cargo · done"),
-            "cargo · done\nPane 2 · Surface 1"
-        );
-    }
     use std::collections::HashMap;
     use std::time::Instant;
 
     use con_ghostty::ProgramStatusEvent;
 
     #[test]
+    fn pane_details_update_when_the_tabs_aggregate_activity_does_not() {
+        use con_core::terminal_status::{Activity, Evidence, Status, aggregate};
+        let row = |id| crate::sidebar::PaneHoverDetail {
+            id,
+            icon: "agents/codex.svg",
+            title: format!("task-{id}"),
+            directory: Some(format!("/project/{id}")),
+            status: Some(Status {
+                surface_id: id,
+                activity: Activity::Busy,
+                evidence: Evidence::ProgramStatus,
+                percent: None,
+            }),
+            status_label: "Working".into(),
+        };
+        let mut rows = vec![row(1), row(2)];
+        let before = aggregate(rows.iter().filter_map(|row| row.status), Some(1))
+            .unwrap()
+            .activity;
+        let mut retained = HashMap::new();
+        assert!(super::retain_pane_hover_details(
+            &mut retained,
+            7,
+            rows.clone()
+        ));
+        rows[1].status.as_mut().unwrap().activity = Activity::Done;
+        rows[1].status_label = "Completed".into();
+        assert_eq!(
+            before,
+            aggregate(rows.iter().filter_map(|row| row.status), Some(1))
+                .unwrap()
+                .activity
+        );
+        assert!(super::retain_pane_hover_details(
+            &mut retained,
+            7,
+            rows.clone()
+        ));
+        assert_eq!(retained[&7][1].status.unwrap().activity, Activity::Done);
+        assert!(!super::retain_pane_hover_details(&mut retained, 7, rows));
+    }
+
+    #[test]
     fn program_detail_changes_invalidate_without_activity_changes() {
+        let detail = |context: &str, other_directory| crate::sidebar::ProgramStatusDetail {
+            content: con_core::program_status::ProgramDetail {
+                application: Some("cargo".into()),
+                scope: None,
+                status: "Working".into(),
+                context: Some(context.into()),
+            },
+
+            source_path: Some(
+                if other_directory {
+                    "/project/other"
+                } else {
+                    "/project"
+                }
+                .into(),
+            ),
+        };
         let mut details = std::collections::HashMap::new();
         assert!(super::retain_program_detail(
             &mut details,
             7,
-            Some("building".into())
+            Some(detail("building", false))
         ));
         assert!(!super::retain_program_detail(
             &mut details,
             7,
-            Some("building".into())
+            Some(detail("building", false))
         ));
         assert!(super::retain_program_detail(
             &mut details,
             7,
-            Some("testing".into())
+            Some(detail("testing", false))
         ));
-        assert_eq!(details[&7].as_deref(), Some("testing"));
+        assert_eq!(
+            details[&7].as_ref().unwrap().content.context.as_deref(),
+            Some("testing")
+        );
+        assert!(super::retain_program_detail(
+            &mut details,
+            7,
+            Some(detail("testing", true))
+        ));
         assert!(super::retain_program_detail(&mut details, 7, None));
         assert!(!super::retain_program_detail(&mut details, 7, None));
     }

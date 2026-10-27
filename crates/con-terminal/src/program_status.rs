@@ -160,6 +160,35 @@ pub struct ProgramRecord {
     pub unseen: bool,
 }
 
+/// Presentation fields for the winning record, separated from protocol identity.
+/// UI consumers should not parse the plain-text detail to recover hierarchy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramDetail {
+    pub application: Option<String>,
+    pub scope: Option<String>,
+    pub status: String,
+    pub context: Option<String>,
+}
+
+impl ProgramDetail {
+    pub fn to_text(&self) -> String {
+        let identity = self
+            .application
+            .iter()
+            .chain(self.scope.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut lines = Vec::new();
+        if !identity.is_empty() {
+            lines.push(identity);
+        }
+        lines.push(self.status.clone());
+        lines.extend(self.context.iter().cloned());
+        truncate_chars(&lines.join("\n"), 180)
+    }
+}
+
 /// The winning record for the single activity indicator.
 ///
 /// Severity outranks recency, so a newer idle root cannot hide an older
@@ -264,23 +293,15 @@ impl SurfaceProgramStatus {
     /// text outside the terminal grid are removed. An acknowledged
     /// completion that no longer raises the indicator is omitted, and an
     /// idle root does not hide a blocked child.
-    pub fn detail_line(&self) -> Option<String> {
+    pub fn detail(&self) -> Option<ProgramDetail> {
         let record = self.winning_record()?;
-        let mut parts = Vec::new();
-        if let Some(app) = self.inherited_app(&record.id) {
-            parts.push(app.as_str().to_string());
-        }
-        if !record.id.is_root() {
-            let id = present_text(&record.id.path());
-            if !id.is_empty() {
-                parts.push(id);
-            }
-        }
-        let mut line = parts.join(" · ");
-        if !line.is_empty() {
-            line.push('\n');
-        }
-        line.push_str(match (record.state, record.kind) {
+        let application = self
+            .inherited_app(&record.id)
+            .map(|app| app.as_str().to_string());
+        let scope = (!record.id.is_root())
+            .then(|| present_text(&record.id.path()))
+            .filter(|id| !id.is_empty());
+        let mut status = String::from(match (record.state, record.kind) {
             (State::Idle, _) => "Idle",
             (State::Working, _) => "Working",
             (State::Done, _) => "Completed",
@@ -291,7 +312,7 @@ impl SurfaceProgramStatus {
             (State::Error, _) => "Failed",
         });
         if let Some(progress) = record.progress {
-            line.push_str(&format!(" · {progress}%"));
+            status.push_str(&format!(" · {progress}%"));
         }
         let mut context = Vec::new();
         if let Some(title) = record.title.as_deref() {
@@ -306,12 +327,16 @@ impl SurfaceProgramStatus {
                 context.push(message);
             }
         }
-        if !context.is_empty() {
-            line.push('\n');
-            line.push_str(&context.join(" — "));
-        }
-        let line = truncate_chars(&line, 180);
-        (!line.is_empty()).then_some(line)
+        Some(ProgramDetail {
+            application,
+            scope,
+            status,
+            context: (!context.is_empty()).then(|| truncate_chars(&context.join(" — "), 180)),
+        })
+    }
+
+    pub fn detail_line(&self) -> Option<String> {
+        self.detail().map(|detail| detail.to_text())
     }
 
     fn winning_record(&self) -> Option<&Record> {
@@ -1044,6 +1069,11 @@ mod tests {
             surface.detail_line().as_deref(),
             Some("cargo · build/test\nWaiting for permission · 40%\nPlan — Apply?hidden")
         );
+        let detail = surface.detail().unwrap();
+        assert_eq!(detail.application.as_deref(), Some("cargo"));
+        assert_eq!(detail.scope.as_deref(), Some("build/test"));
+        assert_eq!(detail.status, "Waiting for permission · 40%");
+        assert_eq!(detail.context.as_deref(), Some("Plan — Apply?hidden"));
         surface.acknowledge();
         assert_eq!(
             surface.detail_line().as_deref(),
