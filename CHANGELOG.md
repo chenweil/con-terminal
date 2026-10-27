@@ -4,7 +4,27 @@ All notable changes to con are documented here.
 
 con is still pre-release, so entries may group related beta work while the product shape is stabilizing.
 
-## `v0.1.0-beta.159`
+## `v0.1.0-beta.160`
+
+### Changed
+
+**Tabs**
+
+- Refine vertical-tab hover cards with application, activity and directory
+  details for each pane, including split tabs, while keeping the sidebar compact.
+  _(PR [#525](https://github.com/nowledge-co/con-terminal/pull/525) by [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Skill completion**
+
+- Restore reachable skill candidates in both the bottom command bar and inline
+  agent input. Long descriptions stay compact; keyboard navigation, wheel
+  scrolling and scrollbar dragging reach the full list. Choosing a skill keeps
+  input focus and inserts the command without submitting it.
+  _(PR [#525](https://github.com/nowledge-co/con-terminal/pull/525) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.159` - 2026-10-26
 
 ### Changed
 
