@@ -42,7 +42,7 @@ pub const PANEL_MIN_WIDTH: f32 = 184.0;
 pub const PANEL_MAX_WIDTH: f32 = 360.0;
 /// Compact details next to a rail tile; long paths wrap within this width.
 #[allow(dead_code)]
-const HOVER_CARD_WIDTH: f32 = 232.0;
+const HOVER_CARD_WIDTH: f32 = 304.0;
 /// Single-line tabs keep the expanded navigator as light as the compact rail.
 const ROW_HEIGHT: f32 = 32.0;
 const ROW_SELECTION_INSET: f32 = 3.0;
@@ -141,7 +141,25 @@ impl NavigationLayout {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgramStatusDetail {
+    pub content: con_core::program_status::ProgramDetail,
+    pub source_path: Option<String>,
+}
+
+/// A retained, user-facing summary of one physical pane, never a raw command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneHoverDetail {
+    pub id: u64,
+    pub icon: &'static str,
+    pub title: String,
+    pub directory: Option<String>,
+    pub status: Option<Status>,
+    pub status_label: String,
+}
+
 /// One row in the tab sidebar panel.
+#[derive(Clone)]
 pub struct SessionEntry {
     pub id: u64,
     pub name: String,
@@ -149,13 +167,13 @@ pub struct SessionEntry {
     pub is_ssh: bool,
     pub needs_attention: bool,
     pub status: Option<Status>,
-    /// Plain text for the program-status record that owns `status`.
+    /// Structured presentation for the program record that owns `status`.
     /// Empty when the indicator comes from a heuristic.
-    pub status_detail: Option<String>,
-    pub terminal_titles: Vec<String>,
+    pub status_detail: Option<ProgramStatusDetail>,
     pub icon: &'static str,
     /// Retained, deduplicated identities of the active content in each pane.
     pub pane_icons: Vec<&'static str>,
+    pub pane_details: Vec<PaneHoverDetail>,
     pub has_user_label: bool,
     /// How many panes the tab contains (split count). Surfaced in
     /// the rail's hover card so the user can see "this tab has 3
@@ -1310,169 +1328,8 @@ impl SessionSidebar {
         let min_top = self.leading_top_pad + RAIL_TOP_CONTROLS_HEIGHT + 8.0;
         let max_height = (window.viewport_size().height.as_f32() - min_top - 8.0).clamp(1.0, 240.0);
 
-        let name_color = theme.foreground;
-        let sub_color = theme.muted_foreground;
-        let meta_color = theme.muted_foreground;
-        let sys_font = theme.font_family.clone();
-
-        let mut card_inner = div()
-            .flex()
-            .flex_col()
-            .px(px(12.0))
-            .py(px(10.0))
-            .font_family(sys_font)
-            .child(
-                div()
-                    .debug_selector(|| "tab-hover-heading".into())
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap(px(4.0))
-                            .max_w(px(96.0))
-                            .flex_shrink_0()
-                            .children(session.identity_icons().iter().map(|icon| {
-                                crate::assets::tab_identity_icon(
-                                    crate::assets::tab_identity_asset(icon),
-                                    ui_icon_px(
-                                        theme,
-                                        if session.identity_icons().len() > 1 {
-                                            14.0
-                                        } else {
-                                            18.0
-                                        },
-                                    ),
-                                    theme.foreground,
-                                )
-                            })),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "tab-hover-name".into())
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(ui_px(theme, 13.0))
-                            .line_height(ui_px(theme, 18.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(name_color)
-                            .truncate()
-                            .child(session.name.clone()),
-                    )
-                    .when(session.pane_count > 1, |row| {
-                        row.child(
-                            div()
-                                .debug_selector(|| "tab-hover-pane-count".into())
-                                .flex_shrink_0()
-                                .text_size(ui_px(theme, 11.0))
-                                .text_color(meta_color)
-                                .child(format!("{} panes", session.pane_count)),
-                        )
-                    }),
-            );
-
-        if let Some(sub) = session.subtitle.as_ref() {
-            card_inner = card_inner.child(
-                div()
-                    .debug_selector(|| "tab-hover-path".into())
-                    .flex_shrink_0()
-                    .mt(px(6.0))
-                    .text_size(ui_px(theme, 11.0))
-                    .line_height(ui_px(theme, 16.0))
-                    .text_color(sub_color)
-                    .font_family(theme.font_family.clone())
-                    .w_full()
-                    .child(sub.clone()),
-            );
-        }
-
-        // A single pane already has one identity and working directory.
-        // Extra terminal titles help distinguish panes only in a split tab.
-        let terminal_titles: Vec<_> = session
-            .terminal_titles
-            .iter()
-            .filter(|title| {
-                session.pane_count > 1
-                    && *title != &session.name
-                    && Some(title.as_str()) != session.subtitle.as_deref()
-            })
-            .collect();
-        if !terminal_titles.is_empty() {
-            let mut titles = div()
-                .flex()
-                .flex_col()
-                .flex_shrink_0()
-                .mt(px(8.0))
-                .gap(px(4.0))
-                .child(
-                    div()
-                        .h(px(0.5))
-                        .w_full()
-                        .mb(px(4.0))
-                        .bg(theme.foreground.opacity(0.08)),
-                );
-            for title in terminal_titles {
-                titles = titles.child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(ui_px(theme, 11.0))
-                        .line_height(ui_px(theme, 16.0))
-                        .font_family(theme.font_family.clone())
-                        .text_color(theme.foreground)
-                        .truncate()
-                        .child(title.clone()),
-                );
-            }
-            card_inner = card_inner.child(titles);
-        }
-
-        if let Some(detail) = session.status_detail.as_ref() {
-            card_inner = card_inner.child(
-                div()
-                    .debug_selector(|| "tab-hover-status".into())
-                    .flex_shrink_0()
-                    .mt(px(8.0))
-                    .text_size(ui_px(theme, 11.0))
-                    .line_height(ui_px(theme, 16.0))
-                    .text_color(theme.foreground)
-                    .w_full()
-                    .child(detail.clone()),
-            );
-        }
-
-        let mut meta = div()
-            .debug_selector(|| "tab-hover-meta".into())
-            .flex_shrink_0()
-            .mt(px(8.0))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .text_size(ui_px(theme, 11.0))
-            .line_height(ui_px(theme, 14.0))
-            .text_color(meta_color);
-
-        if session.is_ssh {
-            meta = meta.child(div().child("SSH"));
-        }
-        if session.needs_attention {
-            if session.is_ssh {
-                meta = meta.child(div().child("·").text_color(meta_color));
-            }
-            meta = meta.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(div().size(px(6.0)).rounded_full().bg(theme.primary))
-                    .child(div().child("unread")),
-            );
-        }
-        if session.is_ssh || session.needs_attention {
-            card_inner = card_inner.child(meta);
-        }
+        let card_inner = sidebar_hover_content(session, window, cx);
+        let theme = cx.theme();
 
         let card = div()
             .id("tab-sidebar-hover-card")
@@ -1728,21 +1585,7 @@ impl SessionSidebar {
         let drag_in_sidebar = cx.has_active_drag() && self.drag_preview.borrow().is_some();
 
         for i in 0..total {
-            let session_clone = SessionEntry {
-                id: self.sessions[i].id,
-                name: self.sessions[i].name.clone(),
-                subtitle: self.sessions[i].subtitle.clone(),
-                is_ssh: self.sessions[i].is_ssh,
-                needs_attention: self.sessions[i].needs_attention,
-                status: self.sessions[i].status,
-                status_detail: self.sessions[i].status_detail.clone(),
-                terminal_titles: self.sessions[i].terminal_titles.clone(),
-                icon: self.sessions[i].icon,
-                pane_icons: self.sessions[i].pane_icons.clone(),
-                has_user_label: self.sessions[i].has_user_label,
-                pane_count: self.sessions[i].pane_count,
-                color: self.sessions[i].color,
-            };
+            let session_clone = self.sessions[i].clone();
             let row = self.render_panel_row(
                 i,
                 &session_clone,
@@ -2004,12 +1847,16 @@ impl SessionSidebar {
                 theme.muted_foreground
             })
             .tooltip({
-                let detail = sidebar_row_detail(session);
+                let sidebar = cx.entity().downgrade();
                 move |window, cx| {
-                    Tooltip::new(detail.clone())
-                        .font_family(cx.theme().font_family.clone())
-                        .text_size(ui_px(cx.theme(), 12.0))
-                        .max_w(px(360.0))
+                    let width = (window.viewport_size().width.as_f32() - 48.0).clamp(1.0, 304.0);
+                    let details = cx
+                        .new(|cx| SidebarHoverDetails::new(sidebar.clone(), session_id, width, cx));
+                    Tooltip::element(move |_, _| details.clone())
+                        .p_0()
+                        .border_0()
+                        .shadow(Vec::new())
+                        .rounded(px(10.0))
                         .build(window, cx)
                 }
             })
@@ -2243,13 +2090,377 @@ fn sidebar_tab_icon(icon: &'static str) -> &'static str {
     crate::assets::tab_identity_asset(icon)
 }
 
-fn sidebar_row_detail(session: &SessionEntry) -> String {
-    std::iter::once(session.name.as_str())
-        .chain(session.subtitle.as_deref())
-        .chain(session.status_detail.as_deref())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+/// An open component tooltip follows live tab facts without subscribing the
+/// sidebar to animation frames or holding a stale copy from mouse entry.
+struct SidebarHoverDetails {
+    sidebar: WeakEntity<SessionSidebar>,
+    session_id: u64,
+    width: f32,
+}
+
+impl SidebarHoverDetails {
+    fn new(
+        sidebar: WeakEntity<SessionSidebar>,
+        session_id: u64,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        if let Some(sidebar) = sidebar.upgrade() {
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+        }
+        Self {
+            sidebar,
+            session_id,
+            width,
+        }
+    }
+}
+
+impl Render for SidebarHoverDetails {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let session = self.sidebar.upgrade().and_then(|sidebar| {
+            sidebar
+                .read(cx)
+                .sessions
+                .iter()
+                .find(|session| session.id == self.session_id)
+                .cloned()
+        });
+        session
+            .map(|session| {
+                sidebar_hover_content(&session, window, cx)
+                    .w(px(self.width))
+                    .id("live-tab-details")
+                    .max_h(px((window.viewport_size().height.as_f32() - 48.0).max(1.0)))
+                    .overflow_y_scroll()
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| div().into_any_element())
+    }
+}
+
+/// Shared by the expanded navigator tooltip and compact rail hover card.
+/// Keep metadata out of the permanent single-line rows.
+fn multi_pane_hover_content(session: &SessionEntry, window: &mut Window, cx: &mut App) -> Div {
+    let theme = cx.theme().clone();
+    let layer = window.use_keyed_state(
+        gpui::ElementId::NamedInteger("pane-hover-activity".into(), session.id),
+        cx,
+        |window, cx| cx.new(|cx| crate::tab_activity::TabActivity::new(window, cx)),
+    );
+    let layer = layer.read(cx).clone();
+    layer.read(cx).clear();
+    let size = ui_icon_px(&theme, 16.0);
+    let secondary = theme.popover.blend(theme.foreground.opacity(0.72));
+    let mut rows = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .px(px(12.0))
+        .pb(px(12.0));
+    for pane in &session.pane_details {
+        let activity = pane.status.filter(|status| {
+            !matches!(
+                status.activity,
+                con_core::terminal_status::Activity::Idle
+                    | con_core::terminal_status::Activity::Unknown
+            )
+        });
+        let marker = activity.map(|status| layer.read(cx).status_marker(status, size, &theme));
+        let mut text = div().flex_1().min_w_0().flex().flex_col().child(
+            div()
+                .debug_selector({
+                    let id = pane.id;
+                    move || format!("pane-hover-title-{id}")
+                })
+                .text_size(ui_px(&theme, 12.0))
+                .line_height(ui_px(&theme, 18.0))
+                .text_color(theme.foreground)
+                .child(pane.title.clone()),
+        );
+        if let Some(directory) = &pane.directory
+            && directory != &pane.title
+        {
+            text = text.child(
+                div()
+                    .debug_selector({
+                        let id = pane.id;
+                        move || format!("pane-hover-path-{id}")
+                    })
+                    .mt(px(4.0))
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(ui_px(&theme, 11.0))
+                    .line_height(ui_px(&theme, 16.0))
+                    .text_color(secondary)
+                    .child(directory.clone()),
+            );
+        }
+        rows = rows.child(
+            div()
+                .id(gpui::ElementId::NamedInteger("pane-detail".into(), pane.id))
+                .debug_selector({
+                    let id = pane.id;
+                    move || format!("pane-hover-row-{id}")
+                })
+                .flex_shrink_0()
+                .flex()
+                .items_start()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .mt(px(1.0))
+                        .flex_none()
+                        .child(crate::assets::tab_identity_icon(
+                            pane.icon,
+                            size,
+                            theme.foreground,
+                        )),
+                )
+                .child(text)
+                .child(
+                    div()
+                        .id("pane-state")
+                        .relative()
+                        .flex_none()
+                        .size(size)
+                        .role(gpui::Role::Label)
+                        .aria_label(pane.status_label.clone())
+                        .children(marker),
+                )
+                .when_some(
+                    activity.and_then(|status| status.percent),
+                    |row, percent| row.child(hover_progress(percent, &theme)),
+                ),
+        );
+    }
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .rounded(px(10.0))
+        .bg(gpui::linear_gradient(
+            180.0,
+            gpui::linear_color_stop(
+                theme
+                    .popover
+                    .blend(
+                        theme
+                            .foreground
+                            .opacity(if theme.is_dark() { 0.055 } else { 0.032 }),
+                    ),
+                0.0,
+            ),
+            gpui::linear_color_stop(theme.popover.blend(theme.foreground.opacity(0.008)), 1.0),
+        ))
+        .font_family(theme.font_family.clone())
+        .child(
+            div()
+                .debug_selector(|| "tab-hover-heading".into())
+                .px(px(12.0))
+                .py(px(12.0))
+                .text_size(ui_px(&theme, 13.0))
+                .line_height(ui_px(&theme, 20.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .child(session.name.clone()),
+        )
+        .child(rows)
+        .child(layer)
+}
+
+fn hover_progress(percent: u8, theme: &gpui_component::Theme) -> Div {
+    div()
+        .debug_selector(|| "tab-hover-progress".into())
+        .flex_none()
+        .w(ui_px(theme, 28.0))
+        .text_size(ui_px(theme, 11.0))
+        .text_color(theme.popover.blend(theme.foreground.opacity(0.72)))
+        .font_family(theme.mono_font_family.clone())
+        .child(format!("{percent}%"))
+}
+
+fn sidebar_hover_content(session: &SessionEntry, window: &mut Window, cx: &mut App) -> Div {
+    if session.pane_count > 1 {
+        return multi_pane_hover_content(session, window, cx);
+    }
+    let theme = cx.theme().clone();
+    let theme = &theme;
+    let application = session
+        .status_detail
+        .as_ref()
+        .and_then(|detail| detail.content.application.as_deref());
+    let app_icon = crate::assets::agent_cli_icon(application);
+    let icons = app_icon
+        .as_ref()
+        .map(std::slice::from_ref)
+        .unwrap_or_else(|| session.identity_icons());
+    let status_marker = session.status.map(|status| {
+        let layer = window.use_keyed_state(
+            gpui::ElementId::NamedInteger("tab-hover-activity".into(), session.id),
+            cx,
+            // Keep the keyed owner inert: animation notifications belong to
+            // the mounted layer, never the containing sidebar or tooltip.
+            |window, cx| cx.new(|cx| crate::tab_activity::TabActivity::new(window, cx)),
+        );
+        let layer = layer.read(cx).clone();
+        let size = ui_icon_px(theme, 16.0);
+        let label = session
+            .status_detail
+            .as_ref()
+            .map(|detail| detail.content.status.clone())
+            .unwrap_or_else(|| format!("{:?}", status.activity));
+        let activity = layer.read(cx);
+        activity.clear();
+        let marker = activity.status_marker(status, size, theme);
+        div()
+            .id("tab-hover-status")
+            .debug_selector(|| "tab-hover-status".into())
+            .role(gpui::Role::Label)
+            .aria_label(label)
+            .relative()
+            .flex_none()
+            .size(size)
+            .child(marker)
+            .child(layer)
+            .into_any_element()
+    });
+    let secondary = theme.popover.blend(theme.foreground.opacity(0.72));
+    let mut header = div()
+        .debug_selector(|| "tab-hover-summary".into())
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .px(px(12.0))
+        .py(px(12.0))
+        .font_family(theme.font_family.clone())
+        .child(
+            div()
+                .debug_selector(|| "tab-hover-heading".into())
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .debug_selector(|| "tab-hover-name".into())
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(ui_px(theme, 13.0))
+                        .line_height(ui_px(theme, 20.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(session.name.clone()),
+                )
+                .child(crate::assets::tab_identity_group(
+                    icons,
+                    ui_icon_px(theme, 16.0),
+                    theme.foreground,
+                    false,
+                    theme,
+                ))
+                .children(status_marker)
+                .when_some(
+                    session.status.and_then(|status| status.percent),
+                    |row, percent| row.child(hover_progress(percent, theme)),
+                ),
+        );
+    if let Some(app) = application
+        && app_icon.is_none()
+        && !app.eq_ignore_ascii_case(&session.name)
+    {
+        header = header.child(
+            div()
+                .mt(px(4.0))
+                .text_size(ui_px(theme, 11.0))
+                .line_height(ui_px(theme, 16.0))
+                .text_color(secondary)
+                .child(app.to_string()),
+        );
+    }
+    let mut content = div()
+        .flex()
+        .flex_col()
+        .px(px(12.0))
+        .pb(px(12.0))
+        .font_family(theme.font_family.clone());
+    let mut has_body = false;
+    if let Some(context) = session
+        .status_detail
+        .as_ref()
+        .and_then(|detail| detail.content.context.as_ref())
+    {
+        content = content.child(
+            div()
+                .debug_selector(|| "tab-hover-context".into())
+                .flex_shrink_0()
+                .text_size(ui_px(theme, 12.0))
+                .line_height(ui_px(theme, 18.0))
+                .text_color(theme.foreground)
+                .child(context.clone()),
+        );
+        has_body = true;
+    }
+    if let Some(path) = session
+        .status_detail
+        .as_ref()
+        .and_then(|detail| detail.source_path.as_ref())
+        .or(session.subtitle.as_ref())
+    {
+        content = content.child(
+            div()
+                .debug_selector(|| "tab-hover-path".into())
+                .flex_shrink_0()
+                .mt(px(if has_body { 8.0 } else { 0.0 }))
+                .w_full()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(ui_px(theme, 11.0))
+                .line_height(ui_px(theme, 16.0))
+                .text_color(secondary)
+                .child(path.clone()),
+        );
+        has_body = true;
+    }
+    let mut metadata: Vec<&str> = Vec::new();
+    if session.is_ssh {
+        metadata.push("SSH");
+    }
+    if session.needs_attention {
+        metadata.push("Unread activity");
+    }
+    if !metadata.is_empty() {
+        content = content.child(
+            div()
+                .debug_selector(|| "tab-hover-meta".into())
+                .flex_shrink_0()
+                .mt(px(if has_body { 8.0 } else { 0.0 }))
+                .text_size(ui_px(theme, 10.5))
+                .line_height(ui_px(theme, 14.0))
+                .text_color(secondary)
+                .child(metadata.join(" · ")),
+        );
+        has_body = true;
+    }
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(10.0))
+        .bg(gpui::linear_gradient(
+            180.0,
+            gpui::linear_color_stop(
+                theme
+                    .popover
+                    .blend(
+                        theme
+                            .foreground
+                            .opacity(if theme.is_dark() { 0.055 } else { 0.032 }),
+                    ),
+                0.0,
+            ),
+            gpui::linear_color_stop(theme.popover.blend(theme.foreground.opacity(0.008)), 1.0),
+        ))
+        .font_family(theme.font_family.clone())
+        .child(header)
+        .when(has_body, |view| view.child(content))
 }
 
 fn sanitize_tab_accent_alpha(alpha: f32) -> f32 {
@@ -2846,6 +3057,88 @@ mod tests {
         }
     }
 
+    struct TabDetailsTestView {
+        session: super::SessionEntry,
+        width: f32,
+    }
+
+    impl gpui::Render for TabDetailsTestView {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::{InteractiveElement, Styled};
+            super::sidebar_hover_content(&self.session, window, cx)
+                .debug_selector(|| "details-content".into())
+                .w(px(self.width))
+        }
+    }
+
+    #[gpui::test]
+    fn shared_hover_details_wrap_long_context_without_losing_metadata(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        for mode in [
+            gpui_component::ThemeMode::Light,
+            gpui_component::ThemeMode::Dark,
+        ] {
+            for (width, font_size) in [(232.0, 16.0), (304.0, 16.0), (304.0, 24.0)] {
+                let (_, view) = cx.add_window_view(|_, cx| {
+                    gpui_component::Theme::change(mode, None, cx);
+                    gpui_component::Theme::update(cx, |theme| theme.font_size = px(font_size));
+                    let mut entry = session(
+                        Some(con_core::terminal_status::Status {
+                            surface_id: 1,
+                            activity: con_core::terminal_status::Activity::Busy,
+                            evidence: con_core::terminal_status::Evidence::ProgramStatus,
+                            percent: None,
+                        }),
+                        None,
+                    );
+                    entry.status_detail = Some(super::ProgramStatusDetail {
+                        content: con_core::program_status::ProgramDetail {
+                            application: Some("opencode".into()),
+                            scope: Some("ses_e8706effeCn9UcgQrtNYJXJ".into()),
+                            status: "Working".into(),
+                            context: Some(
+                                "Inspect completion configuration and shell paths".into(),
+                            ),
+                        },
+
+                        source_path: None,
+                    });
+                    entry.name = "Terminal configuration and shell completion verification".into();
+                    entry.subtitle = Some("~/dev/项目/nowledge-labs-website/nowledge-mem".into());
+                    TabDetailsTestView {
+                        session: entry,
+                        width,
+                    }
+                });
+                let content = view.debug_bounds("details-content").unwrap();
+                let surface = view.debug_bounds("tab-hover-summary").unwrap();
+                assert_eq!(surface.left(), content.left());
+                assert_eq!(surface.right(), content.right());
+                let context = view.debug_bounds("tab-hover-context").unwrap();
+                assert!(surface.bottom() <= context.top());
+                let heading = view.debug_bounds("tab-hover-heading").unwrap();
+                let name = view.debug_bounds("tab-hover-name").unwrap();
+                let path = view.debug_bounds("tab-hover-path").unwrap();
+                let status = view.debug_bounds("tab-hover-status").unwrap();
+                assert!(name.size.height > px(18.0), "full long title must wrap");
+                assert!(status.top() >= heading.top());
+                assert!(status.bottom() <= heading.bottom());
+                assert!(status.bottom() < path.top());
+                for bounds in [heading, path, status] {
+                    assert!(bounds.left() >= content.left() + px(12.0));
+                    assert!(bounds.right() <= content.right() - px(12.0));
+                    assert!(bounds.bottom() <= content.bottom() - px(12.0));
+                }
+            }
+        }
+    }
+
     #[gpui::test]
     fn hover_details_anchor_to_the_tile_and_omit_redundant_single_pane_metadata(
         cx: &mut gpui::TestAppContext,
@@ -2894,13 +3187,24 @@ mod tests {
                     ),
                     is_ssh: true,
                     needs_attention: true,
-                    status: None,
-                    status_detail: Some("build/test · blocked · permission · 40% — Apply?".into()),
-                    terminal_titles: vec!["build".into(), "logs".into()],
+                    status: Some(con_core::terminal_status::Status {
+                        surface_id: 1,
+                        activity: con_core::terminal_status::Activity::NeedsInput,
+                        evidence: con_core::terminal_status::Evidence::ProgramStatus,
+                        percent: None,
+                    }),
+                    status_detail: Some(super::ProgramStatusDetail {
+                        source_path: Some(
+                            "/project/a-long-parent-directory/another-long-directory/server".into(),
+                        ),
+                        ..test_status_detail("Waiting for permission · 40%".into())
+                    }),
+
                     icon: "phosphor/terminal.svg",
                     pane_icons: Vec::new(),
+                    pane_details: Vec::new(),
                     has_user_label: true,
-                    pane_count: 2,
+                    pane_count: 1,
                     color: None,
                 }];
                 sidebar
@@ -2909,19 +3213,19 @@ mod tests {
         let card = cx.debug_bounds("tab-hover-card").expect("hover card");
         let heading = cx.debug_bounds("tab-hover-heading").expect("heading");
         let name = cx.debug_bounds("tab-hover-name").expect("name");
-        let count = cx.debug_bounds("tab-hover-pane-count").expect("pane count");
         let path = cx.debug_bounds("tab-hover-path").expect("path");
         let status = cx.debug_bounds("tab-hover-status").expect("status");
         let meta = cx.debug_bounds("tab-hover-meta").expect("metadata");
         assert_eq!(heading.left() - card.left(), px(12.0));
         assert_eq!(card.right() - heading.right(), px(12.0));
-        assert_eq!(heading.top() - card.top(), px(10.0));
-        assert_eq!(card.bottom() - meta.bottom(), px(10.0));
-        assert!(name.right() <= count.left());
-        assert!(name.bottom() <= path.top());
-        assert!(path.bottom() <= status.top());
-        assert!(status.bottom() <= meta.top());
-        assert_eq!(status.left() - card.left(), px(12.0));
+        assert_eq!(heading.top() - card.top(), px(12.0));
+        assert_eq!(card.bottom() - meta.bottom(), px(12.0));
+        assert!(name.right() <= status.left());
+        assert!(status.top() >= heading.top());
+        assert!(status.bottom() < path.top());
+        assert!(path.bottom() <= meta.top());
+        assert!(status.right() <= heading.right());
+        assert_eq!(path.left(), name.left());
         assert!(
             path.size.height > px(16.0),
             "long paths wrap instead of losing their tail"
@@ -2936,7 +3240,15 @@ mod tests {
             HoverCardTestView(cx.new(|cx| {
                 let mut sidebar = SessionSidebar::new(cx);
                 sidebar.hovered_rail = Some(0);
-                sidebar.sessions = vec![session(None, Some("Ready".into()))];
+                sidebar.sessions = vec![session(
+                    Some(con_core::terminal_status::Status {
+                        surface_id: 1,
+                        activity: con_core::terminal_status::Activity::Busy,
+                        evidence: con_core::terminal_status::Evidence::ProgramStatus,
+                        percent: None,
+                    }),
+                    Some("Working".into()),
+                )];
                 sidebar
             }))
         });
@@ -2948,20 +3260,217 @@ mod tests {
                 gpui_component::Theme::change(mode, None, cx);
             });
             let mut heights = Vec::new();
-            for (font_size, expected_height) in [(12.0, 12.0), (16.0, 16.0), (24.0, 24.0)] {
+            for (font_size, expected_height) in [(12.0, 14.4), (16.0, 16.0), (24.0, 21.6)] {
                 cx.update(|_, cx| {
                     gpui_component::Theme::update(cx, |theme| theme.font_size = px(font_size));
                 });
                 view.update(cx, |_, cx| cx.notify());
-                let status = cx.debug_bounds("tab-hover-status").expect("status label");
+                let status = cx.debug_bounds("tab-hover-status").expect("status marker");
                 assert!((status.size.height.as_f32() - expected_height).abs() < 0.5);
                 let path = cx.debug_bounds("tab-hover-path").expect("path");
-                assert!(path.bottom() <= status.top());
+                assert!(status.bottom() < path.top());
                 assert!(cx.debug_bounds("tab-hover-meta").is_none());
                 heights.push(status.size.height.as_f32());
             }
             assert!(heights[0] < heights[1] && heights[1] < heights[2]);
         }
+    }
+
+    #[gpui::test]
+    fn multi_pane_hover_exposes_every_panes_own_task_and_directory(cx: &mut gpui::TestAppContext) {
+        use con_core::terminal_status::{Activity, Evidence, Status};
+        cx.update(gpui_component::init);
+        for mode in [
+            gpui_component::ThemeMode::Light,
+            gpui_component::ThemeMode::Dark,
+        ] {
+            for count in [2, 6] {
+                let (_, cx) = cx.add_window_view(|_, cx| {
+                    gpui_component::Theme::change(mode, None, cx);
+                    let mut session = session(None, None);
+                    session.pane_count = count;
+                    session.pane_details = (0..count)
+                        .map(|id| super::PaneHoverDetail {
+                            id: id as u64,
+                            icon: if id == 0 {
+                                "agents/codex.svg"
+                            } else {
+                                "phosphor/terminal.svg"
+                            },
+                            title: if id == 0 {
+                                "Reviewing terminal chrome".into()
+                            } else {
+                                format!("service-{id}")
+                            },
+                            directory: Some(format!("/project/service-{id}")),
+                            status: Some(Status {
+                                surface_id: id as u64,
+                                activity: if id == 0 {
+                                    Activity::NeedsInput
+                                } else {
+                                    Activity::Busy
+                                },
+                                evidence: Evidence::ProgramStatus,
+                                percent: None,
+                            }),
+                            status_label: if id == 0 {
+                                "Waiting for permission".into()
+                            } else {
+                                "Working".into()
+                            },
+                        })
+                        .collect();
+                    TabDetailsTestView {
+                        session,
+                        width: 304.0,
+                    }
+                });
+                let mut previous = cx.debug_bounds("tab-hover-heading").unwrap();
+                for id in 0..count {
+                    let row = cx
+                        .debug_bounds(
+                            [
+                                "pane-hover-row-0",
+                                "pane-hover-row-1",
+                                "pane-hover-row-2",
+                                "pane-hover-row-3",
+                                "pane-hover-row-4",
+                                "pane-hover-row-5",
+                            ][id],
+                        )
+                        .expect("every physical pane has a readable row");
+                    let title = cx
+                        .debug_bounds(
+                            [
+                                "pane-hover-title-0",
+                                "pane-hover-title-1",
+                                "pane-hover-title-2",
+                                "pane-hover-title-3",
+                                "pane-hover-title-4",
+                                "pane-hover-title-5",
+                            ][id],
+                        )
+                        .unwrap();
+                    let path = cx
+                        .debug_bounds(
+                            [
+                                "pane-hover-path-0",
+                                "pane-hover-path-1",
+                                "pane-hover-path-2",
+                                "pane-hover-path-3",
+                                "pane-hover-path-4",
+                                "pane-hover-path-5",
+                            ][id],
+                        )
+                        .unwrap();
+                    assert!(previous.bottom() <= row.top());
+                    assert!(title.bottom() <= path.top());
+                    assert!(path.right() <= row.right());
+                    previous = row;
+                }
+                assert!(cx.debug_bounds("tab-hover-pane-count").is_none());
+                assert!(cx.debug_bounds("tab-hover-meta").is_none());
+                cx.update(|window, _| window.activate_window());
+                assert!(
+                    cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
+                    "multiple working panes keep their shared activity layer alive"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn open_hover_details_follow_live_status_updates(cx: &mut gpui::TestAppContext) {
+        use con_core::terminal_status::{Activity, Evidence, Status};
+        use gpui::AppContext;
+        cx.update(gpui_component::init);
+        let sidebar = cx.new(|cx| {
+            let mut sidebar = SessionSidebar::new(cx);
+            sidebar.sessions = vec![session(
+                Some(Status {
+                    surface_id: 1,
+                    activity: Activity::Busy,
+                    evidence: Evidence::ProgramStatus,
+                    percent: None,
+                }),
+                Some("Working".into()),
+            )];
+            sidebar
+        });
+        let id = sidebar.read_with(cx, |sidebar, _| sidebar.sessions[0].id);
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            super::SidebarHoverDetails::new(sidebar.downgrade(), id, 304.0, cx)
+        });
+        assert!(cx.debug_bounds("tab-hover-status").is_some());
+        assert!(cx.debug_bounds("tab-status-glyph").is_none());
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.sessions[0].status.as_mut().unwrap().activity = Activity::NeedsInput;
+            cx.notify();
+        });
+        assert!(
+            cx.debug_bounds("tab-status-glyph").is_some(),
+            "open tooltip must follow attention updates"
+        );
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.sessions[0].status.as_mut().unwrap().activity = Activity::Done;
+            cx.notify();
+        });
+        assert!(cx.debug_bounds("tab-status-glyph").is_none());
+        assert!(
+            cx.debug_bounds("tab-notification-dot").is_some(),
+            "completion must replace the previous graphic"
+        );
+    }
+
+    #[gpui::test]
+    fn hover_status_transitions_keep_the_header_stable(cx: &mut gpui::TestAppContext) {
+        use con_core::terminal_status::{Activity, Evidence, Status};
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, _| TabDetailsTestView {
+            session: session(
+                Some(Status {
+                    surface_id: 1,
+                    activity: Activity::Busy,
+                    evidence: Evidence::ProgramStatus,
+                    percent: None,
+                }),
+                Some("Working".into()),
+            ),
+            width: 304.0,
+        });
+        let initial = cx.debug_bounds("tab-hover-status").expect("busy marker");
+        let name = cx.debug_bounds("tab-hover-name").expect("name");
+        for reduced in [false, true] {
+            cx.update(|_, cx| cx.set_reduce_motion(reduced));
+            for activity in [
+                Activity::Busy,
+                Activity::NeedsInput,
+                Activity::Paused,
+                Activity::Error,
+                Activity::Done,
+                Activity::Idle,
+            ] {
+                view.update(cx, |view, cx| {
+                    view.session.status.as_mut().unwrap().activity = activity;
+                    cx.notify();
+                });
+                assert_eq!(cx.debug_bounds("tab-hover-status").unwrap(), initial);
+                assert_eq!(cx.debug_bounds("tab-hover-name").unwrap(), name);
+                assert!(cx.debug_bounds("tab-hover-progress").is_none());
+            }
+        }
+        view.update(cx, |view, cx| {
+            let status = view.session.status.as_mut().unwrap();
+            status.activity = Activity::Busy;
+            status.percent = Some(37);
+            cx.notify();
+        });
+        let marker = cx.debug_bounds("tab-hover-status").unwrap();
+        let progress = cx
+            .debug_bounds("tab-hover-progress")
+            .expect("determinate progress");
+        assert_eq!(marker.size, initial.size);
+        assert!(marker.right() <= progress.left());
     }
 
     #[gpui::test]
@@ -3059,6 +3568,19 @@ mod tests {
         })
     }
 
+    fn test_status_detail(status: String) -> super::ProgramStatusDetail {
+        super::ProgramStatusDetail {
+            content: con_core::program_status::ProgramDetail {
+                application: None,
+                scope: None,
+                status,
+                context: None,
+            },
+
+            source_path: None,
+        }
+    }
+
     fn session(
         status: Option<con_core::terminal_status::Status>,
         status_detail: Option<String>,
@@ -3070,10 +3592,11 @@ mod tests {
             is_ssh: false,
             needs_attention: false,
             status,
-            status_detail,
-            terminal_titles: Vec::new(),
+            status_detail: status_detail.map(test_status_detail),
+
             icon: "phosphor/terminal.svg",
             pane_icons: Vec::new(),
+            pane_details: Vec::new(),
             has_user_label: true,
             pane_count: 1,
             color: None,
@@ -3454,9 +3977,10 @@ mod tests {
                     needs_attention: false,
                     status: None,
                     status_detail: None,
-                    terminal_titles: Vec::new(),
+
                     icon: "phosphor/terminal.svg",
                     pane_icons: Vec::new(),
+                    pane_details: Vec::new(),
                     has_user_label: false,
                     pane_count: 1,
                     color: None,
@@ -3689,23 +4213,5 @@ mod tests {
             reopened,
             active_generation
         ));
-    }
-
-    #[test]
-    fn single_line_tabs_keep_full_context_in_the_tooltip() {
-        for path in [
-            "/tmp/con-sidebar-verification/project",
-            "~/dev/项目/.config/",
-            r"C:\Users\dev\project\",
-            r"\\server\share\project",
-        ] {
-            let mut entry = session(None, Some("Waiting for approval".into()));
-            entry.name = "A long title that is truncated in the row".into();
-            entry.subtitle = Some(path.into());
-            assert_eq!(
-                super::sidebar_row_detail(&entry),
-                format!("{}\n{}\nWaiting for approval", entry.name, path)
-            );
-        }
     }
 }

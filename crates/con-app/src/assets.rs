@@ -592,3 +592,33 @@ mod tests {
         }
     }
 }
+
+/// Map a cached agent-CLI classification to its brand logo.
+///
+/// Unknown values and `None` fall through so the existing SSH / AI /
+/// heuristic icon path can run.
+pub(crate) fn agent_cli_icon(agent_cli: Option<&str>) -> Option<&'static str> {
+    match agent_cli? {
+        "codex" => Some("agents/codex.svg"),
+        "claude" => Some("agents/claude.svg"),
+        "opencode" => Some("agents/opencode.svg"),
+        "gemini" => Some("agents/gemini.svg"),
+        "herdr" => Some("agents/herdr.svg"),
+        "kimi" => Some("agents/kimi.svg"),
+        "cursor" => Some("agents/cursor.svg"),
+        "grok" => Some("agents/grok.svg"),
+        "pi" => Some("agents/pi.svg"),
+        "mimo" => Some("agents/mimo.svg"),
+        "qoder" => Some("agents/qoder.svg"),
+        "droid" => Some("agents/droid.svg"),
+        "hermes" => Some("agents/hermes.svg"),
+        "kiro" => Some("agents/kiro.svg"),
+        "cline" => Some("agents/cline.svg"),
+        "qwen" => Some("agents/qwen.svg"),
+        "amp" => Some("agents/amp.svg"),
+        "kilo" => Some("agents/kilo.svg"),
+        "goose" => Some("agents/goose.svg"),
+        "dim" => Some("agents/dim.svg"),
+        _ => None,
+    }
+}

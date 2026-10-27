@@ -197,6 +197,10 @@ impl SurfaceStatus {
         self.program.detail_line()
     }
 
+    pub fn program_detail_parts(&self) -> Option<program_status::ProgramDetail> {
+        self.program.detail()
+    }
+
     /// Replace a backend-reduced snapshot; intermediate lifecycle events have
     /// already been applied in order before this bounded UI handoff.
     pub fn replace_program_status(&mut self, program: SurfaceProgramStatus) {

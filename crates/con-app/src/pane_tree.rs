@@ -955,7 +955,23 @@ impl PaneTree {
         }
     }
 
-    /// Get all pane IDs with their terminal panes
+    /// Physical panes in tree order, including editors and inactive zoom siblings.
+    pub(crate) fn pane_ids(&self) -> Vec<PaneId> {
+        fn collect(node: &PaneNode, ids: &mut Vec<PaneId>) {
+            match node {
+                PaneNode::Leaf { id, .. } => ids.push(*id),
+                PaneNode::Split { first, second, .. } => {
+                    collect(first, ids);
+                    collect(second, ids);
+                }
+            }
+        }
+        let mut ids = Vec::new();
+        collect(&self.root, &mut ids);
+        ids
+    }
+
+    /// Get all pane IDs with their terminal panes.
     pub fn pane_terminals(&self) -> Vec<(PaneId, TerminalPane)> {
         let mut result = Vec::new();
         Self::collect_pane_terminals(&self.root, &mut result);

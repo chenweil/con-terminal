@@ -77,7 +77,6 @@ pub(crate) fn notification_label(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn notification_dot(color: Hsla) -> gpui::Stateful<gpui::Div> {
     div()
         .id("tab-notification-dot")
@@ -223,6 +222,31 @@ impl TabActivity {
 
     pub(crate) fn clear(&self) {
         self.markers.borrow_mut().used = 0;
+    }
+
+    /// A small standalone status slot for hover details. Busy/progress/attention
+    /// use exactly the tab painter; completion remains an unread dot.
+    pub(crate) fn status_marker(
+        &self,
+        status: Status,
+        size: Pixels,
+        theme: &gpui_component::Theme,
+    ) -> AnyElement {
+        match status.activity {
+            Activity::Done => div()
+                .size(size)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(notification_dot(theme.primary).aria_label("Completed"))
+                .into_any_element(),
+            Activity::Idle | Activity::Unknown => svg()
+                .path("phosphor/minus.svg")
+                .size(size)
+                .text_color(theme.muted_foreground)
+                .into_any_element(),
+            _ => self.icon_group(&[], size, theme.foreground, Some(status), theme, false),
+        }
     }
 
     /// Keeps the caller's original icon slot. Compact working states retain the

@@ -655,14 +655,7 @@ impl ConWorkspace {
                 .get(&tab.summary_id)
                 .copied()
                 .flatten(),
-            status_detail: self.program_status_detail(tab.summary_id),
-            terminal_titles: tab
-                .pane_tree
-                .all_surface_terminals()
-                .into_iter()
-                .filter_map(|terminal| terminal.cached_title(cx))
-                .filter(|title| !title.is_empty())
-                .collect(),
+            status_detail: self.program_status_context(tab.summary_id),
             icon: presentation.icon,
             pane_icons: if tab.pane_tree.pane_count() > 1 {
                 let mut icons = Vec::new();
@@ -676,6 +669,12 @@ impl ConWorkspace {
             } else {
                 vec![crate::assets::tab_identity_asset(presentation.icon)]
             },
+            pane_details: self
+                .terminal_presentation
+                .pane_details
+                .get(&tab.summary_id)
+                .cloned()
+                .unwrap_or_default(),
             has_user_label: tab.user_label.is_some(),
             pane_count,
             color: tab.color,

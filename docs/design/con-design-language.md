@@ -237,6 +237,23 @@ It should feel like the best place to do terminal-native work in the AI era.
   at larger UI font sizes. Reserve only one trailing action slot so long
   titles do not lose width to invisible controls. Use the same identity assets
   in the sidebar drag preview.
+- Expanded tooltips and compact hover cards share one continuous rounded surface,
+  with a very slight neutral light falloff, no header slab, borders or shadows.
+  A single-pane detail groups the full name, application logo and graphical
+  state, followed by its explanation and working directory. A multi-pane card
+  shows one compact, spatially ordered row per physical pane: application icon,
+  meaningful task/context or application/folder name, its own state and directory.
+  Include editors by filename and parent directory. Do not substitute a pane
+  count or only the aggregate winner for this overview. Do not dump raw commands
+  or internal pane/surface numbers into it. Keep the stack on the tab itself.
+  Known activity uses the shared retained painter instead of prose status;
+  completion remains a notification dot and determinate progress retains its
+  percentage. Idle rows need no status glyph. Preserve exact accessibility labels.
+  Open cards follow every pane's retained facts, including non-winning changes;
+  use one retained activity layer for all rows and bound long lists by scrolling.
+  Paths wrap; prose uses the system font and paths use the mono font.
+  Keep timestamps and group headers out of default rows unless they represent
+  a feature with reliable source data and persistence semantics.
 - Close uses a hover-only component button with a small circular fill and thin
   cross. Keep rename available through double-click and the context menu, and
   preserve the existing tooltip,
