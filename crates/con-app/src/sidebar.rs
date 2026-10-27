@@ -1329,6 +1329,7 @@ impl SessionSidebar {
         let max_height = (window.viewport_size().height.as_f32() - min_top - 8.0).clamp(1.0, 240.0);
 
         let card_inner = sidebar_hover_content(session, window, cx);
+        #[cfg(target_os = "macos")]
         let theme = cx.theme();
 
         let card = div()
