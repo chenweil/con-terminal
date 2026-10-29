@@ -4,6 +4,30 @@ All notable changes to con are documented here.
 
 con is still pre-release, so entries may group related beta work while the product shape is stabilizing.
 
+## `v0.1.0-beta.161`
+
+### Changed
+
+**Terminal**
+
+- Update the embedded terminal engine to Ghostty 1.4.0 while preserving con's
+  program-status reporting. Source builds now require Zig 0.17.0.
+  _(PR [#532](https://github.com/nowledge-co/con-terminal/pull/532) by [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Terminal security**
+
+- Include upstream terminal-core security fixes and route macOS clipboard/drop
+  text through protected paste handling. Rejected unsafe paste retains the
+  completed-program notification.
+  _(PR [#532](https://github.com/nowledge-co/con-terminal/pull/532) by [@wey-gu](https://github.com/wey-gu))_
+
+**Builds**
+
+- Correct dependency-cache reuse with Zig 0.17.0 across native builds.
+  _(PR [#532](https://github.com/nowledge-co/con-terminal/pull/532) by [@wey-gu](https://github.com/wey-gu))_
+
 ## `v0.1.0-beta.160` - 2026-10-27
 
 ### Changed
