@@ -8527,6 +8527,35 @@ mod tests {
     }
 
     #[test]
+    fn clearing_pruned_scrollback_preserves_cursor_style_and_hyperlink() {
+        // Exercise the host's feed/snapshot path across recycled pages, not
+        // just Ghostty's internal Screen tests (GHSA-w9q4-5jvv-mcv4).
+        let screen = VtScreen::new(10, 3, None).expect("create vt screen");
+        {
+            let inner = screen.inner.lock();
+            let max_lines = 0_usize;
+            let rc = unsafe {
+                ghostty_terminal_set(
+                    inner.terminal,
+                    GhosttyTerminalOption::ScrollbackMaxLines,
+                    &max_lines as *const _ as *const c_void,
+                )
+            };
+            assert_eq!(rc, GHOSTTY_SUCCESS);
+        }
+        for _ in 0..256 {
+            screen.feed(b"\x1b[0m\x1b]8;;\x1b\\x\r\nx\r\nx\x1b[H\x1b[1m\x1b]8;;https://example.com/retained\x1b\\\x1b[22Jy");
+            let snapshot = screen.snapshot();
+            assert_eq!(snapshot.cells[0].codepoint, 'y' as u32);
+            assert_ne!(snapshot.cells[0].attrs & ATTR_BOLD, 0);
+            assert_eq!(
+                screen.hyperlink_at(0, 0).unwrap().as_deref(),
+                Some("https://example.com/retained")
+            );
+        }
+    }
+
+    #[test]
     fn terminal_clipboard_writes_require_opt_in_and_coalesce_pending_text() {
         let screen = VtScreen::new(80, 24, None).expect("create vt screen");
         let policy = Arc::new(ClipboardWritePolicy::new(true));
@@ -8675,13 +8704,17 @@ mod tests {
 
         output.lock().clear();
         let unsafe_text = "echo first\necho second";
-        assert_eq!(
-            screen
-                .paste_text(unsafe_text, VtPasteSource::Clipboard, false)
-                .expect("check unsafe paste"),
-            VtPasteResult::RequiresConfirmation
-        );
-        assert!(output.lock().is_empty(), "rejected paste wrote to the PTY");
+        for source in [VtPasteSource::Clipboard, VtPasteSource::Text] {
+            for text in [unsafe_text, "echo first\recho second", "first\r\nsecond"] {
+                assert_eq!(
+                    screen
+                        .paste_text(text, source, false)
+                        .expect("check unsafe paste"),
+                    VtPasteResult::RequiresConfirmation
+                );
+                assert!(output.lock().is_empty(), "rejected paste wrote to the PTY");
+            }
+        }
 
         assert_eq!(
             screen
@@ -9070,13 +9103,22 @@ mod tests {
         .unwrap();
         screen.feed(b"\x1b]7501;state=done:id=job\x07");
         screen.take_program_events();
-        for query in [b"\x1b]7501;?\x07".as_slice(), b"\x1b]7501;?\x1b\\"] {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\"] {
+            let query = [b"\x1b]7501;?".as_slice(), terminator].concat();
+            // Ghostty 1.4 advertises accepted states/kinds and preserves
+            // the query's terminator. A reply is not user input.
+            let reply = [
+                b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth"
+                    .as_slice(),
+                terminator,
+            ]
+            .concat();
             output.lock().clear();
             // A query may be split across arbitrary PTY reads.
-            for byte in query {
+            for byte in &query {
                 screen.feed(std::slice::from_ref(byte));
             }
-            assert_eq!(output.lock().as_slice(), query);
+            assert_eq!(output.lock().as_slice(), reply);
             assert!(screen.take_program_events().is_empty());
         }
 

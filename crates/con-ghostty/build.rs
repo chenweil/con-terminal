@@ -13,7 +13,7 @@ use std::process::Command;
 /// forward is merged upstream.
 const GHOSTTY_REPO: &str = "https://github.com/wey-gu/ghostty.git";
 /// Pinned Ghostty revision. Bump together when updating either the
-/// macOS full-libghostty build or the Windows libghostty-vt build —
+/// macOS full-libghostty build or the Windows/Linux libghostty-vt build —
 /// both consume the same source tree to keep VT semantics in sync.
 ///
 /// 2026-08-26 bump: from `8867c37c55...` to `5f5b988c52...`. The 27 upstream
@@ -42,6 +42,12 @@ const GHOSTTY_REPO: &str = "https://github.com/wey-gu/ghostty.git";
 /// are unchanged. The optional synchronous ingress appends a runtime callback
 /// at offset 72 (runtime config size 80). The initial_output anchors still match.
 ///
+/// 2026-10-29 bump: Ghostty 1.4.0 (`83fb95624b`) plus the same scoped
+/// OSC 7501 bridge, ported to Zig 0.17. `ghostty.h` adds paste_text;
+/// existing action/layout assertions remain valid. The portable VT ABI
+/// manifest is checked by linked tests on Windows/Linux. See
+/// docs/impl/ghostty-1.4-upgrade.md for security coverage and provenance.
+///
 /// Ghostty's internal macOS embedding API and libghostty-vt API are not
 /// stable. Future bumps must update the handwritten FFI bindings, compile
 /// the ABI assertions, and run real build/link/runtime checks on all three
@@ -49,12 +55,12 @@ const GHOSTTY_REPO: &str = "https://github.com/wey-gu/ghostty.git";
 // Temporary public-fork exception authorized on 2026-10-09; #444 tracks
 // replacement with official upstream. This revision includes IO-thread
 // ingress and close/shutdown/incarnation fixes, not just the initial bridge.
-const GHOSTTY_REV: &str = "8b0ac6c4bc2b0977ef81f80d0c189b2e540f4077";
+const GHOSTTY_REV: &str = "6e68c5f446eb929f03a17bf736b56ebc0d46731b";
 const GHOSTTY_ENV: &str = "CON_GHOSTTY_SOURCE_DIR";
 const GHOSTTY_INITIAL_OUTPUT_REQUIRE_ENV: &str = "CON_REQUIRE_GHOSTTY_INITIAL_OUTPUT";
 const GHOSTTY_PREFETCH_DEPS_ENV: &str = "CON_GHOSTTY_PREFETCH_DEPS";
 const GHOSTTY_VT_TARGET_ENV: &str = "CON_GHOSTTY_VT_TARGET";
-const REQUIRED_ZIG_VERSION: &str = "0.16.0";
+const REQUIRED_ZIG_VERSION: &str = "0.17.0";
 const MAX_PREFETCH_PACKAGES: usize = 256;
 const MAX_PREFETCH_ARCHIVE_BYTES: &str = "134217728";
 
@@ -76,6 +82,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CON_GHOSTTY_OPTIMIZE");
     println!("cargo:rerun-if-env-changed=TARGET");
     println!("cargo:rerun-if-env-changed=ZIG_GLOBAL_CACHE_DIR");
+    println!("cargo:rerun-if-env-changed=ZIG_LOCAL_PKG_DIR");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
@@ -235,7 +242,15 @@ fn build_macos() {
 }
 
 fn ghostty_optimize() -> String {
-    env::var("CON_GHOSTTY_OPTIMIZE").unwrap_or_else(|_| "ReleaseFast".to_string())
+    let value = env::var("CON_GHOSTTY_OPTIMIZE").unwrap_or_else(|_| "fast".to_string());
+    // Zig 0.17 renamed these modes. Keep existing developer overrides usable.
+    match value.as_str() {
+        "Debug" => "debug".to_string(),
+        "ReleaseFast" => "fast".to_string(),
+        "ReleaseSafe" => "safe".to_string(),
+        "ReleaseSmall" => "small".to_string(),
+        _ => value,
+    }
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -317,13 +332,13 @@ fn build_vt_backend(target_os: &str) {
     // `CON_GHOSTTY_VT_EMIT_OPTION=1` (force the option-based path).
     let invocation = pick_vt_invocation(&zig_bin, &ghostty_dir, zig_global_cache_dir.as_deref());
 
-    // `-Doptimize=ReleaseFast` for terminal-class throughput. Default
+    // `-Doptimize=fast` for terminal-class throughput. Default
     // matches macOS so debug Rust builds still get a release-grade VT
     // parser — past macOS lag (resize/reflow stalls of seconds) was
     // traced to building libghostty *without* an explicit optimize
-    // flag, which left it at zig's `-ODebug`. Same risk applies on
+    // flag, which left it at Zig's debug mode. Same risk applies on
     // Windows, so default it on regardless of cargo profile and let
-    // `CON_GHOSTTY_OPTIMIZE=Debug` opt back in for VT-debugging.
+    // `CON_GHOSTTY_OPTIMIZE=debug` opt back in for VT-debugging.
     //
     // `-Dsimd`: Linux libghostty-vt must be built with libc enabled. Ghostty's
     // non-libc Wuffs module (`pkg/wuffs/src/main.zig`) exports hidden weak
@@ -762,7 +777,7 @@ fn try_apply_embedded_initial_output_patch(ghostty_dir: &Path) -> Result<(), Str
         "Con: macOS may deny directory open/stat preflight for privacy-protected cwd",
         &[(
             "            const wd = std.mem.sliceTo(c_wd, 0);\n            if (wd.len > 0) wd: {\n",
-            "            const wd = std.mem.sliceTo(c_wd, 0);\n            if (wd.len > 0) wd: {\n                if (comptime builtin.os.tag.isDarwin()) {\n                    // Con: macOS may deny directory open/stat preflight for privacy-protected cwd\n                    // (Documents, Downloads) even though chdir in the spawned shell succeeds. The\n                    // embedder already passes an absolute cwd captured from shell integration, so\n                    // trust it here and let process spawn be the authoritative failure boundary.\n                    var wd_val: configpkg.WorkingDirectory = .{ .path = wd };\n                    if (wd_val.finalize(config.arenaAlloc())) |_| {\n                        config.@\"working-directory\" = wd_val;\n                    } else |err| {\n                        log.warn(\n                            \"error finalizing working directory config dir={s} err={}\",\n                            .{ wd_val.path, err },\n                        );\n                    }\n                    break :wd;\n                }\n\n",
+            "            const wd = std.mem.sliceTo(c_wd, 0);\n            if (wd.len > 0) wd: {\n                if (comptime builtin.target.os.tag.isDarwin()) {\n                    // Con: macOS may deny directory open/stat preflight for privacy-protected cwd\n                    // (Documents, Downloads) even though chdir in the spawned shell succeeds. The\n                    // embedder already passes an absolute cwd captured from shell integration, so\n                    // trust it here and let process spawn be the authoritative failure boundary.\n                    var wd_val: configpkg.WorkingDirectory = .{ .path = wd };\n                    if (wd_val.finalize(config.arenaAlloc())) |_| {\n                        config.@\"working-directory\" = wd_val;\n                    } else |err| {\n                        log.warn(\n                            \"error finalizing working directory config dir={s} err={}\",\n                            .{ wd_val.path, err },\n                        );\n                    }\n                    break :wd;\n                }\n\n",
         )],
     )?;
     patch_text_once(
@@ -780,7 +795,7 @@ fn try_apply_embedded_initial_output_patch(ghostty_dir: &Path) -> Result<(), Str
         "Con: trust macOS cwd after embedded surface validation",
         &[(
             "            if (std.Io.Dir.cwd().access(global.io(), proposed, .{})) {\n                break :cwd proposed;\n            } else |err| {\n                log.warn(\"cannot access cwd, ignoring: {}\", .{err});\n                break :cwd null;\n            }\n",
-            "            if (comptime builtin.os.tag.isDarwin()) {\n                // Con: trust macOS cwd after embedded surface validation. Privacy-protected\n                // directories can fail access/open preflight while the child shell can still\n                // chdir there and preserve the user's restored working directory.\n                break :cwd proposed;\n            }\n\n            if (std.Io.Dir.cwd().access(global.io(), proposed, .{})) {\n                break :cwd proposed;\n            } else |err| {\n                log.warn(\"cannot access cwd, ignoring: {}\", .{err});\n                break :cwd null;\n            }\n",
+            "            if (comptime builtin.target.os.tag.isDarwin()) {\n                // Con: trust macOS cwd after embedded surface validation. Privacy-protected\n                // directories can fail access/open preflight while the child shell can still\n                // chdir there and preserve the user's restored working directory.\n                break :cwd proposed;\n            }\n\n            if (std.Io.Dir.cwd().access(global.io(), proposed, .{})) {\n                break :cwd proposed;\n            } else |err| {\n                log.warn(\"cannot access cwd, ignoring: {}\", .{err});\n                break :cwd null;\n            }\n",
         )],
     )?;
     patch_text_once(
@@ -1009,10 +1024,7 @@ fn warn_zig_failure(context: &str, output: &std::process::Output) {
 }
 
 fn prefetch_zig_dependencies(zig_bin: &OsStr, root: &Path, zig_global_cache_dir: Option<&Path>) {
-    let Some(cache_dir) = resolve_zig_global_cache_dir(zig_bin, zig_global_cache_dir) else {
-        println!("cargo:warning=con-ghostty: could not resolve Zig global cache dir for prefetch");
-        return;
-    };
+    let package_dir = zig_local_package_dir(root);
 
     let mut zon_queue = VecDeque::new();
     collect_zon_files(root, &mut zon_queue);
@@ -1048,7 +1060,7 @@ fn prefetch_zig_dependencies(zig_bin: &OsStr, root: &Path, zig_global_cache_dir:
             match prefetch_zig_url(zig_bin, root, &url, zig_global_cache_dir) {
                 Some(package_hash) => {
                     fetched += 1;
-                    let package_root = cache_dir.join("p").join(package_hash);
+                    let package_root = package_dir.join(package_hash);
                     collect_zon_files(&package_root, &mut zon_queue);
                 }
                 None => {
@@ -1263,60 +1275,53 @@ fn zig_fetch_path(
 ) -> Option<String> {
     let mut cmd = Command::new(zig_bin);
     configure_zig_command(&mut cmd, zig_global_cache_dir);
-    // Zig 0.16 resolves fetch configuration through the surrounding build
-    // project even without `--save`, so invoke it from Ghostty's root.
-    let output = cmd
-        .arg("fetch")
-        .arg(path)
-        .current_dir(project_root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        println!(
-            "cargo:warning=con-ghostty: zig fetch {} failed: {stderr}",
-            path.display()
-        );
-        return None;
-    }
+    // Zig 0.17's standalone fetch without local package storage recompresses
+    // the archive's outer directory into the global cache. A later build
+    // then hashes that extra directory and rejects its own cached package.
+    // Local storage is only activated in save mode, even with --pkg-dir.
+    // Save into a disposable manifest, never the upstream project, while
+    // populating the build's package directory with verified package roots.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let scratch = env::temp_dir().join(format!("con-zig-fetch-{}-{unique}", std::process::id()));
+    fs::create_dir(&scratch).ok()?;
+    let result = (|| {
+        fs::write(scratch.join("build.zig"), "").ok()?;
+        let output = cmd
+            .arg("fetch")
+            .arg("--save-exact=con_prefetch")
+            .arg("--pkg-dir")
+            .arg(zig_local_package_dir(project_root))
+            .arg(path)
+            .current_dir(&scratch)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            println!(
+                "cargo:warning=con-ghostty: zig fetch {} failed: {stderr}",
+                path.display()
+            );
+            return None;
+        }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
+        let manifest = fs::read_to_string(scratch.join("build.zig.zon")).ok()?;
+        manifest
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(".hash ="))?
+            .split('"')
+            .nth(1)
+            .map(str::to_string)
+    })();
+    let _ = fs::remove_dir_all(&scratch);
+    result
 }
 
-fn resolve_zig_global_cache_dir(zig_bin: &OsStr, configured_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(dir) = configured_dir {
-        return Some(dir.to_path_buf());
-    }
-    if let Some(dir) = env::var_os("ZIG_GLOBAL_CACHE_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-
-    let output = Command::new(zig_bin).arg("env").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if !line.starts_with(".global_cache_dir") {
-            continue;
-        }
-        let Some(start) = line.find('"') else {
-            continue;
-        };
-        let rest = &line[start + 1..];
-        let Some(end) = rest.find('"') else {
-            continue;
-        };
-        return Some(PathBuf::from(&rest[..end]));
-    }
-    None
+fn zig_local_package_dir(project_root: &Path) -> PathBuf {
+    project_root.join(env::var_os("ZIG_LOCAL_PKG_DIR").unwrap_or_else(|| "zig-pkg".into()))
 }
 
 fn sanitize_filename(input: &str) -> String {
@@ -1334,7 +1339,99 @@ fn sanitize_filename(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cargo_target_to_zig_target, extract_zon_urls, parse_git_package_url};
+    use super::{
+        cargo_target_to_zig_target, extract_zon_urls, parse_git_package_url, zig_fetch_path,
+    };
+
+    #[test]
+    fn prefetched_archive_survives_global_cache_reuse() {
+        use std::{env, fs, process::Command, time::SystemTime};
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let fixture = Fixture(
+            env::temp_dir().join(format!("con-zig-prefetch-{}-{unique}", std::process::id())),
+        );
+        fs::create_dir(&fixture.0).unwrap();
+        let project = fixture.0.join("project");
+        let source = fixture.0.join("source");
+        let cache = fixture.0.join("cache");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("LICENSE"), "prefetch round-trip fixture\n").unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                // Archives honor core.autocrlf too. Keep this fixture's
+                // bytes independent of the runner's/user's Git settings.
+                .args(["-c", "core.autocrlf=false"])
+                .args(args)
+                .current_dir(&source)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "LICENSE"]);
+        let tree = git(&["write-tree"]);
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let archive = fixture.0.join("package.tar");
+        git(&[
+            "archive",
+            "--format=tar",
+            "--prefix=outer/",
+            "--output",
+            archive.to_str().unwrap(),
+            tree.trim(),
+        ]);
+        let zig = env::var_os("CON_ZIG_BIN").unwrap_or_else(|| "zig".into());
+        let hash =
+            zig_fetch_path(&zig, &project, &archive, Some(&cache)).expect("prefetch fixture");
+        fs::write(project.join("build.zig"), "const std = @import(\"std\"); pub fn build(b: *std.Build) void { _ = b.dependency(\"fixture\", .{}).path(\"LICENSE\"); }\n").unwrap();
+        fs::write(
+            project.join("build.zig.zon"),
+            format!(
+                r#".{{
+            .name = .ghostty, .version = "0.0.0", .fingerprint = 0x64407a2a0b4147e5,
+            .paths = .{{"build.zig"}},
+            .dependencies = .{{ .fixture = .{{
+                .url = "https://invalid.example/prefetch-fixture.tar", .hash = "{hash}",
+            }} }},
+        }}"#
+            ),
+        )
+        .unwrap();
+        // A separate package directory forces the build to unpack and verify
+        // the global cached tarball, rather than reuse the prefetched tree.
+        let output = Command::new(&zig)
+            .args(["build", "--fetch", "--pkg-dir"])
+            .arg(fixture.0.join("reused-packages"))
+            .env("ZIG_GLOBAL_CACHE_DIR", &cache)
+            .current_dir(&project)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.0.join("reused-packages").join(hash).join("LICENSE"))
+                .unwrap(),
+            "prefetch round-trip fixture\n"
+        );
+    }
 
     #[test]
     fn maps_linux_targets_to_generic_zig_targets() {
