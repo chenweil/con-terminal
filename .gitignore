@@ -30,6 +30,8 @@ dist
 .env
 .sparkle
 .claude
+# Local installs of third-party agent skills (see docs/agents/ for the repo's own config)
+.agents/
 
 # Documentation screenshots are working artifacts, not committed source.
 # The legitimate shipped images (app icons in crates/con-app/resources/,
