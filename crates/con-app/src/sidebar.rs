@@ -11,8 +11,7 @@
 //! - The close affordance is hover-only on
 //!   every row, including the active one. Quiet by default; reveal
 //!   on intent.
-//! - Surface separation comes from `surface_tone()` (foreground
-//!   blended into background at small intensities), not borders.
+//! - Surface separation comes from quiet foreground-derived fills, not borders.
 
 use crate::activity_bar::ActivitySlot;
 use crate::motion::SidebarMotion;
@@ -33,6 +32,7 @@ use gpui_component::{
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 /// Width of the always-visible icon rail in collapsed mode.
 pub const RAIL_WIDTH: f32 = 44.0;
@@ -55,6 +55,8 @@ const RAIL_SELECTION_SIZE: f32 = 32.0;
 /// Vertical gap between rail icons. Used to compute the icon's
 /// y-center for hover-card anchoring.
 const RAIL_ICON_GAP: f32 = 2.0;
+const NAV_CONTROL_HOVER_ALPHA: f32 = 0.035;
+const NAV_CONTROL_PRESS_ALPHA: f32 = 0.055;
 const RAIL_BUTTON_SIZE: f32 = if cfg!(target_os = "macos") {
     24.0
 } else {
@@ -83,6 +85,7 @@ struct NavigationLayout {
     list_top: f32,
     label_opacity: f32,
     compact: bool,
+    preview: bool,
     controls: [(f32, f32); 4],
 }
 
@@ -136,8 +139,19 @@ impl NavigationLayout {
                 ),
             label_opacity: ((t - 0.15) / 0.7).clamp(0.0, 1.0),
             compact: t < 0.5,
+            preview: false,
             controls,
         }
+    }
+
+    fn preview(panel_width: f32, leading: f32, progress: f32) -> Self {
+        // Hover reveals labels horizontally. Every icon, row and control keeps
+        // the compact geometry under the pointer, including during reversals.
+        let mut layout = Self::new(panel_width, leading, ROW_HEIGHT, 18.0, 0.0);
+        layout.width = RAIL_WIDTH + (panel_width - RAIL_WIDTH) * progress.clamp(0.0, 1.0);
+        layout.label_opacity = ((progress - 0.15) / 0.7).clamp(0.0, 1.0);
+        layout.preview = true;
+        layout
     }
 }
 
@@ -338,6 +352,16 @@ pub struct SessionSidebar {
     pub(crate) notifications: crate::tab_activity::TabNotifications,
     active_session: usize,
     leading_top_pad: f32,
+    /// Adjacent terminal gutter, supplied by the workspace. Compact navigation
+    /// is centered between the window edge and the terminal card in both modes.
+    terminal_gutter: f32,
+    peek_open: bool,
+    peek_hovered: bool,
+    peek_motion: SidebarMotion,
+    peek_task: Option<gpui::Task<()>>,
+    peek_menu_open: bool,
+    peek_menu_subscription: Option<gpui::Subscription>,
+    rail_scroll: gpui::ScrollHandle,
     /// Smooth width animation between rail (0.0) and pinned (1.0).
     width_motion: SidebarMotion,
     /// User-resized width of the pinned panel. Collapsed mode ignores
@@ -447,6 +471,80 @@ impl EventEmitter<SidebarOpenToolSlot> for SessionSidebar {}
 impl EventEmitter<SidebarShowSessions> for SessionSidebar {}
 
 impl SessionSidebar {
+    pub(crate) fn set_terminal_gutter(&mut self, gutter: f32) -> bool {
+        let gutter = gutter.max(0.0);
+        let changed = (self.terminal_gutter - gutter).abs() > f32::EPSILON;
+        self.terminal_gutter = gutter;
+        changed
+    }
+
+    fn navigation_content_offset(&self) -> f32 {
+        if self.tools_panel_open {
+            return 0.0;
+        }
+        self.terminal_gutter * 0.5
+    }
+
+    fn can_peek(&self) -> bool {
+        self.renders_rail_only() && !self.tools_panel_open && self.rename.is_none()
+    }
+
+    fn peek_active(&self) -> bool {
+        self.peek_open || self.peek_motion.is_animating() || self.peek_motion.current() > 0.0
+    }
+
+    fn set_navigation_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.peek_hovered = hovered;
+        self.peek_task = None;
+        if !self.can_peek()
+            || self.peek_menu_open
+            || cx.has_active_drag()
+            || hovered == self.peek_open
+        {
+            return;
+        }
+        self.peek_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(if hovered { 180 } else { 160 }))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.can_peek()
+                    && !this.peek_menu_open
+                    && this.peek_hovered == hovered
+                    && !cx.has_active_drag()
+                {
+                    this.peek_open = hovered;
+                    this.peek_motion.set_target(if hovered { 1.0 } else { 0.0 });
+                    this.hovered_rail = None;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn dismiss_navigation_peek(&mut self) {
+        self.peek_task = None;
+        self.peek_open = false;
+        self.peek_hovered = false;
+        self.peek_motion = SidebarMotion::new(0.0);
+        self.peek_menu_open = false;
+        self.peek_menu_subscription = None;
+    }
+
+    fn hold_navigation_peek_for_menu(&mut self, menu: Entity<PopupMenu>, cx: &mut Context<Self>) {
+        if !self.peek_active() {
+            return;
+        }
+        self.peek_task = None;
+        self.peek_menu_open = true;
+        self.peek_menu_subscription =
+            Some(cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
+                this.peek_menu_open = false;
+                this.peek_menu_subscription = None;
+                this.set_navigation_hover(this.peek_hovered, cx);
+            }));
+    }
+
     pub fn new(_cx: &mut Context<Self>) -> Self {
         Self::default_state()
     }
@@ -464,6 +562,14 @@ impl SessionSidebar {
             // platform titlebar inset creates a dead band above the
             // tab-sidebar controls.
             leading_top_pad: 6.0,
+            terminal_gutter: 0.0,
+            peek_open: false,
+            peek_hovered: false,
+            peek_motion: SidebarMotion::new(0.0),
+            peek_task: None,
+            peek_menu_open: false,
+            peek_menu_subscription: None,
+            rail_scroll: gpui::ScrollHandle::new(),
             width_motion: SidebarMotion::new(0.0),
             panel_width: PANEL_WIDTH,
             effective_panel_max_width: PANEL_MAX_WIDTH,
@@ -516,6 +622,8 @@ impl SessionSidebar {
     }
 
     pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        let preview_progress = (pinned && self.peek_active()).then(|| self.peek_motion.current());
+        self.dismiss_navigation_peek();
         let had_rail_only_override = self.rail_only_override;
         self.rail_only_override = false;
         let new_mode = if pinned {
@@ -528,6 +636,9 @@ impl SessionSidebar {
             self.cancel_rename(cx);
             self.hovered_rail = None;
             let target = if pinned { 1.0 } else { 0.0 };
+            if let Some(progress) = preview_progress {
+                self.width_motion = SidebarMotion::new(progress);
+            }
             self.width_motion.set_target(target);
             cx.notify();
         } else if had_rail_only_override {
@@ -576,23 +687,31 @@ impl SessionSidebar {
         self.width_motion.is_animating()
     }
 
-    pub fn set_tools_panel_open(&mut self, open: bool, active_slot: ActivitySlot) {
+    pub fn set_tools_panel_open(&mut self, open: bool, active_slot: ActivitySlot) -> bool {
+        let changed = self.tools_panel_open != open || self.active_tool_slot != active_slot;
         if self.tools_panel_open != open {
             self.tools_panel_open = open;
             self.hovered_rail = None;
             if open {
+                self.dismiss_navigation_peek();
                 self.rail_only_override = false;
             }
         }
         self.active_tool_slot = active_slot;
+        changed
     }
 
     /// Clear lingering rail hover state. Called by the workspace when the
     /// rail leaves the layout (panel hidden / vertical tabs off) — an
     /// unmounted rail cannot deliver the hover-leave event, so without this
     /// the hover card could persist or reappear once the rail is restored.
-    pub fn clear_hovered_rail(&mut self) {
+    pub fn clear_hovered_rail(&mut self, cx: &mut Context<Self>) {
+        let changed = self.hovered_rail.is_some() || self.peek_active() || self.peek_task.is_some();
         self.hovered_rail = None;
+        self.dismiss_navigation_peek();
+        if changed {
+            cx.notify();
+        }
     }
 
     pub fn show_rail_only_preserving_pinned(&mut self, cx: &mut Context<Self>) {
@@ -881,11 +1000,7 @@ impl SessionSidebar {
     fn render_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
         let session_count = self.sessions.len();
-        let mode_icon = if self.tools_panel_open || (self.is_pinned() && !self.rail_only_override) {
-            "phosphor/caret-line-left.svg"
-        } else {
-            "phosphor/caret-line-right.svg"
-        };
+        let mode_icon = "phosphor/list.svg";
         let mode_color = if self.tools_panel_open || (self.is_pinned() && !self.rail_only_override)
         {
             theme.foreground
@@ -926,6 +1041,7 @@ impl SessionSidebar {
             // even when the cursor exits via a fast diagonal motion
             // that may skip the per-icon hover transitions.
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.set_navigation_hover(*hovered, cx);
                 if !*hovered && this.hovered_rail.take().is_some() {
                     cx.notify();
                 }
@@ -1064,6 +1180,7 @@ impl SessionSidebar {
                 mode_icon,
                 mode_color,
                 theme,
+                self.navigation_content_offset(),
                 cx.listener(|this, _, _, cx| match this.rail_mode_button_action() {
                     RailModeButtonAction::ShowSessionsFromToolPanel => {
                         this.set_pinned(false, cx);
@@ -1084,9 +1201,10 @@ impl SessionSidebar {
             .child(div().h(px(RAIL_DIVIDER_HEIGHT)).w(px(20.0)))
             .child(rail_icon_button(
                 "tab-sidebar-rail-files",
-                "phosphor/folders.svg",
+                "phosphor/tree-view.svg",
                 files_color,
                 theme,
+                self.navigation_content_offset(),
                 cx.listener(|_, _, _, cx| {
                     cx.emit(SidebarOpenToolSlot {
                         slot: ActivitySlot::Files,
@@ -1095,9 +1213,10 @@ impl SessionSidebar {
             ))
             .child(rail_icon_button(
                 "tab-sidebar-rail-search",
-                "phosphor/magnifying-glass.svg",
+                "phosphor/list-magnifying-glass.svg",
                 search_color,
                 theme,
+                self.navigation_content_offset(),
                 cx.listener(|_, _, _, cx| {
                     cx.emit(SidebarOpenToolSlot {
                         slot: ActivitySlot::Search,
@@ -1110,6 +1229,7 @@ impl SessionSidebar {
                 "phosphor/plus.svg",
                 theme.muted_foreground,
                 theme,
+                self.navigation_content_offset(),
                 cx.listener(|_, _, _, cx| cx.emit(NewSession)),
             ))
             .child(div().h(px(RAIL_SESSIONS_GAP)).flex_shrink_0());
@@ -1132,7 +1252,8 @@ impl SessionSidebar {
             .flex_col()
             .items_center()
             .gap(px(RAIL_ICON_GAP))
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .track_scroll(&self.rail_scroll);
 
         for (i, session) in self.sessions.iter().enumerate() {
             let is_active = i == self.active_session;
@@ -1183,17 +1304,14 @@ impl SessionSidebar {
                     cx,
                 )
             });
-            let mut pill = div()
-                .id(SharedString::from(format!("rail-tab-{i}")))
-                .debug_selector(|| "sidebar-session-tile".into())
-                .relative()
+            let mut visual = div()
+                .absolute()
+                .left(px(self.navigation_content_offset()))
+                .top_0()
+                .size(px(RAIL_ICON_SIZE))
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(px(RAIL_ICON_SIZE))
-                .flex_shrink_0()
-                .cursor_pointer()
-                .group(SharedString::from(format!("rail-tab-group-{i}")))
                 .child(
                     div()
                         .debug_selector(|| "sidebar-session-selection".into())
@@ -1212,6 +1330,29 @@ impl SessionSidebar {
                             },
                         ),
                 )
+                .child(self.activity_layer.as_ref().unwrap().read(cx).icon_group(
+                    session.identity_icons(),
+                    ui_icon_px(theme, 18.0),
+                    if is_active {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    },
+                    session.status,
+                    theme,
+                    true,
+                ));
+            let mut pill = div()
+                .id(SharedString::from(format!("rail-tab-{i}")))
+                .debug_selector(|| "sidebar-session-tile".into())
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(RAIL_ICON_SIZE))
+                .flex_shrink_0()
+                .cursor_pointer()
+                .group(SharedString::from(format!("rail-tab-group-{i}")))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |_this, _, _, cx| cx.emit(SidebarSelect { index: i })),
@@ -1241,19 +1382,7 @@ impl SessionSidebar {
                 })
                 .on_prepaint(move |bounds, _, _| {
                     tab_bounds.borrow_mut().push(bounds);
-                })
-                .child(self.activity_layer.as_ref().unwrap().read(cx).icon_group(
-                    session.identity_icons(),
-                    ui_icon_px(theme, 18.0),
-                    if is_active {
-                        theme.foreground
-                    } else {
-                        theme.muted_foreground
-                    },
-                    session.status,
-                    theme,
-                    true,
-                ));
+                });
 
             if let Some(dot) = self.notifications.dot(
                 session.id,
@@ -1278,8 +1407,9 @@ impl SessionSidebar {
                 window,
                 cx,
             ) {
-                pill = pill.child(dot);
+                visual = visual.child(dot);
             }
+            pill = pill.child(visual);
             if show_indicator_above {
                 pill = pill.child(rail_drop_indicator(theme, true));
             }
@@ -1291,6 +1421,66 @@ impl SessionSidebar {
         }
 
         rail.child(pill_list)
+    }
+
+    /// Temporary navigation uses the existing panel rows and their interactions,
+    /// but is painted by the workspace over the terminal, never reserved in layout.
+    pub(crate) fn render_navigation_peek_overlay(
+        &mut self,
+        top: f32,
+        background: Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.can_peek() || !self.peek_active() {
+            return None;
+        }
+        let progress = self.peek_motion.value(window, cx);
+        if !self.peek_open && progress == 0.0 {
+            return None;
+        }
+        let activity = self
+            .activity_layer
+            .get_or_insert_with(|| cx.new(|cx| crate::tab_activity::TabActivity::new(window, cx)))
+            .clone();
+        activity.read(cx).clear();
+        let layout =
+            NavigationLayout::preview(self.effective_panel_width(), self.leading_top_pad, progress);
+        let width = layout.width;
+        let body = self.render_panel_body(layout, window, cx);
+        Some(
+            div()
+                .id("tab-sidebar-navigation-peek")
+                .debug_selector(|| "sidebar-navigation-peek".into())
+                .absolute()
+                .left_0()
+                .top(px(top))
+                .w(px(width + self.terminal_gutter))
+                .h((window.viewport_size().height - px(top)).max(px(0.0)))
+                // This is attached window chrome, continuing from the caption
+                // to the bottom edge. A local corner cuts a notch into that
+                // continuous surface and exposes the terminal beneath it.
+                .overflow_hidden()
+                .occlude()
+                .bg(Hsla {
+                    a: 1.0,
+                    ..background
+                })
+                .font_family(cx.theme().font_family.clone())
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    this.set_navigation_hover(*hovered, cx);
+                }))
+                .child(
+                    div()
+                        .relative()
+                        .left(px(self.navigation_content_offset()))
+                        .w(px(width))
+                        .h_full()
+                        .child(body),
+                )
+                .child(activity)
+                .into_any_element(),
+        )
     }
 
     /// Floating hover card shown next to the hovered rail icon.
@@ -1308,7 +1498,7 @@ impl SessionSidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.renders_rail_only() {
+        if !self.renders_rail_only() || self.peek_active() || self.peek_task.is_some() {
             return None;
         }
         let i = self.hovered_rail?;
@@ -1387,13 +1577,18 @@ impl SessionSidebar {
     ) -> Div {
         let mode_label = format!(
             "{} tabs ({})",
-            if self.is_pinned() {
+            if layout.preview {
+                "Keep expanded"
+            } else if self.is_pinned() {
                 "Compact"
             } else {
                 "Expand"
             },
             self.sessions.len()
         );
+        let preview = layout
+            .preview
+            .then_some((layout.width, layout.label_opacity));
         let header = div()
             .relative()
             .w_full()
@@ -1401,21 +1596,25 @@ impl SessionSidebar {
             .flex_shrink_0()
             .child(navigation_button(
                 "tab-sidebar-rail-expand",
-                if self.is_pinned() {
-                    "phosphor/caret-line-left.svg"
-                } else {
-                    "phosphor/caret-line-right.svg"
-                },
+                "phosphor/list.svg",
                 mode_label.into(),
                 layout.controls[0],
+                preview,
                 cx,
-                cx.listener(|this, _, _, cx| this.toggle_pinned(cx)),
+                cx.listener(move |this, _, _, cx| {
+                    if layout.preview {
+                        this.set_pinned(true, cx);
+                    } else {
+                        this.toggle_pinned(cx);
+                    }
+                }),
             ))
             .child(navigation_button(
                 "tab-sidebar-rail-files",
-                "phosphor/folders.svg",
+                "phosphor/tree-view.svg",
                 "Files".into(),
                 layout.controls[1],
+                preview,
                 cx,
                 cx.listener(|_, _, _, cx| {
                     cx.emit(SidebarOpenToolSlot {
@@ -1425,9 +1624,10 @@ impl SessionSidebar {
             ))
             .child(navigation_button(
                 "tab-sidebar-rail-search",
-                "phosphor/magnifying-glass.svg",
+                "phosphor/list-magnifying-glass.svg",
                 "Search across files".into(),
                 layout.controls[2],
+                preview,
                 cx,
                 cx.listener(|_, _, _, cx| {
                     cx.emit(SidebarOpenToolSlot {
@@ -1440,6 +1640,7 @@ impl SessionSidebar {
                 "phosphor/plus.svg",
                 "New tab".into(),
                 layout.controls[3],
+                preview,
                 cx,
                 cx.listener(|_, _, _, cx| cx.emit(NewSession)),
             ));
@@ -1465,6 +1666,7 @@ impl SessionSidebar {
             .px(px(layout.row_inset))
             .gap(px(2.0))
             .overflow_y_scroll()
+            .when(layout.preview, |list| list.track_scroll(&self.rail_scroll))
             // Body-level drag_move ONLY runs the "below last row"
             // detection — the per-row handlers handle every cursor
             // position that's actually over a row. We fire the
@@ -1941,7 +2143,13 @@ impl SessionSidebar {
                 let has_user_label = session.has_user_label;
                 let current_color = session.color;
                 let weak = cx.weak_entity();
-                move |menu, _window, _cx| {
+                move |menu, _window, cx| {
+                    if let Some(sidebar) = weak.upgrade() {
+                        let menu_entity = cx.entity();
+                        sidebar.update(cx, |sidebar, cx| {
+                            sidebar.hold_navigation_peek_for_menu(menu_entity, cx);
+                        });
+                    }
                     build_row_context_menu(
                         menu,
                         weak.clone(),
@@ -1996,6 +2204,9 @@ impl Render for SessionSidebar {
             .activity_layer
             .get_or_insert_with(|| cx.new(|cx| crate::tab_activity::TabActivity::new(window, cx)))
             .clone();
+        if self.peek_active() && self.can_peek() {
+            return div().w(px(RAIL_WIDTH)).h_full().into_any_element();
+        }
         activity_layer.read(cx).clear();
         // Clear stale drop indicator after the drag completes — GPUI
         // doesn't expose an on_drag_end hook for the source element.
@@ -2039,7 +2250,10 @@ impl Render for SessionSidebar {
                 ui_icon_px(theme, 16.0).as_f32(),
                 progress,
             );
-            let panel = self.render_panel_body(layout, window, cx);
+            let panel = self
+                .render_panel_body(layout, window, cx)
+                .relative()
+                .left(px(self.navigation_content_offset()));
             div()
                 .font_family(ui_font)
                 .relative()
@@ -2062,18 +2276,6 @@ impl Render for SessionSidebar {
                 .into_any_element()
         }
     }
-}
-
-/// Compose a surface color one perceptual step darker (light theme) or
-/// lighter (dark theme) than `theme.background`. Foreground is forced
-/// to a desaturated extreme-luminance overlay so the result reads
-/// against any palette author's choice of `theme.background`.
-fn surface_tone(theme: &gpui_component::Theme, intensity: f32) -> Hsla {
-    let mut over = theme.foreground;
-    over.s = 0.0;
-    over.l = if theme.foreground.l < 0.5 { 0.0 } else { 1.0 };
-    over.a = intensity.clamp(0.0, 1.0);
-    theme.background.blend(over)
 }
 
 fn sidebar_selection_fill(theme: &gpui_component::Theme) -> Hsla {
@@ -2574,15 +2776,18 @@ fn rail_icon_button<F>(
     icon: &'static str,
     icon_color: Hsla,
     theme: &gpui_component::Theme,
+    offset: f32,
     handler: F,
 ) -> Stateful<Div>
 where
     F: Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 {
-    let hover_bg = surface_tone(theme, 0.065);
+    let hover_bg = theme.foreground.opacity(NAV_CONTROL_HOVER_ALPHA);
     div()
         .id(id)
         .debug_selector(move || id.into())
+        .relative()
+        .left(px(offset))
         .size(px(RAIL_BUTTON_SIZE))
         .flex_shrink_0()
         .flex()
@@ -2592,11 +2797,16 @@ where
         .cursor_pointer()
         .hover(move |s| s.bg(hover_bg))
         .child(
-            svg()
-                .path(icon)
+            div()
+                .debug_selector(move || format!("{id}-icon"))
                 .size(ui_icon_px(theme, 16.0))
                 .flex_shrink_0()
-                .text_color(icon_color),
+                .child(
+                    svg()
+                        .path(icon)
+                        .size(ui_icon_px(theme, 16.0))
+                        .text_color(icon_color),
+                ),
         )
         .on_mouse_down(MouseButton::Left, handler)
 }
@@ -2712,40 +2922,110 @@ fn build_row_context_menu(
     )
 }
 
+fn sidebar_button_tooltip(mut button: Button, label: SharedString) -> Button {
+    button.interactivity().tooltip(move |window, cx| {
+        let theme = cx.theme();
+        Tooltip::new(label.clone())
+            .font_family(theme.font_family.clone())
+            .text_size(ui_px(theme, 11.5))
+            .text_color(theme.foreground)
+            .bg(Hsla {
+                a: 1.0,
+                ..theme.popover
+            })
+            .border_0()
+            .shadow(Vec::new())
+            .rounded(px(6.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .build(window, cx)
+    });
+    button
+}
+
 fn navigation_button<F>(
     id: &'static str,
     icon: &'static str,
     label: SharedString,
     origin: (f32, f32),
+    preview: Option<(f32, f32)>,
     cx: &App,
     handler: F,
 ) -> Button
 where
     F: Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 {
-    Button::new(id)
+    let icon_size = ui_icon_px(cx.theme(), 16.0);
+    let visible_label = if preview.is_some() && id == "tab-sidebar-rail-expand" {
+        "Keep expanded".into()
+    } else {
+        label.clone()
+    };
+    let button = Button::new(id)
         .debug_selector(move || id.into())
-        .ghost()
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .foreground(cx.theme().muted_foreground)
+                .hover(cx.theme().foreground.opacity(NAV_CONTROL_HOVER_ALPHA))
+                .active(cx.theme().foreground.opacity(NAV_CONTROL_PRESS_ALPHA)),
+        )
         .small()
         .absolute()
         .left(px(origin.0))
         .top(px(origin.1))
         .size(px(RAIL_BUTTON_SIZE))
-        .w(px(RAIL_BUTTON_SIZE))
+        .w(px(preview.map_or(RAIL_BUTTON_SIZE, |(width, _)| {
+            (width - origin.0 - 8.0).max(RAIL_BUTTON_SIZE)
+        })))
         .h(px(RAIL_BUTTON_SIZE))
         .p_0()
         .rounded(px(7.0))
         .tab_stop(false)
         .accessibility_label(label.clone())
-        .tooltip(label)
         .child(
-            svg()
-                .path(icon)
-                .size(ui_icon_px(cx.theme(), 16.0))
-                .text_color(cx.theme().muted_foreground),
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    div()
+                        .debug_selector(move || format!("{id}-icon"))
+                        .absolute()
+                        .left((px(RAIL_BUTTON_SIZE) - icon_size) * 0.5)
+                        .top((px(RAIL_BUTTON_SIZE) - icon_size) * 0.5)
+                        .size(icon_size)
+                        .child(
+                            svg()
+                                .path(icon)
+                                .size(icon_size)
+                                .text_color(cx.theme().muted_foreground),
+                        ),
+                )
+                .when_some(preview, |content, (_, opacity)| {
+                    content.child(
+                        div()
+                            .absolute()
+                            .left(px(RAIL_BUTTON_SIZE + 12.0))
+                            .right(px(8.0))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .opacity(opacity)
+                            .text_size(ui_px(cx.theme(), 12.5))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(div().truncate().child(visible_label)),
+                    )
+                }),
         )
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_click(handler)
+        .on_click(handler);
+    if preview.is_some() {
+        // The preview already displays the action text. A second floating label
+        // obscures neighboring controls and adds an unrelated elevation layer.
+        button
+    } else {
+        sidebar_button_tooltip(button, label)
+    }
 }
 
 fn sidebar_close_button(id: SharedString, cx: &App) -> Button {
@@ -2757,7 +3037,7 @@ fn sidebar_close_button(id: SharedString, cx: &App) -> Button {
         .foreground
         .opacity(if theme.is_dark() { 0.14 } else { 0.10 });
     let pressed = theme.foreground.opacity(0.18);
-    Button::new(id)
+    let button = Button::new(id)
         .custom(
             ButtonCustomVariant::new(cx)
                 .foreground(theme.muted_foreground)
@@ -2773,7 +3053,6 @@ fn sidebar_close_button(id: SharedString, cx: &App) -> Button {
         .rounded_full()
         .tab_stop(false)
         .accessibility_label("Close tab")
-        .tooltip("Close tab")
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
             div()
@@ -2794,7 +3073,8 @@ fn sidebar_close_button(id: SharedString, cx: &App) -> Button {
                         .text_color(theme.foreground),
                 ),
         )
-        .group("tab-close-control")
+        .group("tab-close-control");
+    sidebar_button_tooltip(button, "Close tab".into())
 }
 
 #[cfg(test)]
@@ -3039,9 +3319,127 @@ mod tests {
         blur_should_commit_for_lifecycle, cancel_rename_lifecycle, normalize_sidebar_rename_label,
         rail_slot_from_local_y, vertical_drag_overlay_probe_position, vertical_slot_from_bounds,
     };
-    use gpui::{Bounds, Point, Size, px};
+    use gpui::{Bounds, InteractiveElement, ParentElement, Point, Size, Styled, px};
+    use gpui_component::ActiveTheme;
+    use std::time::Duration;
 
     struct HoverCardTestView(gpui::Entity<SessionSidebar>);
+
+    struct NavigationPeekTestView(gpui::Entity<SessionSidebar>);
+
+    impl gpui::Render for NavigationPeekTestView {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let width = self.0.read(cx).rendered_width();
+            let bg = cx.theme().background;
+            let mut root = gpui::div()
+                .relative()
+                .flex()
+                .w(px(700.0))
+                .h(window.viewport_size().height)
+                .child(gpui::div().w(px(width)).h_full().child(self.0.clone()))
+                .child(
+                    gpui::div()
+                        .debug_selector(|| "peek-test-terminal".into())
+                        .flex_1()
+                        .h_full(),
+                );
+            if let Some(overlay) = self.0.update(cx, |sidebar, cx| {
+                sidebar.render_navigation_peek_overlay(0.0, bg, window, cx)
+            }) {
+                root = root.child(overlay);
+            }
+            root
+        }
+    }
+
+    #[gpui::test]
+    fn navigation_hover_previews_all_tabs_without_reserving_terminal_width(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        cx.update(gpui_component::init);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let sidebar = cx.new(|cx| {
+            let mut sidebar = SessionSidebar::new(cx);
+            sidebar.sessions = (0..60)
+                .map(|id| {
+                    let mut entry = session(None, None);
+                    entry.id = id;
+                    entry.name = format!("Task {id}");
+                    entry
+                })
+                .collect();
+            sidebar
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+            NavigationPeekTestView(sidebar.clone())
+        });
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar
+                .rail_scroll
+                .set_offset(gpui::point(px(0.0), px(-84.0)));
+            cx.notify();
+        });
+        let terminal = cx.debug_bounds("peek-test-terminal").unwrap();
+        assert!(sidebar.read_with(cx, |sidebar, _| sidebar.rail_scroll.offset().y) < px(0.0));
+        let row_origins = sidebar.read_with(cx, |sidebar, _| {
+            sidebar
+                .tab_bounds
+                .borrow()
+                .iter()
+                .map(|bounds| bounds.top())
+                .collect::<Vec<_>>()
+        });
+        let files_icon = cx.debug_bounds("tab-sidebar-rail-files-icon").unwrap();
+        sidebar.update(cx, |sidebar, cx| sidebar.set_navigation_hover(true, cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(179));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar-navigation-peek").is_none());
+        cx.executor().advance_clock(Duration::from_millis(2));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar-navigation-peek").unwrap().right() > terminal.left());
+        assert_eq!(cx.debug_bounds("peek-test-terminal").unwrap(), terminal);
+        sidebar.read_with(cx, |sidebar, _| {
+            assert!(!sidebar.is_pinned());
+            assert_eq!(sidebar.rendered_width(), super::RAIL_WIDTH);
+            assert_eq!(sidebar.tab_bounds.borrow().len(), row_origins.len());
+            assert_eq!(
+                sidebar
+                    .tab_bounds
+                    .borrow()
+                    .iter()
+                    .map(|bounds| bounds.top())
+                    .collect::<Vec<_>>(),
+                row_origins
+            );
+        });
+        assert_eq!(
+            cx.debug_bounds("tab-sidebar-rail-files-icon").unwrap(),
+            files_icon
+        );
+        // Crossing from rail into preview cancels the delayed close.
+        sidebar.update(cx, |sidebar, cx| sidebar.set_navigation_hover(false, cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        sidebar.update(cx, |sidebar, cx| sidebar.set_navigation_hover(true, cx));
+        cx.executor().advance_clock(Duration::from_millis(240));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar-navigation-peek").is_some());
+        sidebar.update(cx, |sidebar, cx| sidebar.set_navigation_hover(false, cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(221));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar-navigation-peek").is_none());
+        assert_eq!(cx.debug_bounds("peek-test-terminal").unwrap(), terminal);
+        view.update(cx, |_, cx| cx.notify());
+    }
 
     impl gpui::Render for HoverCardTestView {
         fn render(
@@ -3602,6 +4000,96 @@ mod tests {
             pane_count: 1,
             color: None,
         }
+    }
+
+    #[gpui::test]
+    fn navigation_balances_the_terminal_gutter_in_both_modes(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sidebar = SessionSidebar::new(cx);
+            let mut entry = session(None, None);
+            entry.pane_icons = vec!["tab-terminal-refined.png", "tab-code.png", "tab-file.png"];
+            sidebar.sessions = vec![entry];
+            sidebar.set_terminal_gutter(5.0);
+            sidebar
+        });
+        let selection = cx.debug_bounds("sidebar-session-selection").unwrap();
+        let tile = cx.debug_bounds("sidebar-session-tile").unwrap();
+        let control = cx.debug_bounds("tab-sidebar-rail-files").unwrap();
+        let icon = cx.debug_bounds("tab-status-slot").unwrap();
+        let pane_edge = px(super::RAIL_WIDTH + 5.0);
+        assert_eq!(selection.left(), pane_edge - selection.right());
+        assert_eq!(control.center().x, selection.center().x);
+        assert_eq!(icon.center().x, selection.center().x);
+        assert_eq!(tile.size, gpui::size(px(40.0), px(40.0)));
+        assert!(tile.left() >= px(0.0) && tile.right() <= px(super::RAIL_WIDTH));
+        assert!(selection.right() < px(super::RAIL_WIDTH));
+
+        // The interpolated panel must meet the corrected rail at its compact
+        // endpoint, while the expanded rows share the same balanced margins.
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_pinned(true, cx);
+            sidebar.width_motion = crate::motion::SidebarMotion::new(0.0);
+        });
+        assert_eq!(
+            cx.debug_bounds("sidebar-session-surface")
+                .unwrap()
+                .center()
+                .x,
+            selection.center().x
+        );
+        assert_eq!(
+            cx.debug_bounds("tab-sidebar-rail-files")
+                .unwrap()
+                .center()
+                .x,
+            control.center().x
+        );
+        for expansion in [0.25, 0.5, 0.75, 1.0] {
+            view.update(cx, |sidebar, cx| {
+                sidebar.width_motion = crate::motion::SidebarMotion::new(expansion);
+                sidebar.set_terminal_gutter(0.0);
+                cx.notify();
+            });
+            let original = cx.debug_bounds("tab-sidebar-rail-files").unwrap();
+            let width = view.read_with(cx, |sidebar, _| sidebar.rendered_width());
+            view.update(cx, |sidebar, cx| {
+                sidebar.set_terminal_gutter(5.0);
+                cx.notify();
+            });
+            let adjusted = cx.debug_bounds("tab-sidebar-rail-files").unwrap();
+            assert!((adjusted.left() - original.left() - px(2.5)).abs() <= px(0.5));
+            assert_eq!(adjusted.size, original.size);
+            assert_eq!(
+                view.read_with(cx, |sidebar, _| sidebar.rendered_width()),
+                width
+            );
+        }
+        let expanded_name = cx.debug_bounds("sidebar-session-name").unwrap();
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_terminal_gutter(0.0);
+            cx.notify();
+        });
+        assert!(
+            (expanded_name.left()
+                - cx.debug_bounds("sidebar-session-name").unwrap().left()
+                - px(2.5))
+            .abs()
+                <= px(0.5)
+        );
+
+        view.update(cx, |sidebar, cx| {
+            sidebar.set_terminal_gutter(5.0);
+            sidebar.set_tools_panel_open(true, crate::activity_bar::ActivitySlot::Files);
+            cx.notify();
+        });
+        assert_eq!(
+            cx.debug_bounds("tab-sidebar-rail-files")
+                .unwrap()
+                .center()
+                .x,
+            px(super::RAIL_WIDTH * 0.5)
+        );
     }
 
     #[gpui::test]
