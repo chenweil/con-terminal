@@ -187,3 +187,17 @@ When solving a non-trivial bug or issue, create `postmortem/YYYY-MM-DD-title.md`
 - Root cause
 - Fix applied
 - What we learned
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as GitHub issues in `chenweil/con-terminal` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles mapped to the default labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
