@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -5,17 +6,28 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use super::pty::{LinuxPtyOptions, LinuxPtySession, LinuxWakeCallback};
+use super::pty::{LinuxPtyOptions, LinuxPtySession, LinuxPtySpawnError, LinuxWakeCallback};
 use crate::stub::{
-    CommandFinishedSignal, CommandRecord, GhosttyConfigPatch, GhosttySplitDirection,
-    GhosttySurfaceEvent, MouseButton, SurfaceSize, TerminalColors,
+    CommandFinishedSignal, CommandRecord, GhosttyConfigPatch, GhosttyScrollbar,
+    GhosttySplitDirection, GhosttySurfaceEvent, MouseButton, SurfaceSize, TerminalColors,
 };
-use crate::vt::ScreenSnapshot;
+use crate::vt::{
+    ScreenSnapshot, SelectionAutoscroll, SelectionAutoscrollUpdate, SelectionGeometry,
+    SelectionPoint, VtKeyEvent, VtKeyOutcome, VtMouseEvent,
+};
+use crate::{
+    ClipboardWritePolicy, DesktopNotificationPolicy, clipboard_write_policy,
+    desktop_notification_policy,
+};
 
 #[derive(Debug, Clone)]
 pub struct LinuxBackendConfig {
     pub shell_program: Option<String>,
+    /// `None` means the auto-detected program should start as an interactive
+    /// login shell. `Some` is the exact argv from an explicit user command.
+    pub shell_args: Option<Vec<OsString>>,
     pub font_family: Option<String>,
+    pub font_fallback: Vec<String>,
     pub font_size: Option<f32>,
     pub colors: Option<TerminalColors>,
     /// 0.0 (fully see-through) … 1.0 (opaque). Multiplied into the
@@ -31,17 +43,21 @@ pub struct LinuxBackendConfig {
     /// itself — the `WindowBackgroundAppearance::Blurred` toggle is
     /// applied at the GPUI window level in `con-app/main.rs`.
     pub background_blur: bool,
+    pub clipboard_write: bool,
 }
 
 impl Default for LinuxBackendConfig {
     fn default() -> Self {
         Self {
             shell_program: None,
+            shell_args: None,
             font_family: None,
+            font_fallback: Vec::new(),
             font_size: None,
             colors: None,
             background_opacity: 1.0,
             background_blur: false,
+            clipboard_write: false,
         }
     }
 }
@@ -51,13 +67,17 @@ impl Default for LinuxBackendConfig {
 pub struct LinuxGhosttyApp {
     config: Mutex<LinuxBackendConfig>,
     wake_generation: Arc<AtomicU64>,
+    clipboard_write_policy: Arc<ClipboardWritePolicy>,
+    desktop_notification_policy: Arc<DesktopNotificationPolicy>,
 }
 
 impl LinuxGhosttyApp {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         colors: Option<&TerminalColors>,
+        shell: Option<&str>,
         font_family: Option<&str>,
+        font_fallback: Option<&[String]>,
         font_size: Option<f32>,
         background_opacity: Option<f32>,
         background_blur: Option<bool>,
@@ -67,17 +87,36 @@ impl LinuxGhosttyApp {
         _background_image_position: Option<&str>,
         _background_image_fit: Option<&str>,
         _background_image_repeat: Option<bool>,
+        clipboard_write: bool,
     ) -> Result<Self, String> {
+        let (shell_program, shell_args) = match shell.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(shell) => match parse_configured_shell(shell) {
+                Ok((program, args)) => (Some(program), Some(args)),
+                Err(error) => {
+                    log::warn!(
+                        "{error}; falling back to automatic Linux shell detection instead of blocking startup"
+                    );
+                    (default_linux_shell_program(), None)
+                }
+            },
+            None => (default_linux_shell_program(), None),
+        };
+
         Ok(Self {
             config: Mutex::new(LinuxBackendConfig {
-                shell_program: default_linux_shell_program(),
+                shell_program,
+                shell_args,
                 font_family: font_family.map(ToOwned::to_owned),
+                font_fallback: font_fallback.unwrap_or_default().to_vec(),
                 font_size,
                 colors: colors.cloned(),
                 background_opacity: clamp_opacity(background_opacity.unwrap_or(1.0)),
                 background_blur: background_blur.unwrap_or(false),
+                clipboard_write,
             }),
             wake_generation: Arc::new(AtomicU64::new(1)),
+            clipboard_write_policy: clipboard_write_policy(clipboard_write),
+            desktop_notification_policy: desktop_notification_policy(),
         })
     }
 
@@ -98,6 +137,7 @@ impl LinuxGhosttyApp {
         &self,
         colors: &TerminalColors,
         font_family: &str,
+        font_fallback: &[String],
         font_size: f32,
         background_opacity: f32,
         background_blur: bool,
@@ -110,6 +150,7 @@ impl LinuxGhosttyApp {
     ) -> Result<(), String> {
         let mut config = self.config.lock();
         config.font_family = Some(font_family.to_string());
+        config.font_fallback = font_fallback.to_vec();
         config.font_size = Some(font_size);
         config.colors = Some(colors.clone());
         config.background_opacity = clamp_opacity(background_opacity);
@@ -131,17 +172,38 @@ impl LinuxGhosttyApp {
 
     pub fn set_color_scheme(&self, _dark: bool) {}
 
+    pub fn set_clipboard_write_enabled(&self, enabled: bool) -> Result<(), String> {
+        if !enabled {
+            self.clipboard_write_policy.set_enabled(false);
+        }
+        self.config.lock().clipboard_write = enabled;
+        if enabled {
+            self.clipboard_write_policy.set_enabled(true);
+        }
+        Ok(())
+    }
+
     pub fn backend_config(&self) -> LinuxBackendConfig {
         self.config.lock().clone()
     }
 
-    pub fn default_pty_options(&self, cwd: Option<&str>) -> LinuxPtyOptions {
+    pub fn default_pty_options(&self, cwd: Option<&std::path::Path>) -> LinuxPtyOptions {
         let config = self.backend_config();
+        let (program, command_program) = if config.shell_args.is_some() {
+            (None, config.shell_program.clone().map(OsString::from))
+        } else {
+            (config.shell_program.clone(), None)
+        };
         LinuxPtyOptions {
             cwd: cwd.map(PathBuf::from),
-            program: config.shell_program,
+            program,
+            command_program,
+            command_args: config.shell_args,
             wake_generation: Some(self.wake_generation.clone()),
             theme: config.colors,
+            clipboard_write: config.clipboard_write,
+            clipboard_write_policy: self.clipboard_write_policy.clone(),
+            desktop_notification_policy: self.desktop_notification_policy.clone(),
             ..LinuxPtyOptions::default()
         }
     }
@@ -186,6 +248,16 @@ fn default_linux_shell_program() -> Option<String> {
     None
 }
 
+fn parse_configured_shell(shell: &str) -> Result<(String, Vec<OsString>), String> {
+    let mut argv = shell_words::split(shell)
+        .map_err(|error| format!("invalid terminal shell command: {error}"))?
+        .into_iter();
+    let program = argv
+        .next()
+        .ok_or_else(|| "terminal shell command must name a program".to_string())?;
+    Ok((program, argv.map(OsString::from).collect()))
+}
+
 /// One per pane. The GPUI view attaches the PTY + VT session lazily
 /// once the pane has real bounds.
 pub struct LinuxGhosttyTerminal {
@@ -194,6 +266,9 @@ pub struct LinuxGhosttyTerminal {
 }
 
 impl LinuxGhosttyTerminal {
+    pub const SUPPORTS_FOREGROUND_PROCESS_GROUP_ID: bool = true;
+    pub const SUPPORTS_TTY_NAME: bool = false;
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(None)),
@@ -209,12 +284,12 @@ impl LinuxGhosttyTerminal {
         self.inner.lock().is_some()
     }
 
-    pub fn spawn_with_options(&self, options: LinuxPtyOptions) -> Result<(), String> {
+    pub fn spawn_with_options(&self, options: LinuxPtyOptions) -> Result<(), LinuxPtySpawnError> {
         let mut options = options;
         if options.wake_callback.is_none() {
             options.wake_callback = self.wake_callback.lock().clone();
         }
-        let session = LinuxPtySession::spawn(options).map_err(|err| err.to_string())?;
+        let session = LinuxPtySession::spawn(options)?;
         self.attach(session);
         Ok(())
     }
@@ -241,12 +316,12 @@ impl LinuxGhosttyTerminal {
         }
     }
 
-    pub fn resize_surface(&self, size: SurfaceSize) {
-        if let Some(session) = self.inner.lock().as_ref() {
-            if let Err(err) = session.resize(size) {
-                log::debug!("linux pty resize failed: {err:#}");
-            }
-        }
+    pub fn resize_surface(&self, size: SurfaceSize) -> Result<(), String> {
+        let guard = self.inner.lock();
+        let Some(session) = guard.as_ref() else {
+            return Err("linux terminal is not attached".to_string());
+        };
+        session.resize(size).map_err(|err| format!("{err:#}"))
     }
 
     pub fn size(&self) -> SurfaceSize {
@@ -265,8 +340,14 @@ impl LinuxGhosttyTerminal {
     }
 
     pub fn set_content_scale(&self, _scale: f64) {}
-    pub fn set_focus(&self, _focused: bool) {}
-    pub fn set_occlusion(&self, _occluded: bool) {}
+    pub fn set_focus(&self, focused: bool) {
+        if let Some(session) = self.inner.lock().as_ref()
+            && let Err(err) = session.set_focus(focused)
+        {
+            log::warn!("failed to report terminal focus: {err}");
+        }
+    }
+    pub fn set_visible(&self, _visible: bool) {}
     pub fn set_color_scheme(&self, dark: bool) {
         if let Some(session) = self.inner.lock().as_ref() {
             session.set_dark_mode(dark);
@@ -275,6 +356,13 @@ impl LinuxGhosttyTerminal {
 
     pub fn perform_binding_action(&self, _action: &str) -> Result<bool, String> {
         Ok(false)
+    }
+
+    pub(crate) fn search_screen(&self) -> Option<Arc<crate::vt::VtScreen>> {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(|session| session.vt().clone())
     }
 
     pub fn clear_screen_and_scrollback(&self) -> Result<(), String> {
@@ -295,6 +383,7 @@ impl LinuxGhosttyTerminal {
         &self,
         colors: &TerminalColors,
         _font_family: &str,
+        _font_fallback: &[String],
         _font_size: f32,
         _background_opacity: f32,
         _background_blur: bool,
@@ -311,11 +400,31 @@ impl LinuxGhosttyTerminal {
         Ok(())
     }
 
-    /// Returns the current libghostty-vt screen snapshot, if a PTY
-    /// session has been spawned. Used by `con-app/src/linux_view.rs`
-    /// to drive the styled-cell paint path.
+    /// Returns the current libghostty-vt screen snapshot when a PTY
+    /// session exists and render extraction succeeds. Used by
+    /// `con-app/src/linux_view.rs` to drive the styled-cell paint path.
     pub fn snapshot(&self) -> Option<ScreenSnapshot> {
-        self.inner.lock().as_ref().map(LinuxPtySession::snapshot)
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::snapshot)
+    }
+
+    pub fn acknowledge_snapshot(&self, generation: u64) {
+        if let Some(session) = self.inner.lock().as_ref() {
+            session.acknowledge_snapshot(generation);
+        }
+    }
+
+    pub fn render_hold_deadline(&self) -> Option<std::time::Instant> {
+        self.search_screen()?.render_hold_deadline()
+    }
+
+    pub fn expire_render_hold(&self, deadline: std::time::Instant) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(|session| session.expire_render_hold(deadline))
     }
 
     pub fn write_to_pty(&self, data: &[u8]) {
@@ -327,14 +436,34 @@ impl LinuxGhosttyTerminal {
     }
 
     pub fn send_text(&self, text: &str) {
-        self.write_to_pty(text.as_bytes());
+        if let Some(session) = self.inner.lock().as_ref()
+            && let Err(err) = session.send_text(text)
+        {
+            log::debug!("linux terminal text write failed: {err:#}");
+        }
     }
 
-    pub fn is_bracketed_paste(&self) -> bool {
-        self.inner
-            .lock()
-            .as_ref()
-            .is_some_and(LinuxPtySession::is_bracketed_paste)
+    pub fn send_key(&self, event: &VtKeyEvent<'_>) -> Result<VtKeyOutcome, String> {
+        let guard = self.inner.lock();
+        let Some(session) = guard.as_ref() else {
+            return Ok(VtKeyOutcome::default());
+        };
+        session.send_key(event).map_err(|err| err.to_string())
+    }
+
+    pub fn paste_text(
+        &self,
+        text: &str,
+        source: crate::vt::VtPasteSource,
+        confirm_unsafe_paste: bool,
+    ) -> Result<crate::vt::VtPasteResult, String> {
+        let guard = self.inner.lock();
+        let Some(session) = guard.as_ref() else {
+            return Ok(crate::vt::VtPasteResult::Empty);
+        };
+        session
+            .paste_text(text, source, confirm_unsafe_paste)
+            .map_err(|err| err.to_string())
     }
 
     pub fn is_decckm(&self) -> bool {
@@ -351,12 +480,117 @@ impl LinuxGhosttyTerminal {
     pub fn send_mouse_pos(&self, _x: f64, _y: f64, _mods: i32) {}
     pub fn send_mouse_scroll(&self, _x: f64, _y: f64, _mods: i32) {}
 
+    /// Forward normalized input to the shared encoder. Selection bypass is
+    /// owned by the view; protocol filtering and motion deduplication by VT.
+    pub fn mouse_event(&self, event: VtMouseEvent) -> bool {
+        let inner = self.inner.lock();
+        let Some(session) = inner.as_ref() else {
+            return false;
+        };
+        match session.send_mouse_event(event) {
+            Ok(outcome) => outcome.output_written,
+            Err(err) => {
+                log::debug!("linux pty mouse event failed: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// See [`LinuxPtySession::scroll_viewport_or_alt_screen`].
+    pub fn scroll_viewport_or_alt_screen(
+        &self,
+        delta_y_px: f32,
+        row_height_px: f32,
+        allow_alt_screen_keys: bool,
+    ) {
+        if let Some(session) = self.inner.lock().as_ref() {
+            session.scroll_viewport_or_alt_screen(delta_y_px, row_height_px, allow_alt_screen_keys);
+        }
+    }
+
+    /// See [`LinuxPtySession::scroll_viewport_rows`]: negative rows are up.
+    pub fn scroll_viewport_rows(&self, rows: isize) {
+        if let Some(session) = self.inner.lock().as_ref() {
+            session.scroll_viewport_rows(rows);
+        }
+    }
+
+    pub fn scroll_viewport_to_offset(&self, offset: u64) {
+        if let Some(session) = self.inner.lock().as_ref() {
+            session.scroll_viewport_to_offset(offset);
+        }
+    }
+
+    pub fn scrollbar(&self) -> Option<GhosttyScrollbar> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::scrollbar)
+    }
+
+    pub fn mouse_tracking_active(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(LinuxPtySession::mouse_tracking_active)
+    }
+
+    pub fn is_alternate_screen(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(|session| session.vt().is_alternate_screen())
+    }
+
     pub fn request_close(&self) {
         *self.inner.lock() = None;
     }
 
     pub fn title(&self) -> Option<String> {
         self.inner.lock().as_ref().and_then(LinuxPtySession::title)
+    }
+
+    pub fn take_bell(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(LinuxPtySession::take_bell)
+    }
+
+    pub fn progress(&self) -> Option<crate::TerminalProgress> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::progress)
+    }
+
+    pub fn take_program_events(&self) -> Vec<crate::ProgramStatusEvent> {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(LinuxPtySession::take_program_events)
+            .unwrap_or_default()
+    }
+
+    pub fn set_clipboard_write_enabled(&self, enabled: bool) -> Result<(), String> {
+        if let Some(session) = self.inner.lock().as_ref() {
+            session.set_clipboard_write_enabled(enabled)?;
+        }
+        Ok(())
+    }
+
+    pub fn take_clipboard_write(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::take_clipboard_write)
+    }
+
+    pub fn take_desktop_notification(&self) -> Option<crate::DesktopNotification> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::take_desktop_notification)
     }
 
     pub fn current_dir(&self) -> Option<String> {
@@ -366,11 +600,54 @@ impl LinuxGhosttyTerminal {
             .and_then(LinuxPtySession::current_dir)
     }
 
+    pub fn foreground_process_group_id(&self) -> Option<u64> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::foreground_process_group_id)
+    }
+
+    pub fn uses_host_process_namespace(&self) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(LinuxPtySession::uses_host_process_namespace)
+    }
+
+    /// Request host-namespace facts without blocking. Returns false for local PTYs
+    /// and bridges that did not explicitly negotiate metadata support.
+    pub fn request_process_metadata(&self, sequence: u64) -> bool {
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(|session| session.request_process_metadata(sequence))
+    }
+
+    /// Latest asynchronous host response; match its sequence and apply caller timeout policy.
+    pub fn cached_process_metadata(&self) -> Option<super::pty::HostProcessMetadata> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::cached_process_metadata)
+    }
+
+    pub fn tty_name(&self) -> Option<String> {
+        None
+    }
+
     pub fn is_alive(&self) -> bool {
         self.inner
             .lock()
             .as_ref()
             .is_some_and(LinuxPtySession::is_alive)
+    }
+
+    pub fn prompt_state(&self) -> crate::TerminalPromptState {
+        self.inner
+            .lock()
+            .as_ref()
+            .map(LinuxPtySession::prompt_state)
+            .unwrap_or_default()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -417,14 +694,83 @@ impl LinuxGhosttyTerminal {
     pub fn recover_shell_prompt_state(&self) {}
 
     pub fn has_selection(&self) -> bool {
-        false
+        self.inner
+            .lock()
+            .as_ref()
+            .is_some_and(LinuxPtySession::has_selection)
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        None
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::selection_text)
     }
 
-    pub fn clear_selection(&self) {}
+    pub fn take_selection_text(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .as_ref()
+            .and_then(LinuxPtySession::take_selection_text)
+    }
+
+    pub fn clear_selection(&self) {
+        if let Some(session) = self.inner.lock().as_ref() {
+            session.clear_selection();
+        }
+    }
+
+    pub fn selection_press(
+        &self,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
+        click_count: u8,
+        extend: bool,
+    ) -> anyhow::Result<()> {
+        let inner = self.inner.lock();
+        let session = inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("linux terminal session is not attached"))?;
+        session.selection_press(point, geometry, click_count, extend)
+    }
+
+    pub fn selection_drag(
+        &self,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
+    ) -> anyhow::Result<SelectionAutoscroll> {
+        let inner = self.inner.lock();
+        let session = inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("linux terminal session is not attached"))?;
+        session.selection_drag(point, geometry)
+    }
+
+    pub fn selection_autoscroll_tick(
+        &self,
+        point: SelectionPoint,
+        geometry: SelectionGeometry,
+    ) -> anyhow::Result<SelectionAutoscrollUpdate> {
+        let inner = self.inner.lock();
+        let session = inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("linux terminal session is not attached"))?;
+        session.selection_autoscroll_tick(point, geometry)
+    }
+
+    pub fn selection_release(&self, point: Option<(u16, u16)>) -> anyhow::Result<()> {
+        let inner = self.inner.lock();
+        let session = inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("linux terminal session is not attached"))?;
+        session.selection_release(point)
+    }
+
+    pub fn selection_cancel_gesture(&self) {
+        if let Some(session) = self.inner.lock().as_ref() {
+            session.selection_cancel_gesture();
+        }
+    }
 
     pub fn read_screen_text(&self, max_lines: usize) -> Vec<String> {
         self.inner
@@ -470,3 +816,29 @@ impl Default for LinuxGhosttyTerminal {
 
 unsafe impl Send for LinuxGhosttyTerminal {}
 unsafe impl Sync for LinuxGhosttyTerminal {}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_configured_shell;
+
+    #[test]
+    fn configured_shell_preserves_quoted_arguments() {
+        let (program, args) =
+            parse_configured_shell("/usr/bin/fish --init-command 'echo hello world'")
+                .expect("valid shell command");
+
+        assert_eq!(program, "/usr/bin/fish");
+        assert_eq!(
+            args,
+            ["--init-command", "echo hello world"].map(std::ffi::OsString::from)
+        );
+    }
+
+    #[test]
+    fn configured_shell_rejects_unclosed_quotes() {
+        let error = parse_configured_shell("/usr/bin/fish '")
+            .expect_err("invalid shell command should fail");
+
+        assert!(error.contains("invalid terminal shell command"));
+    }
+}

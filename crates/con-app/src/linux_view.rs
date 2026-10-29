@@ -1,37 +1,48 @@
 //! Linux terminal view backed by con's local Unix PTY + libghostty-vt
-//! parser. Phase 4 styled-cell renderer: this view consumes the parsed
-//! `ScreenSnapshot` from `con-ghostty` and paints each row as a GPUI
-//! `StyledText` element with one `TextRun` per styled span. That keeps
-//! prompt colors, ANSI palette, bold/italic/underline, and selection
-//! inverse working without bringing the full D3D11 / DirectWrite stack
-//! the Windows backend needs.
-//!
-//! Rendering trade-off: this is a CPU-side per-cell paint path, not a
-//! real glyph atlas. It's good enough for shell prompts, vim/less, and
-//! basic TUIs while the long-term GPUI-owned grid renderer matures, and
-//! it avoids the previous "trim to plain text" downgrade that hid color
-//! and layout state. The Windows D3D11 path remains the model for the
-//! eventual native renderer.
+//! parser. Each row is one GPUI canvas with cached, fixed-grid text spans.
+//! ASCII cells batch together; non-ASCII native cells shape independently
+//! so host shaping cannot recombine cells across terminal boundaries.
+//! GPUI still owns glyph rasterization; this is not a dedicated terminal
+//! atlas. Colors, decorations, selection, and cursor geometry use the same
+//! native grid, including wide-cell tails and concealed graphemes.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::{Duration, Instant};
 
+use con_ghostty::cursor::{CursorBlink, CursorStyle};
+use con_ghostty::vt::{
+    SelectionAutoscroll, SelectionAutoscrollUpdate, SelectionGeometry, SelectionPoint, VtKeyAction,
+    VtKeyEvent, VtKeyModifiers, VtMouseAction, VtMouseButton, VtMouseEvent, VtMouseModifiers,
+    VtPasteResult, VtPasteSource,
+};
 use con_ghostty::{
-    ATTR_BOLD, ATTR_INVERSE, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE, GhosttyApp,
-    GhosttySplitDirection, GhosttyTerminal, ScreenSnapshot, SurfaceSize, VtCell, VtCursor,
+    ATTR_BOLD, ATTR_INVERSE, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE, DesktopNotification,
+    GhosttyApp, GhosttySplitDirection, GhosttyTerminal, KittyImage, KittyPlacement, ScreenSnapshot,
+    SurfaceSize, TerminalProgress, VtCell, VtCursor,
 };
 use futures::StreamExt;
 use futures::channel::mpsc::unbounded;
 use gpui::*;
-use gpui_component::ActiveTheme;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::ContextMenuExt;
+use gpui_component::{ActiveTheme, Sizable as _};
+use image::{Frame, RgbaImage};
+use smallvec::SmallVec;
 
+use crate::mouse_sequence::MouseButtonSequence;
+use crate::terminal_find::{TerminalFind, TerminalFindDismissed, TerminalFindUpdated};
 use crate::terminal_ime::{TerminalImeInputHandler, TerminalImeView};
 use crate::terminal_links::{self, TerminalLink};
 use crate::terminal_paste::{
-    TerminalPastePayload, payload_from_clipboard, payload_from_external_paths,
+    TerminalPastePayload, copy_selection_to_clipboard, payload_from_clipboard,
+    payload_from_external_paths, unsafe_paste_preview,
 };
-use crate::terminal_restore::{key_down_may_write_terminal, restored_terminal_output};
+use crate::terminal_restore::restored_terminal_output;
+use crate::terminal_scrollbar::{
+    SCROLLBAR_INSET_PX, SCROLLBAR_WIDTH_PX, ThumbDrag, ThumbLayout, thumb_layout, track_click_rows,
+};
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
 const MIN_FONT_SIZE_PX: f32 = 12.0;
@@ -39,6 +50,143 @@ const DEFAULT_CELL_WIDTH_RATIO: f32 = 0.62;
 const DEFAULT_CELL_HEIGHT_RATIO: f32 = 1.45;
 const TERMINAL_PADDING_X_PX: f32 = 12.0;
 const TERMINAL_PADDING_Y_PX: f32 = 10.0;
+/// Pane bounds converted from device px can land slightly below an exact grid fit.
+const GRID_FIT_TOLERANCE_PX: f32 = 0.01;
+const KITTY_BELOW_BACKGROUND_LIMIT: i32 = i32::MIN / 2;
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(15);
+const BUNDLED_LINUX_FONT_FAMILY: &str = "IoskeleyMono";
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct FontResolutionKey {
+    font: Font,
+    codepoint: u32,
+}
+
+#[derive(Clone)]
+struct LinuxFontFace {
+    id: fontdb::ID,
+    canonical_family: SharedString,
+    weight: u16,
+    style: fontdb::Style,
+}
+
+static LINUX_FONT_DATABASE: LazyLock<fontdb::Database> = LazyLock::new(|| {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    for font in [
+        include_bytes!("../../../assets/fonts/IoskeleyMono-Regular.ttf").as_slice(),
+        include_bytes!("../../../assets/fonts/IoskeleyMono-Bold.ttf").as_slice(),
+        include_bytes!("../../../assets/fonts/IoskeleyMono-Italic.ttf").as_slice(),
+        include_bytes!("../../../assets/fonts/IoskeleyMono-BoldItalic.ttf").as_slice(),
+    ] {
+        database.load_font_data(font.to_vec());
+    }
+    database
+});
+
+static LINUX_FONT_FACE_INDEX: LazyLock<HashMap<String, Vec<LinuxFontFace>>> = LazyLock::new(|| {
+    let mut index = HashMap::<String, Vec<LinuxFontFace>>::new();
+    for face in LINUX_FONT_DATABASE.faces() {
+        let canonical_family = face
+            .families
+            .first()
+            .map(|(name, _)| SharedString::from(name.clone()))
+            .unwrap_or_else(|| SharedString::from(face.post_script_name.clone()));
+        let indexed = LinuxFontFace {
+            id: face.id,
+            canonical_family,
+            weight: face.weight.0,
+            style: face.style,
+        };
+        for (family, _) in &face.families {
+            index
+                .entry(normalize_linux_family(family))
+                .or_default()
+                .push(indexed.clone());
+        }
+    }
+    index
+});
+
+static LINUX_FONT_RESOLUTION_CACHE: LazyLock<
+    parking_lot::Mutex<HashMap<FontResolutionKey, SharedString>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+fn normalize_linux_family(family: &str) -> String {
+    family
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn linux_family_for_glyph(font: &Font, glyph: char) -> SharedString {
+    // Terminal control/ASCII glyphs overwhelmingly belong to the primary and
+    // bypassing the database keeps the hot shell-prompt path lock-free.
+    if glyph.is_ascii() {
+        return font.family.clone();
+    }
+
+    let key = FontResolutionKey {
+        font: font.clone(),
+        codepoint: glyph as u32,
+    };
+    if let Some(family) = LINUX_FONT_RESOLUTION_CACHE.lock().get(&key).cloned() {
+        return family;
+    }
+
+    let mut candidates = Vec::with_capacity(
+        1 + font
+            .fallbacks
+            .as_ref()
+            .map_or(0, |fallbacks| fallbacks.fallback_list().len()),
+    );
+    candidates.push(font.family.as_ref());
+    if let Some(fallbacks) = font.fallbacks.as_ref() {
+        candidates.extend(fallbacks.fallback_list().iter().map(String::as_str));
+    }
+
+    let resolved = candidates
+        .into_iter()
+        .find_map(|family| linux_family_with_glyph(family, glyph, font.weight, font.style))
+        .unwrap_or_else(|| font.family.clone());
+    let mut cache = LINUX_FONT_RESOLUTION_CACHE.lock();
+    if cache.len() >= 16_384 {
+        cache.clear();
+    }
+    cache.insert(key, resolved.clone());
+    resolved
+}
+
+fn linux_family_with_glyph(
+    family: &str,
+    glyph: char,
+    weight: FontWeight,
+    style: FontStyle,
+) -> Option<SharedString> {
+    let desired_style = match style {
+        FontStyle::Normal => fontdb::Style::Normal,
+        FontStyle::Italic => fontdb::Style::Italic,
+        FontStyle::Oblique => fontdb::Style::Oblique,
+    };
+    let desired_weight = weight.0.clamp(1.0, u16::MAX as f32) as u16;
+    let face = LINUX_FONT_FACE_INDEX
+        .get(&normalize_linux_family(family))?
+        .iter()
+        .min_by_key(|face| {
+            (
+                u8::from(face.style != desired_style),
+                face.weight.abs_diff(desired_weight),
+            )
+        })?;
+    let has_glyph = LINUX_FONT_DATABASE.with_face_data(face.id, |data, index| {
+        ttf_parser::Face::parse(data, index)
+            .ok()
+            .and_then(|face| face.glyph_index(glyph))
+            .is_some()
+    })?;
+    has_glyph.then(|| face.canonical_family.clone())
+}
 
 /// Resolved logical font size used for both the cell-grid estimate
 /// (`estimate_surface_size`) and the actual paint (`render`). Both
@@ -64,32 +212,240 @@ fn cell_height_px(font_size_px: f32) -> f32 {
     (font_size_px * DEFAULT_CELL_HEIGHT_RATIO).round().max(14.0)
 }
 
+/// Rows to move Con's scrollback for Shift+PgUp or Shift+PgDn, in
+/// libghostty-vt's sign (negative is up), matching Ghostty's default
+/// `scroll_page_up`/`scroll_page_down` bindings. Returns `None` when the
+/// key belongs to the application: any other key or modifier, or the
+/// alternate screen, where pagers and editors use these keys themselves.
+fn scrollback_page_rows(
+    keystroke: &gpui::Keystroke,
+    alternate_screen: bool,
+    page_rows: u16,
+) -> Option<isize> {
+    let modifiers = &keystroke.modifiers;
+    if alternate_screen
+        || !modifiers.shift
+        || modifiers.control
+        || modifiers.alt
+        || modifiers.platform
+        || modifiers.function
+    {
+        return None;
+    }
+    let rows = page_rows.max(1) as isize;
+    match keystroke.key.as_str() {
+        "pageup" => Some(-rows),
+        "pagedown" => Some(rows),
+        _ => None,
+    }
+}
+
+fn physical_cell_size(font_size_px: f32, scale_factor: f32) -> (u32, u32) {
+    let scale_factor = scale_factor.max(f32::EPSILON);
+    (
+        (cell_width_px(font_size_px) * scale_factor)
+            .round()
+            .max(1.0) as u32,
+        (cell_height_px(font_size_px) * scale_factor)
+            .round()
+            .max(1.0) as u32,
+    )
+}
+
+/// PTY grid for a pane of `width` × `height` logical px.
+///
+/// This must describe exactly what `render()` paints: content inset by the
+/// terminal padding on every side, with a column every `cell_width_px` and a
+/// row every `cell_height_px` logical px. Sizing from the whole pane, or from
+/// the rounded physical cell, reports more columns than fit. Full-screen
+/// terminal programs then draw past the right and bottom edges (#485).
+fn grid_size_for_pane(
+    width: f32,
+    height: f32,
+    configured_font_size: f32,
+    scale_factor: f32,
+) -> SurfaceSize {
+    let usable_width = width - 2.0 * TERMINAL_PADDING_X_PX;
+    let usable_height = height - 2.0 * TERMINAL_PADDING_Y_PX;
+    // The PTY pixel size covers only the cells' area, so programs that size
+    // images from `ws_xpixel / ws_col` get the painted cell width.
+    let width_px = ((usable_width * scale_factor).round() as u32).max(1);
+    let height_px = ((usable_height * scale_factor).round() as u32).max(1);
+
+    // Until the real grid renderer lands we estimate the PTY grid
+    // from the configured mono font size so shells and TUIs do
+    // not stay stuck at the initial 80x24 forever. Run through
+    // the same `effective_font_size` clamp `render()` uses so
+    // the grid we ask the PTY for matches the cell size we
+    // actually paint at — picking different floors here would
+    // make text overrun the estimated column count and lines
+    // wrap unexpectedly on the alternate screen.
+    let font_size_px = effective_font_size(configured_font_size);
+    // GPUI paints in logical pixels and applies the display scale after
+    // layout. Scale those exact logical cell metrics for libghostty too;
+    // recalculating the ratios from an already-scaled font can round to a
+    // different device size (for example 9 px logical became 17 px at 2x),
+    // which makes Kitty placements drift away from their text columns.
+    let (physical_cell_width, physical_cell_height) =
+        physical_cell_size(font_size_px, scale_factor);
+    // Count cells in logical px, the space `render()` lays them out in. The
+    // rounded physical cell differs at fractional scales (15 device px for a
+    // 9 px cell at 1.7x, which paints 15.3), and that error adds up across a row.
+    let cells_in = |usable: f32, cell: f32| {
+        ((usable + GRID_FIT_TOLERANCE_PX) / cell)
+            .floor()
+            .max(1.0)
+            .min(f32::from(u16::MAX)) as u16
+    };
+    let columns = cells_in(usable_width, cell_width_px(font_size_px));
+    let rows = cells_in(usable_height, cell_height_px(font_size_px));
+
+    SurfaceSize {
+        columns,
+        rows,
+        width_px,
+        height_px,
+        cell_width_px: physical_cell_width,
+        cell_height_px: physical_cell_height,
+    }
+}
+
+/// The painted grid a pointer is mapped onto.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PointerGrid {
+    columns: u16,
+    rows: u16,
+    font_size_px: f32,
+    scale_factor: f32,
+    /// Logical px, padding included.
+    pane_height: f32,
+}
+
+/// A pointer mapped onto the painted grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GridPointer {
+    col: u16,
+    row: u16,
+    /// Device px from the pane origin, for Ghostty's selection gesture.
+    selection_x_px: f32,
+    selection_y_px: f32,
+    /// Device px from the grid origin, for Ghostty's mouse encoder.
+    report_x_px: f32,
+    report_y_px: f32,
+    geometry: SelectionGeometry,
+}
+
+/// Map a pointer at (`local_x`, `local_y`) logical px from the pane origin
+/// onto the painted grid. Returns `None` for non-finite positions, an empty
+/// grid, or a pointer in the padding unless `clamp_to_grid` is set.
+///
+/// `render()` paints a column every `cell_width_px` logical px, but Ghostty
+/// divides device px by the whole-pixel `physical_cell_size`. At fractional
+/// scales those differ (15.3 against 15 device px for a 9 px cell at 1.7x),
+/// and the error grows across a row (#486). So the positions handed to
+/// Ghostty are rescaled to put each painted cell on a device cell.
+fn pointer_in_grid(
+    local_x: f32,
+    local_y: f32,
+    grid: PointerGrid,
+    clamp_to_grid: bool,
+) -> Option<GridPointer> {
+    if grid.columns == 0 || grid.rows == 0 || !local_x.is_finite() || !local_y.is_finite() {
+        return None;
+    }
+    let scale = grid.scale_factor.max(f32::EPSILON);
+    let scale = if scale.is_finite() { scale } else { 1.0 };
+    let cell_width = cell_width_px(grid.font_size_px);
+    let cell_height = cell_height_px(grid.font_size_px);
+    let (device_cell_width, device_cell_height) = physical_cell_size(grid.font_size_px, scale);
+    let padding_left = (TERMINAL_PADDING_X_PX * scale).round().max(0.0);
+    let padding_top = (TERMINAL_PADDING_Y_PX * scale).round().max(0.0);
+
+    // Painted cells, measured from the grid origin.
+    let cells_x = (local_x - TERMINAL_PADDING_X_PX) / cell_width;
+    let cells_y = (local_y - TERMINAL_PADDING_Y_PX) / cell_height;
+    let columns = f32::from(grid.columns);
+    let rows = f32::from(grid.rows);
+    if !clamp_to_grid && (cells_x < 0.0 || cells_y < 0.0 || cells_x >= columns || cells_y >= rows) {
+        return None;
+    }
+    let col = cells_x.floor().clamp(0.0, columns - 1.0) as u16;
+    let row = cells_y.floor().clamp(0.0, rows - 1.0) as u16;
+
+    // Not clamped: drag autoscroll needs positions outside the grid.
+    let report_x_px = cells_x * device_cell_width as f32;
+    let report_y_px = cells_y * device_cell_height as f32;
+    // Autoscroll compares against the pane's bottom edge, padding included,
+    // in the same rescaled space as the pointer.
+    let pane_bottom_cells = (grid.pane_height - TERMINAL_PADDING_Y_PX) / cell_height;
+    let screen_height_px =
+        ((padding_top + pane_bottom_cells * device_cell_height as f32).ceil() as u32).max(1);
+    Some(GridPointer {
+        col,
+        row,
+        selection_x_px: padding_left + report_x_px,
+        selection_y_px: padding_top + report_y_px,
+        report_x_px,
+        report_y_px,
+        geometry: SelectionGeometry {
+            columns: u32::from(grid.columns),
+            cell_width_px: device_cell_width,
+            padding_left_px: padding_left as u32,
+            screen_height_px,
+        },
+    })
+}
+
 actions!(ghostty, [ConsumeTab, ConsumeTabPrev]);
 
 #[allow(dead_code)]
-pub struct GhosttyTitleChanged(pub Option<String>);
+pub struct GhosttyTitleChanged {
+    pub content_changed: bool,
+}
+pub struct GhosttyBell;
 pub struct GhosttyProcessExited;
 pub struct GhosttyFocusChanged;
 pub struct GhosttySplitRequested(pub GhosttySplitDirection);
 pub struct GhosttyCwdChanged(pub Option<String>);
+pub struct GhosttyProgressChanged;
+pub struct GhosttyDesktopNotification(pub DesktopNotification);
 
 impl EventEmitter<GhosttyTitleChanged> for GhosttyView {}
+impl EventEmitter<GhosttyBell> for GhosttyView {}
 impl EventEmitter<GhosttyProcessExited> for GhosttyView {}
 impl EventEmitter<GhosttyFocusChanged> for GhosttyView {}
 impl EventEmitter<GhosttySplitRequested> for GhosttyView {}
 impl EventEmitter<GhosttyCwdChanged> for GhosttyView {}
+impl EventEmitter<GhosttyProgressChanged> for GhosttyView {}
+impl EventEmitter<GhosttyDesktopNotification> for GhosttyView {}
+
+#[derive(Clone, Copy)]
+enum LeftMouseSequence {
+    LocalSelection,
+    TerminalReport,
+}
 
 pub struct GhosttyView {
     app: Arc<GhosttyApp>,
     terminal: Option<Arc<GhosttyTerminal>>,
+    terminal_find: Option<Entity<TerminalFind>>,
     focus_handle: FocusHandle,
-    initial_cwd: Option<String>,
+    terminal_focused: bool,
+    cursor_blink: CursorBlink,
+    cursor_blink_task: Option<(Instant, Task<()>)>,
+    render_hold_task: Option<(Instant, Task<()>)>,
+    cursor_subscriptions: Vec<Subscription>,
+    display_cursor: VtCursor,
+    initial_cwd: Option<std::path::PathBuf>,
     restored_screen_text: Option<Vec<String>>,
+    initial_command: Option<crate::startup_args::TerminalCommand>,
+    startup_error: Option<String>,
     initial_font_size: f32,
     initialized: bool,
     process_exit_emitted: bool,
-    last_title: Option<String>,
+    pub(crate) terminal_title: con_core::terminal_title::TerminalTitle,
     last_cwd: Option<String>,
+    last_progress: Option<TerminalProgress>,
     pending_write: Option<Vec<u8>>,
     snapshot: Option<ScreenSnapshot>,
     row_cache: Vec<CachedTerminalRow>,
@@ -97,6 +453,8 @@ pub struct GhosttyView {
     row_cache_cursor: Option<VtCursor>,
     row_cache_style: Option<RowCacheStyleKey>,
     row_cache_shape: Option<(u16, u16)>,
+    kitty_images: HashMap<KittyImageKey, Arc<RenderImage>>,
+    failed_kitty_images: HashSet<KittyImageKey>,
     /// Latched after the first PTY snapshot that contained any
     /// printable content. Used to gate the "Waiting for shell
     /// prompt…" placeholder so it disappears the moment bash echoes
@@ -108,16 +466,39 @@ pub struct GhosttyView {
     scale_factor: f32,
     ime_marked_text: Option<String>,
     ime_selected_range: Option<Range<usize>>,
-    last_surface_size: Option<(u32, u32, u16, u16)>,
+    last_surface_size: Option<SurfaceSize>,
     mouse_down_link: Option<TerminalLink>,
     suppress_link_mouse_up: bool,
     hovered_link: Option<TerminalLink>,
     last_mouse_position: Option<Point<Pixels>>,
-    selection: Option<TerminalSelection>,
-    drag_anchor: Option<(u16, u64)>,
+    mouse_modifiers: Modifiers,
+    terminal_left_mouse_sequence: MouseButtonSequence<LeftMouseSequence>,
+    /// Whether the most recent right-button press was consumed by the
+    /// terminal app (a mouse report emitted). The context-menu builder
+    /// suppresses con's menu only when this is true.
+    terminal_mouse_right_consumed: Option<bool>,
+    terminal_right_mouse_sequence: MouseButtonSequence<()>,
+    terminal_middle_mouse_sequence: MouseButtonSequence<()>,
+    selection_autoscroll_epoch: u64,
+    selection_autoscroll_active: bool,
+    /// Set while the left button holds the scrollbar thumb.
+    scrollbar_drag: Option<ThumbDrag>,
+    /// Scrollbar state read with `snapshot`, so the thumb matches the rows
+    /// being painted.
+    scrollbar: Option<con_ghostty::GhosttyScrollbar>,
+    keys_awaiting_release: HashMap<String, crate::terminal_keys::TrackedVtKey>,
+    pending_unsafe_paste: Option<(String, VtPasteSource)>,
 }
 
 pub fn init(cx: &mut App) {
+    // Build the system-font coverage index off the UI thread so the first CJK
+    // or symbol glyph does not pause terminal row construction.
+    let _ = std::thread::Builder::new()
+        .name("con-font-fallback-index".to_string())
+        .spawn(|| {
+            LazyLock::force(&LINUX_FONT_FACE_INDEX);
+        });
+
     // Tab is a focus-navigation key in GPUI Root. Bind it inside the
     // terminal context so shells receive completion requests instead of
     // the window moving focus away from the terminal.
@@ -130,8 +511,9 @@ pub fn init(cx: &mut App) {
 impl GhosttyView {
     pub fn new(
         app: Arc<GhosttyApp>,
-        cwd: Option<String>,
+        cwd: Option<std::path::PathBuf>,
         restored_screen_text: Option<Vec<String>>,
+        command: Option<crate::startup_args::TerminalCommand>,
         font_size: f32,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -153,6 +535,7 @@ impl GhosttyView {
                                 changed |= view.refresh_snapshot();
                             }
                         }
+                        view.arm_render_hold(cx);
                         if changed {
                             cx.notify();
                         }
@@ -168,14 +551,24 @@ impl GhosttyView {
         Self {
             app,
             terminal: Some(terminal),
+            terminal_find: None,
             focus_handle: cx.focus_handle(),
+            terminal_focused: false,
+            cursor_blink: CursorBlink::default(),
+            cursor_blink_task: None,
+            render_hold_task: None,
+            cursor_subscriptions: Vec::new(),
+            display_cursor: VtCursor::default(),
             initial_cwd: cwd,
             restored_screen_text,
+            initial_command: command,
+            startup_error: None,
             initial_font_size: font_size,
             initialized: false,
             process_exit_emitted: false,
-            last_title: None,
+            terminal_title: Default::default(),
             last_cwd: None,
+            last_progress: None,
             pending_write: None,
             snapshot: None,
             row_cache: Vec::new(),
@@ -183,6 +576,8 @@ impl GhosttyView {
             row_cache_cursor: None,
             row_cache_style: None,
             row_cache_shape: None,
+            kitty_images: HashMap::new(),
+            failed_kitty_images: HashSet::new(),
             seen_any_output: false,
             pane_bounds: None,
             scale_factor: 1.0,
@@ -193,13 +588,59 @@ impl GhosttyView {
             suppress_link_mouse_up: false,
             hovered_link: None,
             last_mouse_position: None,
-            selection: None,
-            drag_anchor: None,
+            mouse_modifiers: Modifiers::default(),
+            terminal_left_mouse_sequence: MouseButtonSequence::default(),
+            terminal_mouse_right_consumed: None,
+            terminal_right_mouse_sequence: MouseButtonSequence::default(),
+            terminal_middle_mouse_sequence: MouseButtonSequence::default(),
+            selection_autoscroll_epoch: 0,
+            selection_autoscroll_active: false,
+            scrollbar_drag: None,
+            scrollbar: None,
+            keys_awaiting_release: HashMap::new(),
+            pending_unsafe_paste: None,
         }
     }
 
     pub fn terminal(&self) -> Option<&Arc<GhosttyTerminal>> {
         self.terminal.as_ref()
+    }
+
+    /// Layout fixtures must not spawn a shell that wakes the test scheduler.
+    #[cfg(test)]
+    pub(crate) fn prepare_for_layout_test(&mut self) {
+        self.terminal = None;
+    }
+
+    pub(crate) fn show_terminal_find(
+        &mut self,
+        needle: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(find) = self.terminal_find.as_ref() {
+            find.update(cx, |find, cx| find.set_needle(needle, window, cx));
+            return;
+        }
+        let Some(terminal) = self.terminal.clone() else {
+            return;
+        };
+        let focus = self.focus_handle.clone();
+        let find = cx.new(|cx| TerminalFind::new(terminal, focus, needle, window, cx));
+        cx.subscribe(&find, |this, _, _: &TerminalFindUpdated, cx| {
+            this.refresh_snapshot();
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&find, |this, _, _: &TerminalFindDismissed, cx| {
+            this.terminal_find = None;
+            this.refresh_snapshot();
+            cx.notify();
+        })
+        .detach();
+        find.update(cx, |find, cx| find.focus(window, cx));
+        self.terminal_find = Some(find);
+        cx.notify();
     }
 
     pub fn write_or_queue(&mut self, data: &[u8]) {
@@ -228,7 +669,15 @@ impl GhosttyView {
         self.terminal
             .as_ref()
             .and_then(|terminal| terminal.current_dir())
-            .or_else(|| self.initial_cwd.clone())
+            .or_else(|| {
+                self.initial_cwd
+                    .as_ref()
+                    .map(|cwd| cwd.to_string_lossy().into_owned())
+            })
+    }
+
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        self.last_progress
     }
 
     pub fn is_alive(&self) -> bool {
@@ -242,39 +691,45 @@ impl GhosttyView {
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        extract_selection_text(self.snapshot.as_ref()?, self.selection?)
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.selection_text())
+    }
+
+    pub fn release_mouse_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(position) = self.last_mouse_position else {
+            return;
+        };
+        if self.finish_left_mouse_sequence(position) {
+            cx.notify();
+        }
     }
 
     fn clear_selection(&mut self) -> bool {
-        let changed = self.selection.take().is_some() || self.drag_anchor.take().is_some();
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+        let changed = terminal.has_selection();
+        terminal.clear_selection();
         changed
     }
 
     fn copy_current_selection_to_clipboard(&mut self, cx: &mut App) -> bool {
-        if self.selection.is_none() {
-            return false;
-        }
-
-        let Some(selection) = self
-            .selection_text()
-            .filter(|selection| !selection.is_empty())
-        else {
-            self.clear_selection();
-            return true;
-        };
-
-        cx.write_to_clipboard(ClipboardItem::new_string(selection));
-        self.clear_selection();
-        true
+        self.terminal
+            .as_ref()
+            .is_some_and(|terminal| copy_selection_to_clipboard(terminal, cx))
     }
 
-    pub fn shutdown_surface(&mut self) {
+    pub fn shutdown_surface(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
+        self.release_tracked_keys();
+        self.cancel_pointer_interactions();
         if let Some(terminal) = &self.terminal {
             terminal.request_close();
         }
         self.initialized = false;
+        self.startup_error = None;
         self.process_exit_emitted = false;
-        self.last_title = None;
+        self.terminal_title = Default::default();
         self.pending_write = None;
         self.snapshot = None;
         self.row_cache.clear();
@@ -282,6 +737,10 @@ impl GhosttyView {
         self.row_cache_cursor = None;
         self.row_cache_style = None;
         self.row_cache_shape = None;
+        for image in self.kitty_images.drain().map(|(_, image)| image) {
+            cx.drop_image(image, window.as_deref_mut());
+        }
+        self.failed_kitty_images.clear();
         self.seen_any_output = false;
         self.ime_marked_text = None;
         self.ime_selected_range = None;
@@ -290,11 +749,26 @@ impl GhosttyView {
         self.suppress_link_mouse_up = false;
         self.hovered_link = None;
         self.last_mouse_position = None;
-        self.selection = None;
-        self.drag_anchor = None;
+        self.terminal_left_mouse_sequence = MouseButtonSequence::default();
+        self.terminal_mouse_right_consumed = None;
+        self.terminal_right_mouse_sequence = MouseButtonSequence::default();
+        self.terminal_middle_mouse_sequence = MouseButtonSequence::default();
+        self.stop_selection_autoscroll();
+        self.keys_awaiting_release.clear();
+        self.pending_unsafe_paste = None;
     }
 
     pub fn set_surface_focus_state(&mut self, focused: bool) {
+        if !focused {
+            self.release_tracked_keys();
+            self.cancel_pointer_interactions();
+        }
+    }
+
+    pub fn sync_terminal_focus(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        let focused = window.is_window_active() && self.focus_handle.is_focused(window);
+        self.terminal_focused = focused;
+        self.set_surface_focus_state(focused);
         if let Some(terminal) = &self.terminal {
             terminal.set_focus(focused);
         }
@@ -338,12 +812,26 @@ impl GhosttyView {
         if terminal.take_needs_render() {
             changed |= self.refresh_snapshot();
         }
+        self.arm_render_hold(cx);
+
+        if terminal.take_bell() {
+            changed = true;
+            cx.emit(GhosttyBell);
+        }
+
+        if let Some(text) = terminal.take_clipboard_write() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+
+        if let Some(notification) = terminal.take_desktop_notification() {
+            changed = true;
+            cx.emit(GhosttyDesktopNotification(notification));
+        }
 
         let title = terminal.title();
-        if title != self.last_title {
-            self.last_title = title.clone();
+        if let Some(content_changed) = self.terminal_title.update(title) {
             changed = true;
-            cx.emit(GhosttyTitleChanged(title));
+            cx.emit(GhosttyTitleChanged { content_changed });
         }
 
         let cwd = terminal.current_dir();
@@ -353,7 +841,14 @@ impl GhosttyView {
             cx.emit(GhosttyCwdChanged(cwd));
         }
 
-        if !terminal.is_alive() && !self.process_exit_emitted {
+        let progress = terminal.progress();
+        if progress != self.last_progress {
+            self.last_progress = progress;
+            changed = true;
+            cx.emit(GhosttyProgressChanged);
+        }
+
+        if self.initialized && !terminal.is_alive() && !self.process_exit_emitted {
             self.process_exit_emitted = true;
             changed = true;
             cx.emit(GhosttyProcessExited);
@@ -380,12 +875,22 @@ impl GhosttyView {
             if terminal.take_needs_render() {
                 changed |= self.refresh_snapshot();
             }
+            self.arm_render_hold(cx);
+
+            if terminal.take_bell() {
+                changed = true;
+                cx.emit(GhosttyBell);
+            }
+
+            if let Some(notification) = terminal.take_desktop_notification() {
+                changed = true;
+                cx.emit(GhosttyDesktopNotification(notification));
+            }
 
             let title = terminal.title();
-            if title != self.last_title {
-                self.last_title = title.clone();
+            if let Some(content_changed) = self.terminal_title.update(title) {
                 changed = true;
-                cx.emit(GhosttyTitleChanged(title));
+                cx.emit(GhosttyTitleChanged { content_changed });
             }
 
             let cwd = terminal.current_dir();
@@ -395,7 +900,14 @@ impl GhosttyView {
                 cx.emit(GhosttyCwdChanged(cwd));
             }
 
-            if !terminal.is_alive() && !self.process_exit_emitted {
+            let progress = terminal.progress();
+            if progress != self.last_progress {
+                self.last_progress = progress;
+                changed = true;
+                cx.emit(GhosttyProgressChanged);
+            }
+
+            if self.initialized && !terminal.is_alive() && !self.process_exit_emitted {
                 self.process_exit_emitted = true;
                 changed = true;
                 cx.emit(GhosttyProcessExited);
@@ -414,6 +926,9 @@ impl GhosttyView {
     }
 
     fn ensure_session(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.startup_error.is_some() {
+            return false;
+        }
         let Some(terminal) = self.terminal.as_ref().cloned() else {
             return false;
         };
@@ -424,9 +939,15 @@ impl GhosttyView {
         }
 
         let mut options = self.app.default_pty_options(self.initial_cwd.as_deref());
+        if let Some(command) = self.initial_command.as_ref() {
+            options.command_program = Some(command.program.clone());
+            options.command_args = Some(command.args.clone());
+        }
         options.initial_output = restored_terminal_output(self.restored_screen_text.as_deref());
         match terminal.spawn_with_options(options) {
             Ok(()) => {
+                terminal.set_focus(self.terminal_focused);
+                self.initial_command = None;
                 self.restored_screen_text = None;
                 self.initialized = true;
                 self.process_exit_emitted = false;
@@ -434,16 +955,53 @@ impl GhosttyView {
                 if let Some(pending) = self.pending_write.take() {
                     terminal.write_to_pty(&pending);
                 }
-                self.last_title = terminal.title();
+                self.terminal_title.update(terminal.title());
                 let _ = self.refresh_snapshot();
                 cx.notify();
                 true
             }
             Err(err) => {
                 log::error!("failed to start linux shell: {err}");
-                false
+                if err.is_retryable() {
+                    false
+                } else {
+                    self.startup_error = Some(format!("Unable to launch terminal: {err}"));
+                    self.initial_command = None;
+                    cx.notify();
+                    true
+                }
             }
         }
+    }
+
+    fn arm_render_hold(&mut self, cx: &mut Context<Self>) {
+        let deadline = self
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.render_hold_deadline());
+        if self
+            .render_hold_task
+            .as_ref()
+            .map(|(deadline, _)| *deadline)
+            == deadline
+        {
+            return;
+        }
+        self.render_hold_task = deadline.map(|deadline| {
+            let terminal = self.terminal.as_ref().unwrap().clone();
+            let task = cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(deadline.saturating_duration_since(Instant::now()))
+                    .await;
+                if terminal.expire_render_hold(deadline) {
+                    let _ = this.update(cx, |view, cx| {
+                        view.refresh_snapshot();
+                        cx.notify();
+                    });
+                }
+            });
+            (deadline, task)
+        });
     }
 
     fn refresh_snapshot(&mut self) -> bool {
@@ -467,19 +1025,27 @@ impl GhosttyView {
         {
             return false;
         }
-        // Latch once the parser has handed us any printable cell.
+        // Latch once the parser has handed us any visible terminal output.
         // Used to suppress the "Waiting for shell prompt…" placeholder
         // for the lifetime of the PTY session — important for TUIs
         // (htop, vim, less, fzf, …) that switch to the alternate
         // screen and leave the grid empty for ~hundreds of ms before
         // drawing their UI. Without this latch the placeholder would
         // briefly flash over a black backdrop on every alt-screen
-        // entry and look like a regression in shell readiness.
-        if !self.seen_any_output && snapshot.cells.iter().any(|c| c.codepoint != 0) {
+        // entry and look like a regression in shell readiness. Image-only
+        // applications count too, otherwise the placeholder would shift
+        // their Kitty placements down by one synthetic row indefinitely.
+        if !self.seen_any_output
+            && (snapshot.cells.iter().any(|c| c.codepoint != 0)
+                || !snapshot.kitty_placements.is_empty())
+        {
             self.seen_any_output = true;
         }
-        self.clear_selection();
         self.snapshot = Some(snapshot);
+        self.scrollbar = self
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.scrollbar());
         true
     }
 
@@ -492,90 +1058,314 @@ impl GhosttyView {
         };
 
         let size = self.estimate_surface_size(bounds, scale_factor);
-        let signature = (size.width_px, size.height_px, size.columns, size.rows);
-        if self.last_surface_size == Some(signature) {
+        if self.last_surface_size == Some(size) {
             return false;
         }
 
-        self.clear_selection();
-        terminal.resize_surface(size);
-        self.last_surface_size = Some(signature);
+        if let Err(err) = terminal.resize_surface(size) {
+            // Do not cache a resize that never reached the PTY. A later layout
+            // or render pass can retry the same dimensions after backpressure
+            // on the Flatpak host bridge clears.
+            log::debug!("linux pty resize failed: {err}");
+            return false;
+        }
+        self.last_surface_size = Some(size);
         false
     }
 
     fn estimate_surface_size(&self, bounds: Bounds<Pixels>, scale_factor: f32) -> SurfaceSize {
-        let width_px = ((f32::from(bounds.size.width) * scale_factor).ceil() as u32).max(1);
-        let height_px = ((f32::from(bounds.size.height) * scale_factor).ceil() as u32).max(1);
-
-        // Until the real grid renderer lands we estimate the PTY grid
-        // from the configured mono font size so shells and TUIs do
-        // not stay stuck at the initial 80x24 forever. Run through
-        // the same `effective_font_size` clamp `render()` uses so
-        // the grid we ask the PTY for matches the cell size we
-        // actually paint at — picking different floors here would
-        // make text overrun the estimated column count and lines
-        // wrap unexpectedly on the alternate screen.
-        let font_size_px = effective_font_size(self.initial_font_size) * scale_factor;
-        let cell_width = cell_width_px(font_size_px) as u32;
-        let cell_height = cell_height_px(font_size_px) as u32;
-        let columns = (width_px / cell_width.max(1))
-            .max(1)
-            .min(u32::from(u16::MAX)) as u16;
-        let rows = (height_px / cell_height.max(1))
-            .max(1)
-            .min(u32::from(u16::MAX)) as u16;
-
-        SurfaceSize {
-            columns,
-            rows,
-            width_px,
-            height_px,
-            cell_width_px: cell_width,
-            cell_height_px: cell_height,
-        }
+        grid_size_for_pane(
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            self.initial_font_size,
+            scale_factor,
+        )
     }
 
     fn cell_from_event_position(&self, pos: Point<Pixels>) -> Option<(u16, u16)> {
-        self.cell_from_event_position_impl(pos, false)
+        self.selection_input_from_event_position(pos, false)
+            .map(|(point, _)| (point.col, point.row))
     }
 
-    fn clamped_cell_from_event_position(&self, pos: Point<Pixels>) -> Option<(u16, u16)> {
-        self.cell_from_event_position_impl(pos, true)
+    fn report_mouse(
+        &self,
+        pos: Point<Pixels>,
+        action: VtMouseAction,
+        button: Option<VtMouseButton>,
+    ) -> bool {
+        // The encoder clamps captured drags/releases to the grid. An initial
+        // press (including wheel buttons) in padding must not hit an edge cell.
+        if action == VtMouseAction::Press && self.cell_from_event_position(pos).is_none() {
+            return false;
+        }
+        let Some(pointer) = self.grid_pointer(pos, true) else {
+            return false;
+        };
+        self.terminal().is_some_and(|terminal| {
+            terminal.mouse_event(VtMouseEvent {
+                action,
+                button,
+                // Shift starts a local gesture, but must not suppress release
+                // of an already captured terminal gesture.
+                modifiers: VtMouseModifiers {
+                    shift: self.mouse_modifiers.shift,
+                    control: self.mouse_modifiers.control,
+                    alt: self.mouse_modifiers.alt,
+                },
+                surface_x_px: pointer.report_x_px,
+                surface_y_px: pointer.report_y_px,
+            })
+        })
     }
 
-    fn cell_from_event_position_impl(
+    /// Send a wheel event to the application when it tracks the mouse, and
+    /// otherwise scroll Con's own scrollback (or, on the alternate screen,
+    /// send cursor keys). Shift always scrolls Con's view, per xterm.
+    /// Returns whether the event was used.
+    fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent) -> bool {
+        let Some(terminal) = self.terminal().filter(|t| t.is_attached()).cloned() else {
+            return false;
+        };
+        self.mouse_modifiers = event.modifiers;
+        let row_height_px = cell_height_px(effective_font_size(self.initial_font_size));
+
+        // Decide from the application's modes, not from whether a report was
+        // written: a press over the padding writes nothing, and must not
+        // scroll Con's view under an application that tracks the mouse.
+        if terminal.mouse_tracking_active() && !event.modifiers.shift {
+            let delta = match event.delta {
+                ScrollDelta::Lines(delta) => delta,
+                ScrollDelta::Pixels(delta) => point(f32::from(delta.x), f32::from(delta.y)),
+            };
+            // Match Windows: one directional report per host wheel event,
+            // not a burst of synthetic presses proportional to acceleration.
+            let mut reported = false;
+            for (amount, negative, positive) in [
+                (delta.y, VtMouseButton::Button5, VtMouseButton::Button4),
+                (delta.x, VtMouseButton::Button7, VtMouseButton::Button6),
+            ] {
+                if amount.abs() < f32::EPSILON {
+                    continue;
+                }
+                let button = if amount < 0.0 { negative } else { positive };
+                reported |= self.report_mouse(event.position, VtMouseAction::Press, Some(button));
+            }
+            return reported;
+        }
+
+        let delta = match event.delta {
+            ScrollDelta::Lines(delta) => point(delta.x * row_height_px, delta.y * row_height_px),
+            ScrollDelta::Pixels(delta) => point(f32::from(delta.x), f32::from(delta.y)),
+        };
+        // GPUI's X11 and Wayland backends turn a Shift+wheel into horizontal
+        // movement, so with Shift held the vertical amount arrives on `x`.
+        let delta_y_px = if event.modifiers.shift && delta.y.abs() < f32::EPSILON {
+            delta.x
+        } else {
+            delta.y
+        };
+        if delta_y_px.abs() < f32::EPSILON {
+            return false;
+        }
+        terminal.scroll_viewport_or_alt_screen(delta_y_px, row_height_px, !event.modifiers.shift);
+        true
+    }
+
+    /// Page Con's scrollback for Shift+PgUp/PgDn on the primary screen.
+    /// Returns whether the key was used; unused keys go to the application.
+    fn try_page_scrollback(&mut self, keystroke: &gpui::Keystroke) -> bool {
+        if !matches!(keystroke.key.as_str(), "pageup" | "pagedown") || !keystroke.modifiers.shift {
+            return false;
+        }
+        let Some(terminal) = self.terminal().filter(|t| t.is_attached()).cloned() else {
+            return false;
+        };
+        let page_rows = self.snapshot.as_ref().map_or(1, |snapshot| snapshot.rows);
+        let Some(rows) = scrollback_page_rows(keystroke, terminal.is_alternate_screen(), page_rows)
+        else {
+            return false;
+        };
+        terminal.scroll_viewport_rows(rows);
+        true
+    }
+
+    /// The scrollbar state and thumb position, or `None` when there is no
+    /// scrollback to show.
+    fn scrollbar_thumb(&self) -> Option<(con_ghostty::GhosttyScrollbar, ThumbLayout)> {
+        let bounds = self.pane_bounds?;
+        let scrollbar = self.scrollbar?;
+        Some((
+            scrollbar,
+            thumb_layout(f32::from(bounds.size.height), scrollbar)?,
+        ))
+    }
+
+    fn start_scrollbar_drag(&mut self, pos: Point<Pixels>) {
+        if let Some((scrollbar, layout)) = self.scrollbar_thumb() {
+            self.scrollbar_drag = Some(ThumbDrag::start(f32::from(pos.y), scrollbar, layout));
+        }
+    }
+
+    fn drag_scrollbar(&mut self, pos: Point<Pixels>) {
+        let Some(target) = self
+            .scrollbar_drag
+            .and_then(|drag| drag.target_offset(f32::from(pos.y)))
+        else {
+            return;
+        };
+        if let Some(terminal) = self.terminal() {
+            terminal.scroll_viewport_to_offset(target);
+        }
+    }
+
+    /// Returns whether a thumb drag was in progress.
+    fn end_scrollbar_drag(&mut self) -> bool {
+        self.scrollbar_drag.take().is_some()
+    }
+
+    fn page_scrollbar_toward(&mut self, pos: Point<Pixels>) {
+        let (Some((scrollbar, layout)), Some(bounds)) = (self.scrollbar_thumb(), self.pane_bounds)
+        else {
+            return;
+        };
+        let local_y = f32::from(pos.y) - f32::from(bounds.origin.y);
+        let rows = track_click_rows(local_y, layout, scrollbar);
+        if rows != 0
+            && let Some(terminal) = self.terminal()
+        {
+            terminal.scroll_viewport_rows(rows);
+        }
+    }
+
+    /// The overlay thumb, drawn like the Windows view's: theme foreground
+    /// at low opacity, no border or shadow.
+    fn render_terminal_scrollbar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, layout) = self.scrollbar_thumb()?;
+        let theme = cx.theme();
+        let thumb_color = theme.foreground.opacity(0.28);
+        let thumb_hover_color = theme.foreground.opacity(0.42);
+        // While the thumb is held, follow the pointer and the release across
+        // the whole window: the pane's own listeners stop at its edge.
+        let window_drag_listener = self.scrollbar_drag.is_some().then(|| {
+            let view = cx.entity().downgrade();
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, _| {
+                    let move_view = view.clone();
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+                        let _ = move_view.update(cx, |this, cx| {
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                this.drag_scrollbar(event.position);
+                            } else {
+                                this.end_scrollbar_drag();
+                            }
+                            cx.notify();
+                        });
+                    });
+                    let up_view = view.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                            return;
+                        }
+                        let _ = up_view.update(cx, |this, cx| {
+                            if this.end_scrollbar_drag() {
+                                cx.notify();
+                            }
+                        });
+                    });
+                },
+            )
+            .absolute()
+            .size_0()
+        });
+
+        Some(
+            div()
+                .absolute()
+                .top(px(SCROLLBAR_INSET_PX))
+                .right(px(2.0))
+                .bottom(px(SCROLLBAR_INSET_PX))
+                .w(px(SCROLLBAR_WIDTH_PX + 4.0))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        window.prevent_default();
+                        this.page_scrollbar_toward(event.position);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(layout.thumb_top_px - SCROLLBAR_INSET_PX))
+                        .right(px(2.0))
+                        .w(px(SCROLLBAR_WIDTH_PX))
+                        .h(px(layout.thumb_height_px))
+                        .rounded(px(SCROLLBAR_WIDTH_PX / 2.0))
+                        .bg(thumb_color)
+                        .hover(|style| style.bg(thumb_hover_color))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                window.prevent_default();
+                                this.start_scrollbar_drag(event.position);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .children(window_drag_listener)
+                .into_any_element(),
+        )
+    }
+
+    fn grid_pointer(&self, pos: Point<Pixels>, clamp_to_grid: bool) -> Option<GridPointer> {
+        let bounds = self.pane_bounds?;
+        let snapshot = self.snapshot.as_ref()?;
+        pointer_in_grid(
+            f32::from(pos.x) - f32::from(bounds.origin.x),
+            f32::from(pos.y) - f32::from(bounds.origin.y),
+            PointerGrid {
+                columns: snapshot.cols,
+                rows: snapshot.rows,
+                font_size_px: effective_font_size(self.initial_font_size),
+                scale_factor: self.scale_factor,
+                pane_height: f32::from(bounds.size.height),
+            },
+            clamp_to_grid,
+        )
+    }
+
+    fn selection_input_from_event_position(
         &self,
         pos: Point<Pixels>,
         clamp_to_grid: bool,
-    ) -> Option<(u16, u16)> {
-        let bounds = self.pane_bounds?;
-        let snapshot = self.snapshot.as_ref()?;
-        let font_size_px = effective_font_size(self.initial_font_size);
-        let cell_width_px = cell_width_px(font_size_px);
-        let cell_height_px = cell_height_px(font_size_px);
-
-        let mut local_x = f32::from(pos.x) - f32::from(bounds.origin.x) - TERMINAL_PADDING_X_PX;
-        let mut local_y = f32::from(pos.y) - f32::from(bounds.origin.y) - TERMINAL_PADDING_Y_PX;
-        let grid_width = snapshot.cols as f32 * cell_width_px;
-        let grid_height = snapshot.rows as f32 * cell_height_px;
-        if clamp_to_grid {
-            local_x = local_x.clamp(0.0, (grid_width - f32::EPSILON).max(0.0));
-            local_y = local_y.clamp(0.0, (grid_height - f32::EPSILON).max(0.0));
-        } else if local_x < 0.0 || local_y < 0.0 || local_x >= grid_width || local_y >= grid_height
-        {
-            return None;
-        }
-
-        let col = (local_x / cell_width_px).floor() as u16;
-        let row = (local_y / cell_height_px).floor() as u16;
-        if col >= snapshot.cols || row >= snapshot.rows {
-            return None;
-        }
-        Some((col, row))
+    ) -> Option<(SelectionPoint, SelectionGeometry)> {
+        let pointer = self.grid_pointer(pos, clamp_to_grid)?;
+        Some((
+            SelectionPoint {
+                col: pointer.col,
+                row: pointer.row,
+                surface_x_px: f64::from(pointer.selection_x_px),
+                surface_y_px: f64::from(pointer.selection_y_px),
+            },
+            pointer.geometry,
+        ))
     }
 
     fn link_at_position(&self, pos: Point<Pixels>) -> Option<TerminalLink> {
         let (col, row) = self.cell_from_event_position(pos)?;
+        let inner = self.terminal.as_ref()?.inner();
+        let guard = inner.lock();
+        // An unreadable OSC 8 target must not fall back to the visible label.
+        if let Some(uri) = guard.as_ref()?.hyperlink_at(col, row).ok()? {
+            return Some(TerminalLink::osc8(&uri, col, row));
+        }
         let snapshot = self.snapshot.as_ref()?;
         terminal_links::link_at_snapshot(snapshot, col, row)
     }
@@ -596,76 +1386,266 @@ impl GhosttyView {
 
     fn clear_hovered_link(&mut self) -> bool {
         let changed = self.hovered_link.take().is_some();
-        self.last_mouse_position = None;
+        if !self.terminal_left_mouse_sequence.is_active()
+            && !self.terminal_right_mouse_sequence.is_active()
+            && !self.terminal_middle_mouse_sequence.is_active()
+        {
+            self.last_mouse_position = None;
+        }
         changed
     }
 
-    fn begin_selection(&mut self, pos: Point<Pixels>) -> bool {
-        let Some(point) = self.selection_point_from_event_position(pos) else {
-            return self.clear_selection();
-        };
-        self.drag_anchor = Some(point);
-        self.selection = Some(TerminalSelection {
-            anchor: point,
-            extent: point,
-        });
-        true
-    }
-
-    fn update_selection_drag(&mut self, pos: Point<Pixels>) -> bool {
-        let Some(anchor) = self.drag_anchor else {
-            return false;
-        };
-        let Some(extent) = self.clamped_selection_point_from_event_position(pos) else {
-            return false;
-        };
-        let next = TerminalSelection { anchor, extent };
-        if self.selection == Some(next) {
-            return false;
-        }
-        self.selection = Some(next);
-        true
-    }
-
-    fn finish_selection(&mut self, pos: Point<Pixels>) -> bool {
-        let anchor = self.drag_anchor.take();
-        let Some(anchor) = anchor else {
-            return false;
-        };
-        let extent = self
-            .clamped_selection_point_from_event_position(pos)
-            .unwrap_or(anchor);
-        if anchor == extent {
-            return self.clear_selection();
-        }
-        let next = TerminalSelection { anchor, extent };
-        if self.selection == Some(next) {
-            return false;
-        }
-        self.selection = Some(next);
-        true
-    }
-
-    fn selection_point_from_event_position(&self, pos: Point<Pixels>) -> Option<(u16, u64)> {
-        self.cell_from_event_position(pos)
-            .map(|cell| self.selection_point_from_cell(cell))
-    }
-
-    fn clamped_selection_point_from_event_position(
-        &self,
+    fn begin_local_selection(
+        &mut self,
         pos: Point<Pixels>,
-    ) -> Option<(u16, u64)> {
-        self.clamped_cell_from_event_position(pos)
-            .map(|cell| self.selection_point_from_cell(cell))
+        shift: bool,
+        click_count: usize,
+    ) -> bool {
+        let Some((point, geometry)) = self.selection_input_from_event_position(pos, false) else {
+            return false;
+        };
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+        let click_count = u8::try_from(click_count).unwrap_or(u8::MAX);
+        let result = terminal.selection_press(point, geometry, click_count, shift);
+        match result {
+            Ok(()) => {
+                self.terminal_left_mouse_sequence
+                    .begin(LeftMouseSequence::LocalSelection);
+                true
+            }
+            Err(err) => {
+                log::debug!("linux terminal selection press failed: {err:#}");
+                terminal.selection_cancel_gesture();
+                false
+            }
+        }
     }
 
-    fn selection_point_from_cell(&self, cell: (u16, u16)) -> (u16, u64) {
-        let viewport_offset = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.scrollbar)
-            .map_or(0, |scrollbar| scrollbar.offset);
-        (cell.0, viewport_offset.saturating_add(cell.1 as u64))
+    fn update_left_mouse_sequence(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(sequence) = self.terminal_left_mouse_sequence.payload().copied() else {
+            return false;
+        };
+        let Some((point, geometry)) = self.selection_input_from_event_position(pos, true) else {
+            return false;
+        };
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+
+        match sequence {
+            LeftMouseSequence::TerminalReport => {
+                self.report_mouse(pos, VtMouseAction::Motion, Some(VtMouseButton::Left))
+            }
+            LeftMouseSequence::LocalSelection => match terminal.selection_drag(point, geometry) {
+                Ok(autoscroll) => {
+                    self.update_selection_autoscroll(autoscroll, cx);
+                    true
+                }
+                Err(err) => {
+                    log::debug!("linux terminal selection drag failed: {err:#}");
+                    terminal.selection_cancel_gesture();
+                    self.stop_selection_autoscroll();
+                    false
+                }
+            },
+        }
+    }
+
+    fn update_mouse_sequences(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
+        // GPUI Wayland clears its single pressed-button slot when *any* button
+        // is released. Only matching mouse-up or focus cancellation ends our
+        // captures; a buttonless move may still belong to a held chord button.
+        let button = event.pressed_button.or_else(|| {
+            if self.terminal_left_mouse_sequence.is_active() {
+                Some(MouseButton::Left)
+            } else if self.terminal_middle_mouse_sequence.is_active() {
+                Some(MouseButton::Middle)
+            } else if self.terminal_right_mouse_sequence.is_active() {
+                Some(MouseButton::Right)
+            } else {
+                None
+            }
+        });
+        match button {
+            Some(MouseButton::Left) => self.update_left_mouse_sequence(event.position, cx),
+            Some(MouseButton::Middle) if self.terminal_middle_mouse_sequence.is_active() => {
+                self.report_mouse(
+                    event.position,
+                    VtMouseAction::Motion,
+                    Some(VtMouseButton::Middle),
+                );
+                false
+            }
+            Some(MouseButton::Right) if self.terminal_right_mouse_sequence.is_active() => {
+                self.report_mouse(
+                    event.position,
+                    VtMouseAction::Motion,
+                    Some(VtMouseButton::Right),
+                );
+                false
+            }
+            None if !event.modifiers.shift => {
+                self.report_mouse(event.position, VtMouseAction::Motion, None);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn finish_left_mouse_sequence(&mut self, pos: Point<Pixels>) -> bool {
+        self.stop_selection_autoscroll();
+        let Some(sequence) = self.terminal_left_mouse_sequence.finish() else {
+            return false;
+        };
+        let point = self
+            .selection_input_from_event_position(pos, true)
+            .map(|(point, _)| point);
+        let Some(terminal) = self.terminal.as_ref() else {
+            return true;
+        };
+        match sequence {
+            LeftMouseSequence::TerminalReport => {
+                self.report_mouse(pos, VtMouseAction::Release, Some(VtMouseButton::Left));
+            }
+            LeftMouseSequence::LocalSelection => {
+                if let Err(err) =
+                    terminal.selection_release(point.map(|point| (point.col, point.row)))
+                {
+                    log::debug!("linux terminal selection release failed: {err:#}");
+                    terminal.selection_cancel_gesture();
+                }
+            }
+        }
+        true
+    }
+
+    fn finish_right_mouse_sequence(&mut self, pos: Point<Pixels>) -> bool {
+        let Some(_) = self.terminal_right_mouse_sequence.finish() else {
+            return false;
+        };
+
+        self.report_mouse(pos, VtMouseAction::Release, Some(VtMouseButton::Right));
+        true
+    }
+
+    fn finish_middle_mouse_sequence(&mut self, pos: Point<Pixels>) -> bool {
+        let Some(_) = self.terminal_middle_mouse_sequence.finish() else {
+            return false;
+        };
+        self.report_mouse(pos, VtMouseAction::Release, Some(VtMouseButton::Middle));
+        true
+    }
+
+    fn cancel_left_pointer_interactions(&mut self, position: Point<Pixels>) {
+        self.stop_selection_autoscroll();
+        self.scrollbar_drag = None;
+        self.mouse_down_link = None;
+        self.suppress_link_mouse_up = false;
+        self.finish_left_mouse_sequence(position);
+    }
+
+    fn cancel_pointer_interactions(&mut self) {
+        self.stop_selection_autoscroll();
+        self.scrollbar_drag = None;
+        let Some(position) = self.last_mouse_position else {
+            self.mouse_down_link = None;
+            self.suppress_link_mouse_up = false;
+            if matches!(
+                self.terminal_left_mouse_sequence.finish(),
+                Some(LeftMouseSequence::LocalSelection)
+            ) && let Some(terminal) = self.terminal.as_ref()
+            {
+                terminal.selection_cancel_gesture();
+            }
+            self.terminal_right_mouse_sequence.finish();
+            self.terminal_middle_mouse_sequence.finish();
+            return;
+        };
+        self.cancel_left_pointer_interactions(position);
+        self.finish_right_mouse_sequence(position);
+        self.finish_middle_mouse_sequence(position);
+    }
+
+    fn update_selection_autoscroll(
+        &mut self,
+        autoscroll: SelectionAutoscroll,
+        cx: &mut Context<Self>,
+    ) {
+        if autoscroll == SelectionAutoscroll::None {
+            self.stop_selection_autoscroll();
+            return;
+        }
+        if self.selection_autoscroll_active {
+            return;
+        }
+
+        self.selection_autoscroll_epoch = self.selection_autoscroll_epoch.wrapping_add(1);
+        let epoch = self.selection_autoscroll_epoch;
+        self.selection_autoscroll_active = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(SELECTION_AUTOSCROLL_INTERVAL)
+                    .await;
+                let keep_scrolling = this
+                    .update(cx, |this, cx| {
+                        if !this.selection_autoscroll_active
+                            || this.selection_autoscroll_epoch != epoch
+                            || !matches!(
+                                this.terminal_left_mouse_sequence.payload(),
+                                Some(LeftMouseSequence::LocalSelection)
+                            )
+                        {
+                            return false;
+                        }
+                        let update = this.selection_autoscroll_tick();
+                        if update.direction == SelectionAutoscroll::None {
+                            this.stop_selection_autoscroll();
+                            return false;
+                        }
+                        if update.changed {
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_scrolling {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn selection_autoscroll_tick(&self) -> SelectionAutoscrollUpdate {
+        let Some(position) = self.last_mouse_position else {
+            return SelectionAutoscrollUpdate::default();
+        };
+        let Some((point, geometry)) = self.selection_input_from_event_position(position, true)
+        else {
+            return SelectionAutoscrollUpdate::default();
+        };
+        let Some(terminal) = self.terminal.as_ref() else {
+            return SelectionAutoscrollUpdate::default();
+        };
+        match terminal.selection_autoscroll_tick(point, geometry) {
+            Ok(update) => update,
+            Err(err) => {
+                log::debug!("linux terminal selection autoscroll failed: {err:#}");
+                terminal.selection_cancel_gesture();
+                SelectionAutoscrollUpdate::default()
+            }
+        }
+    }
+
+    fn stop_selection_autoscroll(&mut self) {
+        if !self.selection_autoscroll_active {
+            return;
+        }
+        self.selection_autoscroll_active = false;
+        self.selection_autoscroll_epoch = self.selection_autoscroll_epoch.wrapping_add(1);
     }
 
     fn render_link_cursor_overlay(
@@ -691,15 +1671,99 @@ impl GhosttyView {
         )
     }
 
+    fn send_vt_key(
+        &mut self,
+        tracking_key: &str,
+        event: &VtKeyEvent<'_>,
+    ) -> Result<con_ghostty::vt::VtKeyOutcome, String> {
+        let Some(terminal) = self.terminal.as_ref().cloned() else {
+            return Ok(con_ghostty::vt::VtKeyOutcome::default());
+        };
+        let outcome = terminal.send_key(event)?;
+        if outcome.output_accepted {
+            self.cursor_blink.reset();
+            self.clear_restored_screen_text();
+            self.clear_selection();
+            if outcome.report_releases
+                && event.action != VtKeyAction::Release
+                && !self.keys_awaiting_release.contains_key(tracking_key)
+            {
+                self.keys_awaiting_release.insert(
+                    tracking_key.to_owned(),
+                    crate::terminal_keys::TrackedVtKey::from_non_release_event(event),
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent) -> bool {
+        let Some(tracked) = self.keys_awaiting_release.remove(&event.keystroke.key) else {
+            return false;
+        };
+        let release =
+            tracked.release_with_modifiers(&event.keystroke.key, &event.keystroke.modifiers);
+        match self.send_vt_key(&event.keystroke.key, &release) {
+            Ok(outcome) => outcome.output_accepted,
+            Err(err) => {
+                // Preserve the press so focus loss can retry the release if
+                // this was a transient PTY write failure.
+                self.keys_awaiting_release
+                    .insert(event.keystroke.key.clone(), tracked);
+                log::debug!("linux terminal key release failed: {err}");
+                false
+            }
+        }
+    }
+
+    fn release_tracked_keys(&mut self) {
+        let tracked_keys = std::mem::take(&mut self.keys_awaiting_release);
+        let Some(terminal) = self.terminal.as_ref().cloned() else {
+            return;
+        };
+        for (key, tracked) in tracked_keys {
+            let release = tracked.release(&key);
+            if let Err(err) = terminal.send_key(&release) {
+                self.keys_awaiting_release.insert(key, tracked);
+                log::debug!("linux terminal key release failed: {err}");
+            }
+        }
+    }
+
+    fn send_tab_key(&mut self, shift: bool) -> bool {
+        let event = VtKeyEvent {
+            key: "tab",
+            text: "",
+            unshifted_codepoint: None,
+            action: if self.keys_awaiting_release.contains_key("tab") {
+                VtKeyAction::Repeat
+            } else {
+                VtKeyAction::Press
+            },
+            modifiers: VtKeyModifiers {
+                shift,
+                ..VtKeyModifiers::default()
+            },
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        match self.send_vt_key("tab", &event) {
+            Ok(outcome) => outcome.output_accepted,
+            Err(err) => {
+                log::debug!("linux terminal key encoding failed: {err}");
+                false
+            }
+        }
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(terminal) = self.terminal.as_ref().cloned() else {
+        if self.terminal.is_none() {
             return false;
-        };
+        }
 
         let keystroke = &event.keystroke;
         if keystroke.modifiers.platform {
@@ -717,8 +1781,16 @@ impl GhosttyView {
             event,
             window,
             &crate::SearchFiles,
+        ) || crate::terminal_shortcuts::key_down_starts_action_binding(
+            event,
+            window,
+            &crate::FindInTerminal,
         ) {
             return false;
+        }
+        if self.try_page_scrollback(keystroke) {
+            cx.notify();
+            return true;
         }
         // App-level tab selection. Let GPUI dispatch SelectTab1..9
         // instead of forwarding Ctrl+digit to the shell.
@@ -757,21 +1829,18 @@ impl GhosttyView {
                     return true;
                 }
                 "v" => {
-                    paste_from_clipboard(&terminal, cx);
+                    self.paste_from_clipboard(cx);
                     return true;
                 }
                 _ => {}
             }
         }
 
-        let decckm = terminal.is_decckm();
-        if let Some(bytes) = encode_special_key(&keystroke.key, &keystroke.modifiers, decckm) {
-            terminal.send_text(&bytes);
-            return true;
-        }
-
-        if event.prefer_character_input
-            && !keystroke.modifiers.control
+        // XKB compose and IME completion can arrive as a normal keydown
+        // while GPUI still owns marked text. Its InputHandler must commit
+        // the text and clear that state; encoding here would leave the
+        // preedit overlay stale even though the character reached the PTY.
+        if self.ime_marked_text.is_some()
             && keystroke
                 .key_char
                 .as_deref()
@@ -780,64 +1849,179 @@ impl GhosttyView {
             return false;
         }
 
-        if keystroke.modifiers.control
-            && !keystroke.modifiers.alt
-            && (keystroke.key.len() == 1
-                || keystroke
-                    .key_char
-                    .as_deref()
-                    .is_some_and(|text| text.len() == 1))
-        {
-            if let Some(code) = crate::terminal_keys::ctrl_keystroke_to_c0(
-                &keystroke.key,
-                keystroke.key_char.as_deref(),
-                keystroke.modifiers.shift,
-            ) {
-                let control = [code];
-                let text = std::str::from_utf8(&control)
-                    .expect("terminal C0 control bytes are always valid UTF-8");
-                terminal.send_text(text);
-                return true;
+        let Some(vt_event) = crate::terminal_keys::vt_key_down_event(event) else {
+            return false;
+        };
+        match self.send_vt_key(&keystroke.key, &vt_event) {
+            Ok(outcome) => outcome.output_accepted,
+            Err(err) => {
+                log::debug!("linux terminal key encoding failed: {err}");
+                false
             }
         }
+    }
 
-        if keystroke.modifiers.alt && !keystroke.modifiers.control && !keystroke.modifiers.shift {
-            if let Some(ch) = keystroke.key_char.as_deref().filter(|ch| !ch.is_empty()) {
-                let mut out = String::with_capacity(1 + ch.len());
-                out.push('\x1b');
-                out.push_str(ch);
-                terminal.send_text(&out);
-                return true;
+    fn handle_terminal_paste_payload(
+        &mut self,
+        payload: TerminalPastePayload,
+        source: VtPasteSource,
+    ) -> bool {
+        // A new paste intent invalidates any confirmation for older text,
+        // even when this attempt later turns out to be empty or fails.
+        let replaced_confirmation = self.pending_unsafe_paste.take().is_some();
+        let Some(terminal) = self.terminal.as_ref().cloned() else {
+            return replaced_confirmation;
+        };
+
+        match payload {
+            TerminalPastePayload::Text(text) if !text.is_empty() => {
+                match terminal.paste_text(&text, source, false) {
+                    Ok(VtPasteResult::Accepted) => {
+                        self.clear_restored_screen_text();
+                        self.clear_selection();
+                        true
+                    }
+                    Ok(VtPasteResult::RequiresConfirmation) => {
+                        self.pending_unsafe_paste = Some((text, source));
+                        true
+                    }
+                    Ok(VtPasteResult::Empty) => replaced_confirmation,
+                    Err(err) => {
+                        log::debug!("linux terminal paste failed: {err}");
+                        replaced_confirmation
+                    }
+                }
+            }
+            TerminalPastePayload::ForwardCtrlV => {
+                self.clear_restored_screen_text();
+                self.clear_selection();
+                terminal.send_text("\x16");
+                true
+            }
+            TerminalPastePayload::Text(_) => replaced_confirmation,
+        }
+    }
+
+    fn paste_from_clipboard(&mut self, cx: &mut App) -> bool {
+        let replaced_confirmation = self.pending_unsafe_paste.take().is_some();
+        let Some(payload) = cx
+            .read_from_clipboard()
+            .and_then(|item| payload_from_clipboard(&item))
+        else {
+            return replaced_confirmation;
+        };
+        self.handle_terminal_paste_payload(payload, VtPasteSource::Clipboard)
+            || replaced_confirmation
+    }
+
+    fn confirm_unsafe_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((text, source)) = self.pending_unsafe_paste.take() else {
+            return;
+        };
+        let Some(terminal) = self.terminal.as_ref().cloned() else {
+            self.pending_unsafe_paste = Some((text, source));
+            return;
+        };
+
+        match terminal.paste_text(&text, source, true) {
+            Ok(VtPasteResult::Accepted) => {
+                self.clear_restored_screen_text();
+                self.clear_selection();
+            }
+            Ok(VtPasteResult::Empty) => {}
+            Ok(VtPasteResult::RequiresConfirmation) => {
+                self.pending_unsafe_paste = Some((text, source));
+            }
+            Err(err) => {
+                log::debug!("linux confirmed terminal paste failed: {err}");
+                self.pending_unsafe_paste = Some((text, source));
             }
         }
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
 
-        if let Some(text) = keystroke
-            .key_char
-            .as_deref()
-            .filter(|text| !text.is_empty())
-        {
-            if !keystroke.modifiers.control
-                && !keystroke.modifiers.alt
-                && !keystroke.modifiers.platform
-            {
-                return false;
-            }
-            terminal.send_text(text);
-            return true;
-        }
+    fn cancel_unsafe_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_unsafe_paste = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
 
-        if keystroke.key.len() == 1 {
-            if !keystroke.modifiers.control
-                && !keystroke.modifiers.alt
-                && !keystroke.modifiers.platform
-            {
-                return false;
-            }
-            terminal.send_text(&keystroke.key);
-            return true;
-        }
+    fn render_unsafe_paste_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let text = self.pending_unsafe_paste.as_ref()?.0.as_str();
+        let preview = unsafe_paste_preview(text);
+        let theme = cx.theme();
 
-        false
+        Some(
+            div()
+                .absolute()
+                .left(px(12.0))
+                .right(px(12.0))
+                .bottom(px(12.0))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .occlude()
+                        .w_full()
+                        .max_w(px(620.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .p(px(10.0))
+                        .rounded(px(8.0))
+                        .bg(theme
+                            .warning
+                            .opacity(if theme.is_dark() { 0.18 } else { 0.12 }))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.foreground)
+                                .child("This paste can run commands. Review it before continuing."),
+                        )
+                        .child(
+                            div()
+                                .max_h(px(88.0))
+                                .overflow_hidden()
+                                .px(px(8.0))
+                                .py(px(6.0))
+                                .rounded(px(6.0))
+                                .bg(theme.foreground.opacity(0.06))
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(px(11.0))
+                                .line_height(px(15.0))
+                                .text_color(theme.foreground.opacity(0.82))
+                                .child(preview),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    Button::new("linux-cancel-unsafe-paste")
+                                        .label("Cancel")
+                                        .small()
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.cancel_unsafe_paste(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("linux-confirm-unsafe-paste")
+                                        .label("Paste")
+                                        .small()
+                                        .primary()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm_unsafe_paste(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn ime_cursor_bounds(&self) -> Option<Bounds<Pixels>> {
@@ -858,6 +2042,50 @@ impl GhosttyView {
         ))
     }
 
+    fn sync_kitty_image_cache(
+        &mut self,
+        placements: &[KittyPlacement],
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let active = placements
+            .iter()
+            .map(|placement| KittyImageKey::from(placement.image.as_ref()))
+            .collect::<HashSet<_>>();
+        let mut stale = Vec::new();
+        self.kitty_images.retain(|key, image| {
+            let keep = active.contains(key);
+            if !keep {
+                stale.push(image.clone());
+            }
+            keep
+        });
+        for image in stale {
+            cx.drop_image(image, Some(window));
+        }
+        self.failed_kitty_images.retain(|key| active.contains(key));
+
+        for placement in placements {
+            let key = KittyImageKey::from(placement.image.as_ref());
+            if self.kitty_images.contains_key(&key) || self.failed_kitty_images.contains(&key) {
+                continue;
+            }
+            if let Some(image) = kitty_image_to_render_image(&placement.image) {
+                self.kitty_images.insert(key, image);
+            } else {
+                log::warn!(
+                    "ignoring invalid Kitty image {} generation {} ({}x{}, {} bytes)",
+                    key.id,
+                    key.generation,
+                    placement.image.width,
+                    placement.image.height,
+                    placement.image.rgba.len()
+                );
+                self.failed_kitty_images.insert(key);
+            }
+        }
+    }
+
     fn sync_row_cache(
         &mut self,
         default_fg: Hsla,
@@ -876,13 +2104,21 @@ impl GhosttyView {
         };
 
         let style = RowCacheStyleKey {
-            font_family: base_font.family.clone(),
+            font: base_font.clone(),
             default_fg,
             default_bg,
             font_size,
             line_height,
         };
         let shape = (snapshot.cols, snapshot.rows);
+        let generation = snapshot.generation;
+        // Only a block changes text-run colors. Other shapes are overlays,
+        // so their blink frames need no row reconstruction.
+        let cursor = if self.display_cursor.style == CursorStyle::Block {
+            self.display_cursor
+        } else {
+            VtCursor::default()
+        };
         let force_full_rebuild = self.row_cache_style.as_ref() != Some(&style)
             || self.row_cache_shape != Some(shape)
             || self.row_cache.len() != usize::from(snapshot.rows);
@@ -895,12 +2131,20 @@ impl GhosttyView {
         let mut rows_to_refresh = if force_full_rebuild {
             rows_needing_refresh(snapshot, self.row_cache_cursor, true)
         } else if self.row_cache_generation != Some(snapshot.generation) {
-            // Linux currently paints terminal rows through GPUI `StyledText`
-            // elements, so stale rows remain visible if the VT dirty-row set
+            // Linux caches terminal rows, so stale rows remain visible if the VT dirty-row set
             // misses rows that became blank during alternate-screen restore.
-            // Rebuilding all row elements for a changed snapshot is still
-            // bounded by the visible grid and keeps TUI exits correct.
+            // Checking all visible rows keeps TUI exits correct; unchanged
+            // spans retain their shaped layouts below.
             (0..usize::from(snapshot.rows)).collect()
+        } else if self.row_cache_cursor != Some(cursor) {
+            // The cached snapshot retains its original damage; blink-only
+            // frames must not rebuild those unrelated rows again.
+            self.row_cache_cursor
+                .into_iter()
+                .chain(Some(cursor))
+                .filter(|cursor| cursor.visible && cursor.row < snapshot.rows)
+                .map(|cursor| usize::from(cursor.row))
+                .collect()
         } else {
             Vec::new()
         };
@@ -912,10 +2156,10 @@ impl GhosttyView {
             let row_start = row_idx * usize::from(snapshot.cols);
             let row_end = row_start + usize::from(snapshot.cols);
             let Some(cells) = snapshot.cells.get(row_start..row_end) else {
-                break;
+                return;
             };
-            let cursor_for_row = cursor_col_for_row(snapshot.cursor, row_idx);
-            self.row_cache[row_idx] = build_terminal_row(
+            let cursor_for_row = cursor_col_for_row(cursor, row_idx);
+            let mut row = build_terminal_row(
                 cells,
                 default_fg,
                 default_bg,
@@ -924,48 +2168,22 @@ impl GhosttyView {
                 None,
                 default_bg,
             );
+            // Keep the existing full-row content check for alternate-screen
+            // restores, but don't discard unchanged rows' shaped layouts.
+            if !force_full_rebuild && row.spans == self.row_cache[row_idx].spans {
+                row.shaped = self.row_cache[row_idx].shaped.clone();
+            }
+            self.row_cache[row_idx] = row;
         }
 
         self.row_cache_generation = Some(snapshot.generation);
-        self.row_cache_cursor = Some(snapshot.cursor);
+        self.row_cache_cursor = Some(cursor);
         self.row_cache_style = Some(style);
         self.row_cache_shape = Some(shape);
+        if let Some(terminal) = self.terminal.as_ref() {
+            terminal.acknowledge_snapshot(generation);
+        }
     }
-}
-
-fn send_paste(terminal: &GhosttyTerminal, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-
-    if terminal.is_bracketed_paste() {
-        let mut wrapped = String::with_capacity(text.len() + 12);
-        wrapped.push_str("\x1b[200~");
-        wrapped.push_str(text);
-        wrapped.push_str("\x1b[201~");
-        terminal.send_text(&wrapped);
-    } else {
-        terminal.send_text(text);
-    }
-}
-
-fn send_terminal_paste_payload(terminal: &GhosttyTerminal, payload: TerminalPastePayload) {
-    match payload {
-        TerminalPastePayload::Text(text) => send_paste(terminal, &text),
-        TerminalPastePayload::ForwardCtrlV => terminal.send_text("\x16"),
-    }
-}
-
-fn paste_from_clipboard(terminal: &GhosttyTerminal, cx: &mut App) -> bool {
-    let Some(payload) = cx
-        .read_from_clipboard()
-        .and_then(|item| payload_from_clipboard(&item))
-    else {
-        return false;
-    };
-
-    send_terminal_paste_payload(terminal, payload);
-    true
 }
 
 impl Focusable for GhosttyView {
@@ -998,6 +2216,7 @@ impl TerminalImeView for GhosttyView {
     fn send_ime_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let _ = self.ensure_session(cx);
         if !text.is_empty() {
+            self.cursor_blink.reset();
             self.clear_restored_screen_text();
             self.clear_selection();
         }
@@ -1019,7 +2238,52 @@ impl TerminalImeView for GhosttyView {
 }
 
 impl Render for GhosttyView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.cursor_subscriptions.is_empty() {
+            self.cursor_subscriptions = vec![
+                cx.on_focus(&self.focus_handle, window, |this, _, cx| {
+                    this.cursor_blink.reset();
+                    cx.notify();
+                }),
+                cx.on_blur(&self.focus_handle, window, |_, _, cx| cx.notify()),
+                cx.observe_window_activation(window, |this, _, cx| {
+                    this.cursor_blink.reset();
+                    cx.notify();
+                }),
+            ];
+        }
+        self.display_cursor = self.cursor_blink.update(
+            self.snapshot
+                .as_ref()
+                .map_or(VtCursor::default(), |snapshot| snapshot.cursor),
+            self.focus_handle.is_focused(window) && window.is_window_active(),
+            Instant::now(),
+        );
+        if self
+            .cursor_blink_task
+            .as_ref()
+            .map(|(deadline, _)| *deadline)
+            != self.cursor_blink.deadline()
+        {
+            self.cursor_blink_task = self.cursor_blink.deadline().map(|deadline| {
+                let task = cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(deadline.saturating_duration_since(Instant::now()))
+                        .await;
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                });
+                (deadline, task)
+            });
+        }
+        let unsafe_paste_confirmation = self.render_unsafe_paste_confirmation(cx);
+        let kitty_placements = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.kitty_placements.clone())
+            .unwrap_or_default();
+        self.sync_kitty_image_cache(&kitty_placements, window, cx);
+        let scrollbar_overlay = self.render_terminal_scrollbar(cx);
+
         let theme = cx.theme();
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
@@ -1027,28 +2291,45 @@ impl Render for GhosttyView {
         let menu_focus = focus.clone();
         let entity = cx.entity().downgrade();
         let input_entity = entity.clone();
+        let menu_entity = entity.clone();
         let font_size_px = effective_font_size(self.initial_font_size);
         let line_height_px = cell_height_px(font_size_px);
         let cell_width_px = cell_width_px(font_size_px);
+        let physical_cell = self
+            .last_surface_size
+            .map(|size| (size.cell_width_px, size.cell_height_px))
+            .unwrap_or_else(|| physical_cell_size(font_size_px, self.scale_factor));
+        let mut fallback_families = self.app.backend_config().font_fallback;
+        if !con_core::config::is_bundled_terminal_font_family(&theme.mono_font_family)
+            && !fallback_families
+                .iter()
+                .any(|family| con_core::config::is_bundled_terminal_font_family(family))
+        {
+            fallback_families.push(BUNDLED_LINUX_FONT_FAMILY.to_string());
+        }
+        let fallbacks =
+            (!fallback_families.is_empty()).then(|| FontFallbacks::from_fonts(fallback_families));
         let mono_font = Font {
             family: theme.mono_font_family.clone(),
             features: FontFeatures::default(),
-            fallbacks: None,
+            fallbacks,
             weight: FontWeight::NORMAL,
             style: FontStyle::Normal,
         };
 
-        let status_message = if !self.initialized {
-            Some("Launching Linux shell…")
+        let status_message = if let Some(error) = self.startup_error.clone() {
+            Some(error)
+        } else if !self.initialized {
+            Some("Launching Linux shell…".to_string())
         } else if !self.is_alive() {
-            Some("Linux shell exited")
+            Some("Linux shell exited".to_string())
         } else if !self.seen_any_output {
             // Only show the "waiting for prompt" placeholder before
             // bash has echoed *anything* for the first time. Once
             // the latch flips, alt-screen TUIs like htop / vim that
             // briefly clear the grid stay silent instead of
             // flashing this placeholder over their startup gap.
-            Some("Waiting for shell prompt…")
+            Some("Waiting for shell prompt…".to_string())
         } else {
             None
         };
@@ -1067,8 +2348,23 @@ impl Render for GhosttyView {
             configured_pane_opacity
         };
         let pane_background = theme.background.opacity(pane_opacity);
-        let selection = self.selection;
         let selection_bg = theme.selection.opacity(0.42);
+        let mut has_kitty_images = false;
+        let mut split_terminal_rows = false;
+        for placement in kitty_placements.iter() {
+            let key = KittyImageKey::from(placement.image.as_ref());
+            let valid = self.kitty_images.contains_key(&key)
+                && kitty_placement_geometry(
+                    placement,
+                    cell_width_px,
+                    line_height_px,
+                    physical_cell.0,
+                    physical_cell.1,
+                )
+                .is_some();
+            has_kitty_images |= valid;
+            split_terminal_rows |= valid && placement.z < 0;
+        }
         self.sync_row_cache(
             foreground,
             theme.background,
@@ -1081,6 +2377,9 @@ impl Render for GhosttyView {
             usize::from(self.snapshot.as_ref().map_or(0, |snapshot| snapshot.rows))
                 + if status_message.is_some() { 1 } else { 0 },
         );
+        let mut cell_backgrounds = split_terminal_rows.then(Vec::new);
+        let mut overlay_backgrounds = split_terminal_rows.then(Vec::new);
+        let status_row_offset = usize::from(status_message.is_some());
         if let Some(message) = status_message {
             rows.push(
                 div()
@@ -1088,20 +2387,24 @@ impl Render for GhosttyView {
                     .text_size(px(font_size_px))
                     .line_height(px(line_height_px))
                     .text_color(status_color)
-                    .child(message.to_string())
+                    .child(message)
                     .into_any_element(),
             );
         }
 
         if let Some(snapshot) = self.snapshot.as_ref() {
             for row_idx in 0..usize::from(snapshot.rows) {
-                if let Some(selection_cols) =
-                    selection.and_then(|selection| selection.row_range(row_idx, snapshot))
-                {
+                let selection_cols = snapshot
+                    .selection_ranges
+                    .get(row_idx)
+                    .copied()
+                    .flatten()
+                    .map(|range| (usize::from(range.start), usize::from(range.end)));
+                if let Some(selection_cols) = selection_cols {
                     let row_start = row_idx * usize::from(snapshot.cols);
                     let row_end = row_start + usize::from(snapshot.cols);
                     if let Some(cells) = snapshot.cells.get(row_start..row_end) {
-                        let cursor_for_row = cursor_col_for_row(snapshot.cursor, row_idx);
+                        let cursor_for_row = cursor_col_for_row(self.display_cursor, row_idx);
                         let row = build_terminal_row(
                             cells,
                             foreground,
@@ -1111,18 +2414,50 @@ impl Render for GhosttyView {
                             Some(selection_cols),
                             selection_bg,
                         );
+                        if let (Some(backgrounds), Some(overlays)) =
+                            (cell_backgrounds.as_mut(), overlay_backgrounds.as_mut())
+                        {
+                            append_terminal_backgrounds(
+                                &row,
+                                row_idx + status_row_offset,
+                                backgrounds,
+                                overlays,
+                            );
+                            rows.push(render_terminal_foreground_row(
+                                &row,
+                                px(font_size_px),
+                                px(line_height_px),
+                            ));
+                        } else {
+                            rows.push(render_cached_terminal_row(
+                                &row,
+                                px(font_size_px),
+                                px(line_height_px),
+                            ));
+                        }
+                    }
+                } else if let Some(row) = self.row_cache.get(row_idx) {
+                    if let (Some(backgrounds), Some(overlays)) =
+                        (cell_backgrounds.as_mut(), overlay_backgrounds.as_mut())
+                    {
+                        append_terminal_backgrounds(
+                            row,
+                            row_idx + status_row_offset,
+                            backgrounds,
+                            overlays,
+                        );
+                        rows.push(render_terminal_foreground_row(
+                            row,
+                            px(font_size_px),
+                            px(line_height_px),
+                        ));
+                    } else {
                         rows.push(render_cached_terminal_row(
-                            &row,
+                            row,
                             px(font_size_px),
                             px(line_height_px),
                         ));
                     }
-                } else if let Some(row) = self.row_cache.get(row_idx) {
-                    rows.push(render_cached_terminal_row(
-                        row,
-                        px(font_size_px),
-                        px(line_height_px),
-                    ));
                 }
             }
         }
@@ -1139,24 +2474,173 @@ impl Render for GhosttyView {
             );
         }
 
-        let terminal_content = div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .overflow_hidden()
-            .bg(pane_background)
-            .px(px(TERMINAL_PADDING_X_PX))
-            .py(px(TERMINAL_PADDING_Y_PX))
-            .text_color(foreground)
-            .items_start()
-            .justify_start()
-            .children(rows);
+        let cursor_overlay = self.snapshot.as_ref().and_then(|snapshot| {
+            let cursor = self.display_cursor;
+            if !cursor.visible || cursor.style == CursorStyle::Block {
+                return None;
+            }
+            let (col, cell) = cursor_overlay_cell(snapshot, cursor)?;
+            let color = RowStyle::from_cell(
+                cell,
+                foreground,
+                theme.background,
+                &mono_font,
+                false,
+                false,
+                selection_bg,
+            )
+            .fg;
+            let x = px(cell_width_px) * col as f32;
+            let width = px(cell_width_px)
+                * if cell.width == con_ghostty::vt::CellWidth::Wide {
+                    2.0
+                } else {
+                    1.0
+                };
+            let inset_x = if has_kitty_images {
+                0.0
+            } else {
+                TERMINAL_PADDING_X_PX
+            };
+            let inset_y = if has_kitty_images {
+                0.0
+            } else {
+                TERMINAL_PADDING_Y_PX
+            };
+            Some(render_cursor_overlay(
+                cursor.style,
+                Bounds::new(
+                    point(
+                        x + px(inset_x),
+                        px(inset_y
+                            + (usize::from(cursor.row) + status_row_offset) as f32
+                                * line_height_px),
+                    ),
+                    size(width, px(line_height_px)),
+                ),
+                color,
+            ))
+        });
+        let terminal_content = if has_kitty_images {
+            let row_layer = div()
+                .absolute()
+                .flex()
+                .flex_col()
+                .size_full()
+                .items_start()
+                .justify_start()
+                .text_color(foreground)
+                .children(rows);
+            let content_viewport = if split_terminal_rows {
+                div()
+                    .absolute()
+                    .left(px(TERMINAL_PADDING_X_PX))
+                    .right(px(TERMINAL_PADDING_X_PX))
+                    .top(px(TERMINAL_PADDING_Y_PX))
+                    .bottom(px(TERMINAL_PADDING_Y_PX))
+                    .overflow_hidden()
+                    .child(render_kitty_image_layer(
+                        &kitty_placements,
+                        &self.kitty_images,
+                        KittyImageLayer::BelowBackground,
+                        cell_width_px,
+                        line_height_px,
+                        physical_cell.0,
+                        physical_cell.1,
+                        status_row_offset as f32 * line_height_px,
+                    ))
+                    .child(render_terminal_background_layer(
+                        cell_backgrounds.unwrap_or_default(),
+                        px(cell_width_px),
+                        px(line_height_px),
+                    ))
+                    .child(render_kitty_image_layer(
+                        &kitty_placements,
+                        &self.kitty_images,
+                        KittyImageLayer::BelowText,
+                        cell_width_px,
+                        line_height_px,
+                        physical_cell.0,
+                        physical_cell.1,
+                        status_row_offset as f32 * line_height_px,
+                    ))
+                    .child(render_terminal_background_layer(
+                        overlay_backgrounds.unwrap_or_default(),
+                        px(cell_width_px),
+                        px(line_height_px),
+                    ))
+                    .child(row_layer)
+                    .children(cursor_overlay)
+                    .child(render_kitty_image_layer(
+                        &kitty_placements,
+                        &self.kitty_images,
+                        KittyImageLayer::AboveText,
+                        cell_width_px,
+                        line_height_px,
+                        physical_cell.0,
+                        physical_cell.1,
+                        status_row_offset as f32 * line_height_px,
+                    ))
+            } else {
+                div()
+                    .absolute()
+                    .left(px(TERMINAL_PADDING_X_PX))
+                    .right(px(TERMINAL_PADDING_X_PX))
+                    .top(px(TERMINAL_PADDING_Y_PX))
+                    .bottom(px(TERMINAL_PADDING_Y_PX))
+                    .overflow_hidden()
+                    .child(row_layer)
+                    .children(cursor_overlay)
+                    .child(render_kitty_image_layer(
+                        &kitty_placements,
+                        &self.kitty_images,
+                        KittyImageLayer::AboveText,
+                        cell_width_px,
+                        line_height_px,
+                        physical_cell.0,
+                        physical_cell.1,
+                        status_row_offset as f32 * line_height_px,
+                    ))
+            };
+            div()
+                .relative()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .bg(pane_background)
+                .child(content_viewport)
+        } else {
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .bg(pane_background)
+                .px(px(TERMINAL_PADDING_X_PX))
+                .py(px(TERMINAL_PADDING_Y_PX))
+                .text_color(foreground)
+                .items_start()
+                .justify_start()
+                .children(rows)
+                .children(cursor_overlay)
+        };
         let mut terminal_children = vec![terminal_content.into_any_element()];
         if let Some(overlay) = self.render_link_cursor_overlay(cell_width_px, line_height_px) {
             terminal_children.push(overlay);
         }
+        if let Some(preview) = self
+            .hovered_link
+            .as_ref()
+            .zip(self.pane_bounds)
+            .and_then(|(link, bounds)| link.preview(cx.theme(), bounds.size.width))
+        {
+            terminal_children.push(preview.into_any_element());
+        }
+        terminal_children.extend(scrollbar_overlay);
         let terminal_layer = div()
             .relative()
             .size_full()
@@ -1181,10 +2665,7 @@ impl Render for GhosttyView {
                     return;
                 }
                 let _ = this.ensure_session(cx);
-                this.clear_restored_screen_text();
-                if let Some(terminal) = &this.terminal {
-                    terminal.send_text("\t");
-                }
+                this.send_tab_key(false);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ConsumeTabPrev, window, cx| {
@@ -1192,10 +2673,7 @@ impl Render for GhosttyView {
                     return;
                 }
                 let _ = this.ensure_session(cx);
-                this.clear_restored_screen_text();
-                if let Some(terminal) = &this.terminal {
-                    terminal.send_text("\x1b[Z");
-                }
+                this.send_tab_key(true);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &crate::Copy, _window, cx| {
@@ -1205,10 +2683,7 @@ impl Render for GhosttyView {
             }))
             .on_action(cx.listener(|this, _: &crate::Paste, _window, cx| {
                 let _ = this.ensure_session(cx);
-                this.clear_restored_screen_text();
-                if let Some(terminal) = &this.terminal
-                    && paste_from_clipboard(terminal, cx)
-                {
+                if this.paste_from_clipboard(cx) {
                     cx.notify();
                 }
             }))
@@ -1220,9 +2695,7 @@ impl Render for GhosttyView {
                 window.focus(&this.focus_handle, cx);
                 cx.emit(GhosttyFocusChanged);
                 let _ = this.ensure_session(cx);
-                this.clear_restored_screen_text();
-                if let Some(terminal) = &this.terminal {
-                    send_terminal_paste_payload(terminal, payload);
+                if this.handle_terminal_paste_payload(payload, VtPasteSource::Text) {
                     cx.notify();
                 }
             }))
@@ -1230,22 +2703,18 @@ impl Render for GhosttyView {
                 if !this.focus_handle.is_focused(window) {
                     return;
                 }
-                let special_key_writes =
-                    encode_special_key(&event.keystroke.key, &event.keystroke.modifiers, false)
-                        .is_some();
-                let clears_restore = key_down_may_write_terminal(event, special_key_writes);
-                let copy_shortcut = event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt
-                    && !event.keystroke.modifiers.platform
-                    && event.keystroke.key == "c";
                 let _ = this.ensure_session(cx);
-                if clears_restore {
-                    this.clear_restored_screen_text();
-                }
-                if clears_restore && !copy_shortcut {
-                    this.clear_selection();
-                }
                 if this.handle_key_down(event, window, cx) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, window, cx| {
+                if !this.focus_handle.is_focused(window) {
+                    return;
+                }
+                if this.handle_key_up(event) {
                     window.prevent_default();
                     cx.stop_propagation();
                     cx.notify();
@@ -1253,6 +2722,7 @@ impl Render for GhosttyView {
             }))
             .on_modifiers_changed(cx.listener(
                 |this, event: &ModifiersChangedEvent, _window, cx| {
+                    this.mouse_modifiers = event.modifiers;
                     if this.update_hovered_link(&event.modifiers) {
                         cx.notify();
                     }
@@ -1269,9 +2739,21 @@ impl Render for GhosttyView {
                     window.focus(&context_focus, cx);
                     let _ = this.ensure_session(cx);
                     this.last_mouse_position = Some(event.position);
-                    this.mouse_down_link = None;
-                    this.suppress_link_mouse_up = false;
+                    this.mouse_modifiers = event.modifiers;
+                    this.finish_right_mouse_sequence(event.position);
                     let _ = this.update_hovered_link(&event.modifiers);
+                    let shift_at_press = event.modifiers.shift;
+                    this.terminal_mouse_right_consumed = Some(
+                        !shift_at_press
+                            && this.report_mouse(
+                                event.position,
+                                VtMouseAction::Press,
+                                Some(VtMouseButton::Right),
+                            ),
+                    );
+                    if this.terminal_mouse_right_consumed == Some(true) {
+                        this.terminal_right_mouse_sequence.begin(());
+                    }
                     cx.emit(GhosttyFocusChanged);
                     cx.notify();
                 }),
@@ -1282,13 +2764,12 @@ impl Render for GhosttyView {
                     window.focus(&focus, cx);
                     let _ = this.ensure_session(cx);
                     this.last_mouse_position = Some(event.position);
-                    this.mouse_down_link = None;
-                    this.suppress_link_mouse_up = false;
+                    this.mouse_modifiers = event.modifiers;
+                    this.cancel_left_pointer_interactions(event.position);
+                    let preview = this.hovered_link.take();
                     let _ = this.update_hovered_link(&event.modifiers);
-                    if terminal_links::should_open_link(&event.modifiers)
-                        && let Some(link) = this.link_at_position(event.position)
-                    {
-                        this.mouse_down_link = Some(link);
+                    if let Some(link) = this.hovered_link.clone() {
+                        this.mouse_down_link = link.for_press(preview.as_ref());
                         this.suppress_link_mouse_up = true;
                         window.prevent_default();
                         cx.stop_propagation();
@@ -1296,38 +2777,69 @@ impl Render for GhosttyView {
                         cx.notify();
                         return;
                     }
-                    this.begin_selection(event.position);
+                    let shift = event.modifiers.shift;
+                    if !shift
+                        && this.report_mouse(
+                            event.position,
+                            VtMouseAction::Press,
+                            Some(VtMouseButton::Left),
+                        )
+                    {
+                        if let Some(terminal) = this.terminal() {
+                            terminal.selection_cancel_gesture();
+                        }
+                        this.terminal_left_mouse_sequence
+                            .begin(LeftMouseSequence::TerminalReport);
+                    } else if !this.begin_local_selection(event.position, shift, event.click_count)
+                        && !shift
+                    {
+                        this.clear_selection();
+                    }
                     cx.emit(GhosttyFocusChanged);
                     cx.notify();
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 this.last_mouse_position = Some(event.position);
+                this.mouse_modifiers = event.modifiers;
+                if this.scrollbar_drag.is_some() {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_scrollbar(event.position);
+                        cx.notify();
+                        return;
+                    }
+                    this.end_scrollbar_drag();
+                }
                 if this.suppress_link_mouse_up {
-                    let mut changed = this.update_hovered_link(&event.modifiers);
-                    if event.pressed_button != Some(MouseButton::Left) {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        let mut changed = this.update_hovered_link(&event.modifiers);
+                        if let Some(down_link) = this.mouse_down_link.as_ref() {
+                            let still_on_same_link = this
+                                .link_at_position(event.position)
+                                .is_some_and(|link| link.same_link(down_link));
+                            if !still_on_same_link {
+                                this.mouse_down_link = None;
+                                changed = true;
+                            }
+                        }
+                        cx.stop_propagation();
+                        if changed {
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    if event.pressed_button.is_none() {
+                        let mut changed = this.update_hovered_link(&event.modifiers);
                         changed |= this.mouse_down_link.take().is_some();
                         this.suppress_link_mouse_up = false;
-                    } else if let Some(down_link) = this.mouse_down_link.as_ref() {
-                        let still_on_same_link =
-                            this.link_at_position(event.position).as_ref() == Some(down_link);
-                        if !still_on_same_link {
-                            this.mouse_down_link = None;
-                            changed = true;
+                        cx.stop_propagation();
+                        if changed {
+                            cx.notify();
                         }
                     }
-                    cx.stop_propagation();
-                    if changed {
-                        cx.notify();
-                    }
-                    return;
                 }
                 let mut changed = this.update_hovered_link(&event.modifiers);
-                if event.pressed_button == Some(MouseButton::Left) {
-                    changed |= this.update_selection_drag(event.position);
-                } else if this.drag_anchor.is_some() {
-                    changed |= this.finish_selection(event.position);
-                }
+                changed |= this.update_mouse_sequences(event, cx);
                 if changed {
                     cx.notify();
                 }
@@ -1336,13 +2848,20 @@ impl Render for GhosttyView {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, window, cx| {
                     this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
+                    if this.end_scrollbar_drag() {
+                        cx.notify();
+                        return;
+                    }
                     if this.suppress_link_mouse_up {
                         let down_link = this.mouse_down_link.take();
                         this.suppress_link_mouse_up = false;
                         if let Some(down_link) = down_link
-                            && this.link_at_position(event.position).as_ref() == Some(&down_link)
+                            && this
+                                .link_at_position(event.position)
+                                .is_some_and(|link| link.same_link(&down_link))
                         {
-                            cx.open_url(&down_link.url);
+                            down_link.open(window, cx);
                         }
                         window.prevent_default();
                         cx.stop_propagation();
@@ -1350,13 +2869,100 @@ impl Render for GhosttyView {
                         cx.notify();
                         return;
                     }
-                    let mut changed = this.finish_selection(event.position);
+                    let mut changed = this.finish_left_mouse_sequence(event.position);
                     changed |= this.update_hovered_link(&event.modifiers);
                     if changed {
                         cx.notify();
                     }
                 }),
             )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if this.end_scrollbar_drag() {
+                        cx.notify();
+                        return;
+                    }
+                    if !this.terminal_left_mouse_sequence.is_active()
+                        && !this.suppress_link_mouse_up
+                    {
+                        return;
+                    }
+                    this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
+                    this.mouse_down_link = None;
+                    this.suppress_link_mouse_up = false;
+                    let mut changed = this.finish_left_mouse_sequence(event.position);
+                    changed |= this.update_hovered_link(&event.modifiers);
+                    if changed {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
+                    if this.finish_right_mouse_sequence(event.position) {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if !this.terminal_right_mouse_sequence.is_active() {
+                        return;
+                    }
+                    this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
+                    if this.finish_right_mouse_sequence(event.position) {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    let _ = this.ensure_session(cx);
+                    this.last_mouse_position = Some(event.position);
+                    this.mouse_modifiers = event.modifiers;
+                    this.finish_middle_mouse_sequence(event.position);
+                    if !event.modifiers.shift
+                        && this.report_mouse(
+                            event.position,
+                            VtMouseAction::Press,
+                            Some(VtMouseButton::Middle),
+                        )
+                    {
+                        this.terminal_middle_mouse_sequence.begin(());
+                        cx.stop_propagation();
+                    }
+                    cx.emit(GhosttyFocusChanged);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    this.mouse_modifiers = event.modifiers;
+                    this.finish_middle_mouse_sequence(event.position);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, _cx| {
+                    this.mouse_modifiers = event.modifiers;
+                    this.finish_middle_mouse_sequence(event.position);
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                if this.handle_scroll_wheel(event) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
                     .relative()
@@ -1395,11 +3001,23 @@ impl Render for GhosttyView {
                         )
                         .absolute()
                         .size_full(),
-                    ),
+                    )
+                    .children(self.terminal_find.clone())
+                    .children(unsafe_paste_confirmation),
             )
             .context_menu(move |menu, window, cx| {
+                // Empty PopupMenu renders nothing; suppress con's menu only
+                // when the terminal app consumed the right-button press.
+                let right_consumed = menu_entity.upgrade().is_some_and(|view| {
+                    view.read(cx).terminal_mouse_right_consumed.unwrap_or(false)
+                });
+                if right_consumed {
+                    return menu;
+                }
                 crate::terminal_context_menu::terminal_context_menu(
                     menu.action_context(menu_focus.clone()),
+                    // Agent Handoff is macOS-only.
+                    false,
                     window,
                     cx,
                 )
@@ -1409,112 +3027,262 @@ impl Render for GhosttyView {
 
 impl Drop for GhosttyView {
     fn drop(&mut self) {
+        self.release_tracked_keys();
+        self.cancel_pointer_interactions();
         if let Some(terminal) = &self.terminal {
             terminal.request_close();
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct KittyImageKey {
+    id: u32,
+    generation: u64,
+}
+
+impl From<&KittyImage> for KittyImageKey {
+    fn from(image: &KittyImage) -> Self {
+        Self {
+            id: image.id,
+            generation: image.generation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TerminalSelection {
-    anchor: (u16, u64),
-    extent: (u16, u64),
+enum KittyImageLayer {
+    BelowBackground,
+    BelowText,
+    AboveText,
 }
 
-impl TerminalSelection {
-    fn contains(self, col: u16, row: u16, snapshot: &ScreenSnapshot) -> bool {
-        let cols = snapshot.cols;
-        let viewport_offset = snapshot.scrollbar.map_or(0, |scrollbar| scrollbar.offset);
-        let to_linear = |point: (u16, u64)| point.1 as u128 * cols as u128 + point.0 as u128;
-        let anchor = to_linear(self.anchor);
-        let extent = to_linear(self.extent);
-        let (start, end) = if anchor <= extent {
-            (anchor, extent)
-        } else {
-            (extent, anchor)
-        };
-        let current = to_linear((col, viewport_offset.saturating_add(row as u64)));
-        current >= start && current <= end
-    }
-
-    fn row_range(self, row: usize, snapshot: &ScreenSnapshot) -> Option<(usize, usize)> {
-        let cols = snapshot.cols;
-        if cols == 0 || row > u16::MAX as usize {
-            return None;
+impl KittyImageLayer {
+    fn contains(self, z: i32) -> bool {
+        match self {
+            Self::BelowBackground => z < KITTY_BELOW_BACKGROUND_LIMIT,
+            Self::BelowText => (KITTY_BELOW_BACKGROUND_LIMIT..0).contains(&z),
+            Self::AboveText => z >= 0,
         }
-
-        let row = row as u16;
-        let mut start = None;
-        let mut end = None;
-        for col in 0..cols {
-            if self.contains(col, row, snapshot) {
-                start.get_or_insert(usize::from(col));
-                end = Some(usize::from(col));
-            }
-        }
-
-        start.zip(end)
     }
 }
 
-fn extract_selection_text(
-    snapshot: &ScreenSnapshot,
-    selection: TerminalSelection,
-) -> Option<String> {
-    if snapshot.cols == 0 || snapshot.rows == 0 || snapshot.cells.is_empty() {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct KittyPlacementGeometry {
+    left_px: f32,
+    top_px: f32,
+    width_px: f32,
+    height_px: f32,
+    image_left_px: f32,
+    image_top_px: f32,
+    image_width_px: f32,
+    image_height_px: f32,
+}
+
+fn kitty_placement_geometry(
+    placement: &KittyPlacement,
+    logical_cell_width_px: f32,
+    logical_cell_height_px: f32,
+    physical_cell_width_px: u32,
+    physical_cell_height_px: u32,
+) -> Option<KittyPlacementGeometry> {
+    let image = &placement.image;
+    let source_right = placement.source_x.checked_add(placement.source_width)?;
+    let source_bottom = placement.source_y.checked_add(placement.source_height)?;
+    if placement.pixel_width == 0
+        || placement.pixel_height == 0
+        || placement.source_width == 0
+        || placement.source_height == 0
+        || image.width == 0
+        || image.height == 0
+        || source_right > image.width
+        || source_bottom > image.height
+        || !logical_cell_width_px.is_finite()
+        || !logical_cell_height_px.is_finite()
+        || logical_cell_width_px <= 0.0
+        || logical_cell_height_px <= 0.0
+        || physical_cell_width_px == 0
+        || physical_cell_height_px == 0
+    {
         return None;
     }
 
-    let cols = usize::from(snapshot.cols);
-    let mut output = String::new();
-    for row in 0..snapshot.rows {
-        let Some((start, end)) = selection.row_range(usize::from(row), snapshot) else {
-            continue;
-        };
-
-        let row_start = usize::from(row) * cols;
-        let Some(cells) = snapshot.cells.get(row_start + start..=row_start + end) else {
-            continue;
-        };
-
-        let mut row_text = String::with_capacity(cells.len());
-        let mut last_non_blank = None;
-        for cell in cells {
-            let ch = match cell.codepoint {
-                0 => ' ',
-                cp => char::from_u32(cp).unwrap_or('\u{FFFD}'),
-            };
-            if ch != ' ' {
-                last_non_blank = Some(row_text.len() + ch.len_utf8());
-            }
-            row_text.push(ch);
-        }
-
-        if let Some(end_byte) = last_non_blank {
-            output.push_str(&row_text[..end_byte]);
-        }
-        output.push('\n');
-    }
-
-    if output.ends_with('\n') {
-        output.pop();
-    }
-    if output.is_empty() {
-        None
+    // libghostty positions placements in the integer physical cell geometry
+    // supplied by `resize_surface`. Derive each axis from that exact quantized
+    // size instead of dividing by the fractional display scale, which drifts
+    // away from GPUI's logical text grid after several columns.
+    let device_to_logical_x = logical_cell_width_px as f64 / physical_cell_width_px as f64;
+    let device_to_logical_y = logical_cell_height_px as f64 / physical_cell_height_px as f64;
+    let width_px = placement.pixel_width as f64 * device_to_logical_x;
+    let height_px = placement.pixel_height as f64 * device_to_logical_y;
+    let source_scale_x = width_px / placement.source_width as f64;
+    let source_scale_y = height_px / placement.source_height as f64;
+    let values = KittyPlacementGeometry {
+        left_px: (placement.viewport_col as f64 * logical_cell_width_px as f64
+            + placement.cell_x_offset as f64 * device_to_logical_x) as f32,
+        top_px: (placement.viewport_row as f64 * logical_cell_height_px as f64
+            + placement.cell_y_offset as f64 * device_to_logical_y) as f32,
+        width_px: width_px as f32,
+        height_px: height_px as f32,
+        image_left_px: (-(placement.source_x as f64) * source_scale_x) as f32,
+        image_top_px: (-(placement.source_y as f64) * source_scale_y) as f32,
+        image_width_px: (image.width as f64 * source_scale_x) as f32,
+        image_height_px: (image.height as f64 * source_scale_y) as f32,
+    };
+    if [
+        values.left_px,
+        values.top_px,
+        values.width_px,
+        values.height_px,
+        values.image_left_px,
+        values.image_top_px,
+        values.image_width_px,
+        values.image_height_px,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        Some(values)
     } else {
-        Some(output)
+        None
     }
+}
+
+fn kitty_image_to_render_image(image: &KittyImage) -> Option<Arc<RenderImage>> {
+    let expected_len = (image.width as usize)
+        .checked_mul(image.height as usize)?
+        .checked_mul(4)?;
+    if image.width == 0 || image.height == 0 || image.rgba.len() != expected_len {
+        return None;
+    }
+
+    // GPUI's `RenderImage` byte contract is BGRA even though the image crate
+    // buffer type is named `RgbaImage`. Keep the shared VT snapshot in its
+    // renderer-neutral RGBA form and swizzle only once per image generation.
+    let mut bgra = image.rgba.to_vec();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let buffer = RgbaImage::from_raw(image.width, image.height, bgra)?;
+    let frame = Frame::new(buffer);
+    let frames: SmallVec<[Frame; 1]> = SmallVec::from_buf([frame]);
+    Some(Arc::new(RenderImage::new(frames)))
+}
+
+fn render_kitty_image_layer(
+    placements: &[KittyPlacement],
+    images: &HashMap<KittyImageKey, Arc<RenderImage>>,
+    layer: KittyImageLayer,
+    logical_cell_width_px: f32,
+    logical_cell_height_px: f32,
+    physical_cell_width_px: u32,
+    physical_cell_height_px: u32,
+    top_offset_px: f32,
+) -> AnyElement {
+    let paint_records = placements
+        .iter()
+        .filter_map(|placement| {
+            if !layer.contains(placement.z) {
+                return None;
+            }
+            let key = KittyImageKey::from(placement.image.as_ref());
+            let image = images.get(&key)?.clone();
+            let geometry = kitty_placement_geometry(
+                placement,
+                logical_cell_width_px,
+                logical_cell_height_px,
+                physical_cell_width_px,
+                physical_cell_height_px,
+            )?;
+            Some((image, geometry))
+        })
+        .collect::<Vec<_>>();
+
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            for (image, geometry) in paint_records {
+                let crop_bounds = Bounds::new(
+                    point(
+                        bounds.origin.x + px(geometry.left_px),
+                        bounds.origin.y + px(geometry.top_px + top_offset_px),
+                    ),
+                    size(px(geometry.width_px), px(geometry.height_px)),
+                );
+                if !crop_bounds.intersects(&bounds) {
+                    continue;
+                }
+
+                let image_bounds = Bounds::new(
+                    point(
+                        crop_bounds.origin.x + px(geometry.image_left_px),
+                        crop_bounds.origin.y + px(geometry.image_top_px),
+                    ),
+                    size(px(geometry.image_width_px), px(geometry.image_height_px)),
+                );
+                // Clip the destination, not the atlas tile: paint_image rounds
+                // source crops to whole texels, losing partially visible texels
+                // when a low-resolution image is magnified.
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: crop_bounds.intersect(&bounds),
+                    }),
+                    |window| {
+                        if let Err(err) = window.paint_image(
+                            image_bounds,
+                            image_bounds,
+                            Default::default(),
+                            image,
+                            0,
+                            false,
+                        ) {
+                            log::debug!("failed to paint Kitty image placement: {err:#}");
+                        }
+                    },
+                );
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
 }
 
 #[derive(Clone, Default)]
 struct CachedTerminalRow {
+    spans: Arc<[TerminalTextSpan]>,
+    // RowCacheStyleKey invalidates the row when font metrics change.
+    shaped: Arc<OnceLock<Vec<(usize, usize, ShapedLine)>>>,
+    backgrounds: Vec<TerminalBackgroundRun>,
+}
+
+#[derive(PartialEq)]
+struct TerminalTextSpan {
+    start_col: usize,
+    columns: usize,
     text: SharedString,
     runs: Vec<TextRun>,
 }
 
+#[derive(Clone, Copy)]
+struct TerminalBackgroundRun {
+    start_col: usize,
+    len: usize,
+    color: Hsla,
+    overlay: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalBackgroundQuad {
+    row: usize,
+    start_col: usize,
+    len: usize,
+    color: Hsla,
+}
+
 #[derive(Clone, PartialEq)]
 struct RowCacheStyleKey {
-    font_family: SharedString,
+    font: Font,
     default_fg: Hsla,
     default_bg: Hsla,
     font_size: Pixels,
@@ -1522,11 +3290,70 @@ struct RowCacheStyleKey {
 }
 
 fn cursor_col_for_row(cursor: VtCursor, row_idx: usize) -> Option<usize> {
-    if cursor.visible && usize::from(cursor.row) == row_idx {
+    if cursor.visible && cursor.style == CursorStyle::Block && usize::from(cursor.row) == row_idx {
         Some(usize::from(cursor.col))
     } else {
         None
     }
+}
+
+fn cursor_overlay_cell(snapshot: &ScreenSnapshot, cursor: VtCursor) -> Option<(usize, &VtCell)> {
+    if cursor.row >= snapshot.rows || cursor.col >= snapshot.cols {
+        return None;
+    }
+    let row_start = usize::from(cursor.row) * usize::from(snapshot.cols);
+    let mut col = usize::from(cursor.col);
+    if snapshot.cells.get(row_start + col)?.width == con_ghostty::vt::CellWidth::SpacerTail {
+        col = col.saturating_sub(1);
+    }
+    Some((col, snapshot.cells.get(row_start + col)?))
+}
+
+fn render_cursor_overlay(
+    style: CursorStyle,
+    cursor_bounds: Bounds<Pixels>,
+    color: Hsla,
+) -> AnyElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let x = bounds.left() + cursor_bounds.left();
+            let y = bounds.top() + cursor_bounds.top();
+            let cell_width = f32::from(cursor_bounds.size.width);
+            let line_height = f32::from(cursor_bounds.size.height);
+            let stroke = 1.0 / window.scale_factor();
+            let mut paint = |left, top, width, height| {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(x + px(left), y + px(top)),
+                        size(px(width), px(height)),
+                    ),
+                    color,
+                ));
+            };
+            match style {
+                CursorStyle::Bar => paint(0.0, 0.0, stroke, line_height),
+                CursorStyle::Underline => paint(0.0, line_height - stroke, cell_width, stroke),
+                CursorStyle::HollowBlock => {
+                    paint(0.0, 0.0, cell_width, stroke);
+                    paint(0.0, line_height - stroke, cell_width, stroke);
+                    paint(0.0, stroke, stroke, line_height - 2.0 * stroke);
+                    paint(
+                        cell_width - stroke,
+                        stroke,
+                        stroke,
+                        line_height - 2.0 * stroke,
+                    );
+                }
+                CursorStyle::Block => {}
+            }
+        },
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .size_full()
+    .into_any_element()
 }
 
 fn rows_needing_refresh(
@@ -1563,28 +3390,196 @@ fn render_cached_terminal_row(
     font_size: Pixels,
     line_height: Pixels,
 ) -> AnyElement {
-    div()
-        .w_full()
-        .h(line_height)
-        .min_h(line_height)
-        .overflow_hidden()
-        // Terminal rows must never wrap — a sequence like "12345" that
-        // doesn't fit in the remaining width should be clipped, not
-        // reflowed onto the next line. Without this, GPUI's default
-        // word-wrap breaks continuous runs at word boundaries and pushes
-        // them down, making TUI layouts look garbled in narrow panes.
-        .whitespace_nowrap()
-        .text_size(font_size)
-        .line_height(line_height)
-        .child(StyledText::new(row.text.clone()).with_runs(row.runs.clone()))
-        .into_any_element()
+    render_terminal_row_canvas(row, font_size, line_height, true)
 }
 
-/// Build a single GPUI row element from a slice of `VtCell`s. We
-/// collapse runs of cells that share `(fg, bg, attrs)` into one
-/// `TextRun` so each row is a single `StyledText` element. That keeps
-/// allocations bounded by the number of *style changes*, not the cell
-/// count, while still preserving every SGR transition.
+fn append_terminal_backgrounds(
+    row: &CachedTerminalRow,
+    display_row: usize,
+    backgrounds: &mut Vec<TerminalBackgroundQuad>,
+    overlays: &mut Vec<TerminalBackgroundQuad>,
+) {
+    for run in &row.backgrounds {
+        let quad = TerminalBackgroundQuad {
+            row: display_row,
+            start_col: run.start_col,
+            len: run.len,
+            color: run.color,
+        };
+        if run.overlay {
+            overlays.push(quad);
+        } else {
+            backgrounds.push(quad);
+        }
+    }
+}
+
+fn render_terminal_background_layer(
+    backgrounds: Vec<TerminalBackgroundQuad>,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> AnyElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            for background in backgrounds {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(
+                            bounds.origin.x + cell_width * background.start_col as f32,
+                            bounds.origin.y + line_height * background.row as f32,
+                        ),
+                        size(cell_width * background.len as f32, line_height),
+                    ),
+                    background.color,
+                ));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
+    .into_any_element()
+}
+
+fn render_terminal_foreground_row(
+    row: &CachedTerminalRow,
+    font_size: Pixels,
+    line_height: Pixels,
+) -> AnyElement {
+    render_terminal_row_canvas(row, font_size, line_height, false)
+}
+
+fn render_terminal_row_canvas(
+    row: &CachedTerminalRow,
+    font_size: Pixels,
+    line_height: Pixels,
+    paint_backgrounds: bool,
+) -> AnyElement {
+    let spans = row.spans.clone();
+    let shaped = row.shaped.clone();
+    let backgrounds = if paint_backgrounds {
+        row.backgrounds.clone()
+    } else {
+        Vec::new()
+    };
+    let cell_width = px(cell_width_px(f32::from(font_size)));
+    canvas(
+        move |_, window, _| {
+            shaped.get_or_init(|| shape_terminal_spans(&spans, font_size, cell_width, window));
+            shaped
+        },
+        move |bounds, shaped, window, cx| {
+            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                for background in &backgrounds {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(
+                                bounds.origin.x + cell_width * background.start_col as f32,
+                                bounds.origin.y,
+                            ),
+                            size(cell_width * background.len as f32, line_height),
+                        ),
+                        background.color,
+                    ));
+                }
+                for (column, columns, line) in shaped.get().expect("row shaped in prepaint") {
+                    let origin = point(
+                        bounds.origin.x + cell_width * *column as f32,
+                        bounds.origin.y,
+                    );
+                    let clip = Bounds::new(origin, size(cell_width * *columns as f32, line_height));
+                    window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                        if let Err(error) =
+                            line.paint(origin, line_height, TextAlign::Left, None, window, cx)
+                        {
+                            log::warn!("terminal text paint failed: {error}");
+                        }
+                    });
+                }
+            });
+        },
+    )
+    .w_full()
+    .h(line_height)
+    .min_h(line_height)
+    .into_any_element()
+}
+
+fn shape_terminal_spans(
+    spans: &[TerminalTextSpan],
+    font_size: Pixels,
+    cell_width: Pixels,
+    window: &Window,
+) -> Vec<(usize, usize, ShapedLine)> {
+    let mut shaped = Vec::with_capacity(spans.len());
+    for span in spans {
+        let mut runs = span.runs.clone();
+        for run in &mut runs {
+            run.background_color = None;
+        }
+        let mut line = window
+            .text_system()
+            .shape_line(span.text.clone(), font_size, &runs, None);
+        let ascii = span.text.is_ascii();
+        let one_glyph_per_byte = line
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .map(|glyph| glyph.index)
+            .eq(0..span.text.len());
+        if ascii && !one_glyph_per_byte {
+            // A configured font may form ASCII ligatures. Fall back to native
+            // cells rather than stretching a ligature or moving later columns.
+            let mut byte = 0;
+            for run in &runs {
+                for _ in 0..run.len {
+                    let text: SharedString = span.text[byte..byte + 1].to_owned().into();
+                    let run = TextRun {
+                        len: 1,
+                        ..run.clone()
+                    };
+                    let line = window
+                        .text_system()
+                        .shape_line(text, font_size, &[run], None);
+                    shaped.push((
+                        span.start_col + byte,
+                        1,
+                        terminal_grid_layout(line, cell_width, false),
+                    ));
+                    byte += 1;
+                }
+            }
+            continue;
+        }
+        line = terminal_grid_layout(line, cell_width * span.columns as f32, ascii);
+        shaped.push((span.start_col, span.columns, line));
+    }
+    shaped
+}
+
+fn terminal_grid_layout(mut line: ShapedLine, width: Pixels, ascii: bool) -> ShapedLine {
+    // Replace this row's Arc, never mutate GPUI's shared layout cache.
+    let mut runs = line.runs.clone();
+    if ascii {
+        let cell_width = width / line.text.len() as f32;
+        for glyph in runs.iter_mut().flat_map(|run| &mut run.glyphs) {
+            glyph.position.x = cell_width * glyph.index as f32;
+        }
+    }
+    let layout = LineLayout {
+        font_size: line.font_size,
+        width,
+        ascent: line.ascent,
+        descent: line.descent,
+        runs,
+        len: line.len,
+    };
+    *std::ops::DerefMut::deref_mut(&mut line) = Arc::new(layout);
+    line
+}
+
+/// Batch ASCII cells, but preserve native non-ASCII cell boundaries through
+/// shaping. Otherwise mode-2027-off emoji and Indic cells can recombine.
 fn build_terminal_row(
     cells: &[VtCell],
     default_fg: Hsla,
@@ -1594,6 +3589,29 @@ fn build_terminal_row(
     selection_cols: Option<(usize, usize)>,
     selection_bg: Hsla,
 ) -> CachedTerminalRow {
+    use con_ghostty::vt::CellWidth;
+    let head_col = |col: usize| {
+        if cells
+            .get(col)
+            .is_some_and(|cell| cell.width == CellWidth::SpacerTail)
+        {
+            col.saturating_sub(1)
+        } else {
+            col
+        }
+    };
+    let cursor_col = cursor_col.map(head_col);
+    let selection_cols = selection_cols.map(|(start, end)| {
+        let end = head_col(end);
+        (
+            head_col(start),
+            end + usize::from(
+                cells
+                    .get(end)
+                    .is_some_and(|cell| cell.width == CellWidth::Wide),
+            ),
+        )
+    });
     // First pass: find the last column we have to keep. A column
     // matters if it has a real glyph, OR if it carries a non-default
     // background / underline / strikethrough / inverse style, OR if
@@ -1607,8 +3625,9 @@ fn build_terminal_row(
         .iter()
         .enumerate()
         .rposition(|(col_idx, cell)| {
-            let glyph_present =
-                cell.codepoint != 0 && char::from_u32(cell.codepoint).is_some_and(|ch| ch != ' ');
+            let glyph_present = cell.grapheme.is_some()
+                || (cell.codepoint != 0
+                    && char::from_u32(cell.codepoint).is_some_and(|ch| ch != ' '));
             let styled_blank = (cell.bg & 0xFF) != 0
                 || (cell.attrs & (ATTR_INVERSE | ATTR_UNDERLINE | ATTR_STRIKE)) != 0;
             let cursor_here = cursor_col == Some(col_idx);
@@ -1616,19 +3635,27 @@ fn build_terminal_row(
                 selection_cols.is_some_and(|(start, end)| col_idx >= start && col_idx <= end);
             glyph_present || styled_blank || cursor_here || selected_here
         })
-        // `rposition` already returns the index relative to `cells`,
-        // not `iter().enumerate()`'s output. Map it back to a slice
-        // length via +1.
-        .map(|idx| idx + 1)
+        // Retain a final wide cell's tail in the column-to-byte map.
+        .map(|idx| {
+            (idx + if cells[idx].width == con_ghostty::vt::CellWidth::Wide {
+                2
+            } else {
+                1
+            })
+            .min(cells.len())
+        })
         .unwrap_or(0);
 
     let kept = &cells[..last_meaningful_col];
 
     let mut text = String::with_capacity(kept.len());
+    let mut column_bytes = Vec::with_capacity(kept.len() + 1);
     let mut runs: Vec<TextRun> = Vec::new();
-    let mut last_signature: Option<(u32, u32, u8, bool, bool)> = None;
+    let mut backgrounds = Vec::new();
+    let mut last_signature: Option<(u32, u32, u8, bool, bool, SharedString)> = None;
     let mut active_run_len: usize = 0;
     let mut active_style: Option<RowStyle> = None;
+    let mut active_background: Option<(usize, Hsla, bool)> = None;
 
     fn flush_run(
         runs: &mut Vec<TextRun>,
@@ -1651,11 +3678,16 @@ fn build_terminal_row(
     }
 
     for (col_idx, cell) in kept.iter().enumerate() {
-        let is_cursor = cursor_col == Some(col_idx);
+        column_bytes.push(text.len());
+        let cell = &cell.for_render();
+        let is_cursor = cursor_col == Some(head_col(col_idx));
         let is_selected =
             selection_cols.is_some_and(|(start, end)| col_idx >= start && col_idx <= end);
-        let signature = (cell.fg, cell.bg, cell.attrs, is_cursor, is_selected);
-        let style = RowStyle::from_cell(
+        let glyph: char = match cell.codepoint {
+            0 => ' ',
+            cp => char::from_u32(cp).unwrap_or('\u{FFFD}'),
+        };
+        let mut style = RowStyle::from_cell(
             cell,
             default_fg,
             default_bg,
@@ -1664,43 +3696,109 @@ fn build_terminal_row(
             is_selected,
             selection_bg,
         );
+        style.font.family = linux_family_for_glyph(&style.font, glyph);
+        let signature = (
+            cell.fg,
+            cell.bg,
+            cell.attrs,
+            is_cursor,
+            is_selected,
+            style.font.family.clone(),
+        );
 
-        let glyph: char = match cell.codepoint {
-            0 => ' ',
-            cp => char::from_u32(cp).unwrap_or('\u{FFFD}'),
-        };
+        let background = style.bg.map(|color| (color, is_cursor || is_selected));
+        if active_background.map(|(_, color, overlay)| (color, overlay)) != background {
+            if let Some((start_col, color, overlay)) = active_background.take() {
+                backgrounds.push(TerminalBackgroundRun {
+                    start_col,
+                    len: col_idx - start_col,
+                    color,
+                    overlay,
+                });
+            }
+            active_background = background.map(|(color, overlay)| (col_idx, color, overlay));
+        }
 
-        if Some(signature) != last_signature {
+        if Some(&signature) != last_signature.as_ref() {
             flush_run(&mut runs, &mut active_style, &mut active_run_len);
             active_style = Some(style);
             last_signature = Some(signature);
         }
 
-        text.push(glyph);
-        active_run_len += glyph.len_utf8();
+        let mut scalar = [0; 4];
+        let cluster = cell.text(&mut scalar);
+        text.push_str(cluster);
+        active_run_len += cluster.len();
     }
+    column_bytes.push(text.len());
 
     flush_run(&mut runs, &mut active_style, &mut active_run_len);
-
-    let text = if text.is_empty() {
-        let mut fallback = String::with_capacity(1);
-        fallback.push('\u{00A0}');
-        runs.push(TextRun {
-            len: '\u{00A0}'.len_utf8(),
-            font: base_font.clone(),
-            color: default_fg,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
+    if let Some((start_col, color, overlay)) = active_background {
+        backgrounds.push(TerminalBackgroundRun {
+            start_col,
+            len: kept.len() - start_col,
+            color,
+            overlay,
         });
-        fallback
-    } else {
-        text
+    }
+
+    let mut spans = Vec::new();
+    let mut col = 0;
+    let mut run_index = 0;
+    let mut run_byte = 0;
+    let is_ascii_cell = |cell: &VtCell| {
+        cell.width == CellWidth::Narrow && cell.grapheme.is_none() && cell.codepoint < 0x80
     };
+    while col < kept.len() {
+        let start_col = col;
+        if is_ascii_cell(&kept[col]) {
+            col += 1;
+            while col < kept.len() && is_ascii_cell(&kept[col]) {
+                col += 1;
+            }
+        } else {
+            col = (col
+                + if kept[col].width == CellWidth::Wide {
+                    2
+                } else {
+                    1
+                })
+            .min(kept.len());
+        }
+        let start = column_bytes[start_col];
+        let end = column_bytes[col];
+        if start == end {
+            continue;
+        }
+        let mut span_runs = Vec::new();
+        while run_index < runs.len() && run_byte < end {
+            let run = &runs[run_index];
+            let run_end = run_byte + run.len;
+            let overlap = run_end.min(end).saturating_sub(run_byte.max(start));
+            if overlap > 0 {
+                span_runs.push(TextRun {
+                    len: overlap,
+                    ..run.clone()
+                });
+            }
+            if run_end > end {
+                break;
+            }
+            run_byte = run_end;
+            run_index += 1;
+        }
+        spans.push(TerminalTextSpan {
+            start_col,
+            columns: col - start_col,
+            text: text[start..end].to_owned().into(),
+            runs: span_runs,
+        });
+    }
 
     CachedTerminalRow {
-        text: text.into(),
-        runs,
+        spans: spans.into(),
+        shaped: Arc::new(OnceLock::new()),
+        backgrounds,
     }
 }
 
@@ -1804,72 +3902,194 @@ fn vt_color_to_hsla(packed: u32) -> Option<Hsla> {
     Some(Rgba { r, g, b, a }.into())
 }
 
-fn xterm_modifier_param(modifiers: &Modifiers) -> Option<u8> {
-    let mask = u8::from(modifiers.shift)
-        | (u8::from(modifiers.alt) << 1)
-        | (u8::from(modifiers.control) << 2);
-    if mask == 0 { None } else { Some(1 + mask) }
-}
-
-fn encode_special_key(key: &str, modifiers: &Modifiers, decckm: bool) -> Option<String> {
-    let m = xterm_modifier_param(modifiers);
-
-    let tilde = |code: u8| match m {
-        Some(m) => format!("\x1b[{};{}~", code, m),
-        None => format!("\x1b[{}~", code),
-    };
-
-    let csi1 = |final_byte: char, ss3_when_plain: bool, decckm_arrow: bool| match m {
-        Some(m) => format!("\x1b[1;{}{}", m, final_byte),
-        None if decckm_arrow && decckm => format!("\x1bO{}", final_byte),
-        None if ss3_when_plain => format!("\x1bO{}", final_byte),
-        None => format!("\x1b[{}", final_byte),
-    };
-
-    Some(match key {
-        "up" => csi1('A', false, true),
-        "down" => csi1('B', false, true),
-        "right" => csi1('C', false, true),
-        "left" => csi1('D', false, true),
-        "home" => csi1('H', false, false),
-        "end" => csi1('F', false, false),
-        "pageup" => tilde(5),
-        "pagedown" => tilde(6),
-        "insert" => tilde(2),
-        "delete" => tilde(3),
-        "f1" => csi1('P', true, false),
-        "f2" => csi1('Q', true, false),
-        "f3" => csi1('R', true, false),
-        "f4" => csi1('S', true, false),
-        "f5" => tilde(15),
-        "f6" => tilde(17),
-        "f7" => tilde(18),
-        "f8" => tilde(19),
-        "f9" => tilde(20),
-        "f10" => tilde(21),
-        "f11" => tilde(23),
-        "f12" => tilde(24),
-        "enter" | "return" => "\r".into(),
-        "escape" => "\x1b".into(),
-        "backspace" if modifiers.alt && !modifiers.control && !modifiers.platform => {
-            "\x1b\x7f".into()
-        }
-        "backspace" => "\x7f".into(),
-        "tab" if modifiers.shift && !modifiers.control && !modifiers.platform => "\x1b[Z".into(),
-        "tab" => "\t".into(),
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_FONT_SIZE, MIN_FONT_SIZE_PX, TerminalSelection, build_terminal_row, cell_height_px,
-        cell_width_px, effective_font_size, extract_selection_text, rows_needing_refresh,
-        vt_color_to_hsla,
+        BUNDLED_LINUX_FONT_FAMILY, CursorStyle, DEFAULT_FONT_SIZE, GRID_FIT_TOLERANCE_PX,
+        KITTY_BELOW_BACKGROUND_LIMIT, KittyImageLayer, MIN_FONT_SIZE_PX, TERMINAL_PADDING_X_PX,
+        TERMINAL_PADDING_Y_PX, build_terminal_row, cell_height_px, cell_width_px,
+        cursor_overlay_cell, effective_font_size, grid_size_for_pane, kitty_image_to_render_image,
+        kitty_placement_geometry, physical_cell_size, rows_needing_refresh, vt_color_to_hsla,
     };
-    use con_ghostty::{ATTR_BOLD, ATTR_INVERSE, ATTR_UNDERLINE, ScreenSnapshot, VtCell, VtCursor};
-    use gpui::{Font, FontFeatures, FontStyle, FontWeight, Hsla, Rgba};
+    use super::{PointerGrid, pointer_in_grid};
+    use con_ghostty::{
+        ATTR_BOLD, ATTR_INVERSE, ATTR_UNDERLINE, KittyImage, KittyPlacement, ScreenSnapshot,
+        VtCell, VtCursor,
+    };
+    use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Rgba};
+    use std::sync::Arc;
+
+    fn mouse_test_view(cx: &mut gpui::TestAppContext) -> gpui::Entity<super::GhosttyView> {
+        pty_test_view(
+            cx,
+            80,
+            1.5,
+            "stty raw -echo; printf '\x1b[?1002h\x1b[?1006hREADY'; exec sleep 30",
+            "READY",
+        )
+    }
+
+    /// A 14 px font view at `scale` over a real 24-row pty running `script`,
+    /// once the child has printed `ready`. The pane starts at (31, 47).
+    fn pty_test_view(
+        cx: &mut gpui::TestAppContext,
+        columns: u16,
+        scale: f32,
+        script: &str,
+        ready: &str,
+    ) -> gpui::Entity<super::GhosttyView> {
+        use con_ghostty::linux::pty::LinuxPtyOptions;
+        use gpui::{AppContext, Bounds, point, px, size};
+        use std::time::{Duration, Instant};
+
+        let app = Arc::new(
+            con_ghostty::GhosttyApp::new(
+                None, None, None, None, None, None, None, None, None, None, None, None, None, false,
+            )
+            .unwrap(),
+        );
+        let view = cx.new(|cx| super::GhosttyView::new(app, None, None, None, 14.0, cx));
+        view.update(cx, |view, _cx| {
+            let terminal = view.terminal().unwrap();
+            let mut options = LinuxPtyOptions::default();
+            options.command_program = Some("/bin/sh".into());
+            options.command_args = Some(vec!["-c".into(), script.into()]);
+            let (cell_width_px, cell_height_px) = physical_cell_size(14.0, scale);
+            options.size = con_ghostty::SurfaceSize {
+                columns,
+                rows: 24,
+                width_px: u32::from(columns) * cell_width_px,
+                height_px: 24 * cell_height_px,
+                cell_width_px,
+                cell_height_px,
+            };
+            terminal.spawn_with_options(options).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !terminal.read_recent_lines(24).join(" ").contains(ready) {
+                assert!(
+                    Instant::now() < deadline,
+                    "test PTY never printed {ready:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            view.refresh_snapshot();
+            view.scale_factor = scale;
+            let width = (2.0 * PAD_X + f32::from(columns) * CELL_W).max(800.0);
+            view.pane_bounds = Some(Bounds::new(
+                point(px(31.0), px(47.0)),
+                size(px(width), px(520.0)),
+            ));
+        });
+        view
+    }
+
+    #[gpui::test]
+    fn mouse_presses_reject_padding_but_captured_events_can_leave_grid(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{VtMouseAction as Action, VtMouseButton as Button};
+        use gpui::{point, px};
+
+        let view = mouse_test_view(cx);
+        view.update(cx, |view, _cx| {
+            // The painted 80 × 24 grid spans (43, 57) to (763, 537): 9 × 20 px
+            // cells. The 14 × 30 device px cell at 1.5x would end it at x ≈ 790.
+            for button in [
+                Button::Left,
+                Button::Middle,
+                Button::Right,
+                Button::Button4,
+                Button::Button7,
+            ] {
+                for (x, y) in [(42.5, 80.0), (60.0, 56.5), (763.5, 80.0), (60.0, 537.0)] {
+                    assert!(
+                        !view.report_mouse(point(px(x), px(y)), Action::Press, Some(button)),
+                        "padding press {button:?} at ({x}, {y})"
+                    );
+                }
+                assert!(view.report_mouse(point(px(43.0), px(57.0)), Action::Press, Some(button)));
+            }
+            assert!(view.report_mouse(
+                point(px(762.5), px(536.5)),
+                Action::Press,
+                Some(Button::Left)
+            ));
+            let outside = point(px(20.0), px(40.0));
+            assert!(view.report_mouse(outside, Action::Motion, Some(Button::Left)));
+            assert!(view.report_mouse(outside, Action::Release, Some(Button::Left)));
+        });
+    }
+
+    #[gpui::test]
+    fn buttonless_motion_retains_chord_capture_until_matching_release(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{LeftMouseSequence, VtMouseAction as Action, VtMouseButton as Button};
+        use gpui::{MouseMoveEvent, point, px};
+
+        let view = mouse_test_view(cx);
+        view.update(cx, |view, cx| {
+            let position = point(px(73.0), px(121.0));
+            assert!(view.report_mouse(position, Action::Press, Some(Button::Middle)));
+            view.terminal_middle_mouse_sequence.begin(());
+            assert!(view.report_mouse(position, Action::Press, Some(Button::Left)));
+            view.terminal_left_mouse_sequence
+                .begin(LeftMouseSequence::TerminalReport);
+            assert!(view.finish_left_mouse_sequence(position));
+            // Cross a cell boundary: same-cell motion is correctly deduplicated.
+            let position = point(px(103.0), px(161.0));
+            let generation = view.terminal().unwrap().input_generation();
+            view.update_mouse_sequences(
+                &MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                },
+                cx,
+            );
+            assert!(view.terminal_middle_mouse_sequence.is_active());
+            assert_eq!(view.terminal().unwrap().input_generation(), generation + 1);
+            assert!(view.finish_middle_mouse_sequence(position));
+            assert!(!view.finish_middle_mouse_sequence(position));
+            let generation = view.terminal().unwrap().input_generation();
+            view.update_mouse_sequences(
+                &MouseMoveEvent {
+                    position,
+                    ..Default::default()
+                },
+                cx,
+            );
+            // Button-event mode must not emit hover once the actual release arrives.
+            assert_eq!(view.terminal().unwrap().input_generation(), generation);
+        });
+    }
+
+    #[gpui::test]
+    fn hover_exit_retains_middle_capture_until_focus_cancellation(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, point, px};
+
+        let app = Arc::new(
+            con_ghostty::GhosttyApp::new(
+                None, None, None, None, None, None, None, None, None, None, None, None, None, false,
+            )
+            .unwrap(),
+        );
+        let view =
+            cx.new(|cx| super::GhosttyView::new(app, None, None, None, DEFAULT_FONT_SIZE, cx));
+        view.update(cx, |view, _cx| {
+            let position = point(px(73.0), px(121.0));
+            view.last_mouse_position = Some(position);
+            view.terminal_middle_mouse_sequence.begin(());
+            view.clear_hovered_link();
+            assert_eq!(view.last_mouse_position, Some(position));
+            assert!(view.terminal_middle_mouse_sequence.is_active());
+
+            view.set_surface_focus_state(false);
+            assert!(!view.terminal_middle_mouse_sequence.is_active());
+            assert!(!view.finish_middle_mouse_sequence(position));
+            view.clear_hovered_link();
+            assert_eq!(view.last_mouse_position, None);
+        });
+    }
 
     fn base_font() -> Font {
         Font {
@@ -1907,7 +4127,7 @@ mod tests {
             fg,
             bg,
             attrs,
-            _pad: [0; 3],
+            ..VtCell::default()
         }
     }
 
@@ -1917,12 +4137,507 @@ mod tests {
         assert!(vt_color_to_hsla(0x112233_FF).is_some());
     }
 
+    fn grid(width: f32, height: f32, scale: f32) -> (u16, u16) {
+        let size = grid_size_for_pane(width, height, 14.0, scale);
+        (size.columns, size.rows)
+    }
+
+    #[test]
+    fn grid_fits_the_reported_fractional_scale_pane() {
+        // Issue #485: a 2646 × 1238 device px pane at 1.7 scale used to
+        // report 176 × 36, painting about 40 px past the right edge.
+        assert_eq!(grid(2646.0 / 1.7, 1238.0 / 1.7, 1.7), (170, 35));
+    }
+
+    #[test]
+    fn grid_excludes_padding_at_unit_scale() {
+        assert_eq!(grid(800.0, 600.0, 1.0), (86, 29));
+    }
+
+    #[test]
+    fn grid_is_the_largest_painted_grid_that_fits_inside_the_padding() {
+        let cell_width = cell_width_px(14.0);
+        let cell_height = cell_height_px(14.0);
+        for scale in [1.0, 1.25, 1.5, 1.7, 2.0] {
+            for half_px in 2..=8000 {
+                let extent = half_px as f32 / 2.0;
+                let (columns, rows) = grid(extent, extent, scale);
+                for (count, cell, padding) in [
+                    (columns, cell_width, TERMINAL_PADDING_X_PX),
+                    (rows, cell_height, TERMINAL_PADDING_Y_PX),
+                ] {
+                    let painted = |n: u16| 2.0 * padding + f32::from(n) * cell;
+                    assert!(
+                        count == 1 || painted(count) <= extent + GRID_FIT_TOLERANCE_PX,
+                        "{count} cells of {cell} overflow {extent} px at {scale}x"
+                    );
+                    assert!(
+                        painted(count + 1) > extent + GRID_FIT_TOLERANCE_PX,
+                        "{count} cells of {cell} leave room for another in {extent} px at {scale}x"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_is_at_least_one_cell_in_panes_smaller_than_the_padding() {
+        assert_eq!(grid(0.0, 0.0, 1.7), (1, 1));
+        assert_eq!(grid(20.0, 15.0, 1.0), (1, 1));
+        let size = grid_size_for_pane(0.0, 0.0, 14.0, 1.7);
+        assert_eq!((size.width_px, size.height_px), (1, 1));
+    }
+
+    #[test]
+    fn grid_survives_nan_and_infinite_panes() {
+        assert_eq!(grid(f32::NAN, f32::NAN, 1.7), (1, 1));
+        assert_eq!(
+            grid(f32::INFINITY, f32::INFINITY, 1.7),
+            (u16::MAX, u16::MAX)
+        );
+    }
+
+    #[test]
+    fn grid_keeps_physical_cells_and_reports_pixels_inside_the_padding() {
+        let size = grid_size_for_pane(2646.0 / 1.7, 1238.0 / 1.7, 14.0, 1.7);
+        assert_eq!((size.cell_width_px, size.cell_height_px), (15, 34));
+        assert_eq!((size.width_px, size.height_px), (2605, 1204));
+    }
+
+    #[test]
+    fn grid_uses_the_clamped_font_size() {
+        assert_eq!(
+            grid_size_for_pane(800.0, 600.0, 4.0, 1.0),
+            grid_size_for_pane(800.0, 600.0, MIN_FONT_SIZE_PX, 1.0)
+        );
+    }
+
+    #[test]
+    fn grid_keeps_an_exact_fit_through_scale_rounding() {
+        // 24 px padding + 86 × 9 px cells = 798 logical px, arriving as an
+        // inexact device-to-logical conversion.
+        assert_eq!(grid(1356.6 / 1.7, 600.0, 1.7).0, 86);
+    }
+
+    // A 14 px font paints 9 × 20 logical px cells inside 12 / 10 px padding.
+    // Expected cells below come from these numbers, not from the helpers the
+    // code uses, so a test can't share the code's mistake.
+    const CELL_W: f32 = 9.0;
+    const CELL_H: f32 = 20.0;
+    const PAD_X: f32 = 12.0;
+    const PAD_Y: f32 = 10.0;
+    // Whole-number device cells (1, 2), rounded down (1.25, 1.7, 1.75),
+    // rounded up (1.5), and rows drifting while columns don't (4/3).
+    const SCALES: [f32; 7] = [1.0, 1.25, 4.0 / 3.0, 1.5, 1.7, 1.75, 2.0];
+
+    fn pointer_grid(columns: u16, rows: u16, scale_factor: f32) -> PointerGrid {
+        PointerGrid {
+            columns,
+            rows,
+            font_size_px: 14.0,
+            scale_factor,
+            pane_height: 2.0 * PAD_Y + f32::from(rows) * CELL_H,
+        }
+    }
+
+    fn cell_at(x: f32, y: f32, grid: PointerGrid) -> Option<(u16, u16)> {
+        pointer_in_grid(x, y, grid, false).map(|pointer| (pointer.col, pointer.row))
+    }
+
+    /// The left or top edge, the centre and the end of cell `index`.
+    fn points_in_cell(padding: f32, cell: f32, index: u16) -> [f32; 3] {
+        let start = padding + f32::from(index) * cell;
+        [start, start + cell / 2.0, start + cell - 0.05]
+    }
+
+    #[test]
+    fn every_painted_column_maps_to_itself() {
+        // 1000 columns covers an 8K-wide pane at 1x.
+        for scale in SCALES {
+            let grid = pointer_grid(1000, 1, scale);
+            for col in 0..1000 {
+                for x in points_in_cell(PAD_X, CELL_W, col) {
+                    assert_eq!(
+                        cell_at(x, PAD_Y, grid),
+                        Some((col, 0)),
+                        "x = {x} at {scale}x"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_painted_row_maps_to_itself() {
+        for scale in SCALES {
+            let grid = pointer_grid(1, 60, scale);
+            for row in 0..60 {
+                for y in points_in_cell(PAD_Y, CELL_H, row) {
+                    assert_eq!(
+                        cell_at(PAD_X, y, grid),
+                        Some((0, row)),
+                        "y = {y} at {scale}x"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn centre_of_column_150_at_1_7x_is_column_150() {
+        // Issue #486: hit-testing with the rounded 15 px device cell, instead
+        // of the painted 15.3 px, put this pointer on column 153.
+        let x = PAD_X + 150.0 * CELL_W + CELL_W / 2.0;
+        assert_eq!(cell_at(x, PAD_Y, pointer_grid(200, 1, 1.7)), Some((150, 0)));
+    }
+
+    #[test]
+    fn padding_ends_where_the_painted_grid_ends() {
+        let grid = pointer_grid(80, 24, 1.5);
+        let right = PAD_X + 80.0 * CELL_W;
+        let bottom = PAD_Y + 24.0 * CELL_H;
+        for (x, y) in [
+            (PAD_X - 0.1, 50.0),
+            (50.0, PAD_Y - 0.1),
+            (right, 50.0),
+            (50.0, bottom),
+            (right + 30.0, bottom + 30.0),
+        ] {
+            assert_eq!(cell_at(x, y, grid), None, "({x}, {y})");
+        }
+        assert_eq!(cell_at(right - 0.5, bottom - 0.5, grid), Some((79, 23)));
+        assert_eq!(cell_at(PAD_X, PAD_Y, grid), Some((0, 0)));
+    }
+
+    #[test]
+    fn clamped_pointers_outside_the_grid_land_on_the_nearest_edge_cell() {
+        let grid = pointer_grid(80, 24, 1.7);
+        let mid_y = PAD_Y + 12.5 * CELL_H;
+        let mid_x = PAD_X + 40.5 * CELL_W;
+        for ((x, y), cell) in [
+            ((-50.0, mid_y), (0, 12)),
+            ((5000.0, mid_y), (79, 12)),
+            ((mid_x, -50.0), (40, 0)),
+            ((mid_x, 5000.0), (40, 23)),
+            ((-1.0e9, -1.0e9), (0, 0)),
+            ((1.0e9, 1.0e9), (79, 23)),
+        ] {
+            let pointer = pointer_in_grid(x, y, grid, true).unwrap();
+            assert_eq!((pointer.col, pointer.row), cell, "({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn ghostty_finds_the_same_cell_and_offset_in_device_px() {
+        for scale in SCALES {
+            let grid = pointer_grid(300, 60, scale);
+            let device_cell_w = (CELL_W * scale).round();
+            let device_cell_h = (CELL_H * scale).round();
+            let device_pad_x = (PAD_X * scale).round();
+            let device_pad_y = (PAD_Y * scale).round();
+            for (col, row) in [(0, 0), (1, 1), (149, 29), (150, 30), (299, 59)] {
+                for (x, y) in points_in_cell(PAD_X, CELL_W, col)
+                    .into_iter()
+                    .zip(points_in_cell(PAD_Y, CELL_H, row))
+                {
+                    let pointer = pointer_in_grid(x, y, grid, false).unwrap();
+                    let geometry = pointer.geometry;
+                    assert_eq!(geometry.columns, 300);
+                    assert_eq!(geometry.cell_width_px as f32, device_cell_w);
+                    assert_eq!(geometry.padding_left_px as f32, device_pad_x);
+
+                    // Ghostty's selection gesture and mouse encoder divide
+                    // by the whole-pixel device cell.
+                    let selection_col = (pointer.selection_x_px - device_pad_x) / device_cell_w;
+                    let selection_row = (pointer.selection_y_px - device_pad_y) / device_cell_h;
+                    let report_col = pointer.report_x_px / device_cell_w;
+                    let report_row = pointer.report_y_px / device_cell_h;
+                    let painted_col = (x - PAD_X) / CELL_W;
+                    let painted_row = (y - PAD_Y) / CELL_H;
+                    for (device, painted, what) in [
+                        (selection_col, painted_col, "selection column"),
+                        (selection_row, painted_row, "selection row"),
+                        (report_col, painted_col, "report column"),
+                        (report_row, painted_row, "report row"),
+                    ] {
+                        assert!(
+                            (device - painted).abs() < 1e-3,
+                            "{what} at ({x}, {y}), {scale}x: {device} vs {painted}"
+                        );
+                    }
+                    assert_eq!(selection_col.floor() as u16, col);
+                    assert_eq!(selection_row.floor() as u16, row);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn autoscroll_height_uses_the_pointer_space() {
+        let screen_height = |pane_height: f32, scale: f32| {
+            let grid = PointerGrid {
+                pane_height,
+                ..pointer_grid(80, 25, scale)
+            };
+            pointer_in_grid(PAD_X, PAD_Y, grid, false)
+                .unwrap()
+                .geometry
+                .screen_height_px
+        };
+        // Whole-number device rows: the full pane, as before.
+        assert_eq!(screen_height(520.0, 1.5), 780);
+        // 27 px device rows for 26.67 px painted ones at 4/3: 13 px padding
+        // + 510 / 20 × 27 = 701.5, where the pane is 693.3 device px tall.
+        assert_eq!(screen_height(520.0, 4.0 / 3.0), 702);
+    }
+
+    #[test]
+    fn pane_edges_stay_within_a_device_pixel_of_their_true_position() {
+        for scale in SCALES {
+            let grid = pointer_grid(80, 25, scale);
+            let top_left = pointer_in_grid(0.0, 0.0, grid, true).unwrap();
+            assert!(top_left.selection_x_px.abs() < 1.0, "{scale}x");
+            assert!(top_left.selection_y_px.abs() < 1.0, "{scale}x");
+        }
+    }
+
+    #[test]
+    fn degenerate_scales_and_grids_do_not_panic() {
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            if let Some(pointer) = pointer_in_grid(50.0, 50.0, pointer_grid(80, 24, scale), true) {
+                assert!(pointer.col < 80 && pointer.row < 24, "{scale}x");
+                assert!(pointer.geometry.cell_width_px > 0, "{scale}x");
+                assert!(pointer.geometry.screen_height_px > 0, "{scale}x");
+            }
+        }
+        for (columns, rows) in [(0, 24), (80, 0)] {
+            assert!(pointer_in_grid(50.0, 50.0, pointer_grid(columns, rows, 1.5), true).is_none());
+        }
+    }
+
+    #[test]
+    fn non_finite_pointers_map_to_no_cell() {
+        let grid = pointer_grid(80, 24, 1.5);
+        for (x, y) in [
+            (f32::NAN, 50.0),
+            (50.0, f32::NAN),
+            (f32::INFINITY, 50.0),
+            (50.0, f32::NEG_INFINITY),
+        ] {
+            for clamp in [false, true] {
+                assert!(pointer_in_grid(x, y, grid, clamp).is_none(), "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pane_inside_its_padding_has_no_cell_until_clamped() {
+        // grid_size_for_pane never reports less than one cell.
+        let grid = PointerGrid {
+            pane_height: 15.0,
+            ..pointer_grid(1, 1, 1.5)
+        };
+        assert_eq!(cell_at(5.0, 5.0, grid), None);
+        let pointer = pointer_in_grid(5.0, 5.0, grid, true).unwrap();
+        assert_eq!((pointer.col, pointer.row), (0, 0));
+    }
+
+    #[gpui::test]
+    fn mouse_reports_name_the_painted_column_at_fractional_scale(cx: &mut gpui::TestAppContext) {
+        use super::{VtMouseAction as Action, VtMouseButton as Button};
+        use gpui::{point, px};
+        use std::time::{Duration, Instant};
+
+        // SGR press of the left button on column 151, row 1 (both 1-based).
+        let expected = b"\x1b[<0;151;1M";
+        let script = format!(
+            "stty raw -echo; printf '\x1b[?1002h\x1b[?1006hREADY'; \
+             dd bs=1 count={} 2>/dev/null | od -An -tx1; exec sleep 30",
+            expected.len()
+        );
+        let view = pty_test_view(cx, 200, 1.7, &script, "READY");
+        view.update(cx, |view, _cx| {
+            // Centre of painted column 150 in row 0, with the pane at (31, 47).
+            let position = point(
+                px(31.0 + PAD_X + 150.0 * CELL_W + CELL_W / 2.0),
+                px(47.0 + PAD_Y + CELL_H / 2.0),
+            );
+            assert!(view.report_mouse(position, Action::Press, Some(Button::Left)));
+
+            let terminal = view.terminal().unwrap();
+            let expected_hex = expected
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let output = terminal
+                    .read_recent_lines(24)
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if output.contains(&expected_hex) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "expected {expected_hex:?}, got {output:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn link_lookup_uses_the_painted_column_at_fractional_scale(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, px};
+
+        // The URL fills columns 140 to 150 of row 0.
+        let view = pty_test_view(
+            cx,
+            200,
+            1.7,
+            "stty raw -echo; printf '\x1b[1;141Hhttp://a.io'; exec sleep 30",
+            "http://a.io",
+        );
+        view.update(cx, |view, _cx| {
+            let centre_of = |col: f32| {
+                point(
+                    px(31.0 + PAD_X + col * CELL_W + CELL_W / 2.0),
+                    px(47.0 + PAD_Y + CELL_H / 2.0),
+                )
+            };
+            let link = view.link_at_position(centre_of(145.0)).unwrap();
+            assert_eq!((link.start_col, link.end_col), (140, 151));
+            // The rounded device cell used to map this to column 142.
+            assert_eq!(view.link_at_position(centre_of(139.0)), None);
+        });
+    }
+
+    #[gpui::test]
+    fn resize_sends_painted_grid_and_keeps_full_pane_for_selection(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, px};
+
+        let view = mouse_test_view(cx);
+        view.update(cx, |view, _cx| {
+            let bounds = view.pane_bounds.unwrap();
+            view.sync_surface_size(bounds, 1.5);
+            let sent = view.terminal().unwrap().size();
+            // 800 × 520 logical px at 1.5x, inside 12 / 10 px padding.
+            assert_eq!((sent.columns, sent.rows), (86, 25));
+            assert_eq!((sent.width_px, sent.height_px), (1164, 750));
+
+            let (_, geometry) = view
+                .selection_input_from_event_position(point(px(100.0), px(100.0)), true)
+                .unwrap();
+            assert_eq!(geometry.screen_height_px, 780);
+        });
+    }
+
     #[test]
     fn cell_metrics_match_font_size_clamping() {
         assert_eq!(effective_font_size(0.0), DEFAULT_FONT_SIZE);
         assert_eq!(effective_font_size(8.0), MIN_FONT_SIZE_PX);
         assert_eq!(cell_width_px(14.0), 9.0);
         assert_eq!(cell_height_px(14.0), 20.0);
+        assert_eq!(physical_cell_size(14.0, 2.0), (18, 40));
+    }
+
+    #[test]
+    fn kitty_placement_maps_device_pixels_and_source_crop() {
+        let placement = KittyPlacement {
+            image: Arc::new(KittyImage {
+                id: 1,
+                generation: 2,
+                width: 4,
+                height: 2,
+                rgba: vec![0; 4 * 2 * 4].into(),
+            }),
+            placement_id: 3,
+            z: 0,
+            viewport_col: -1,
+            viewport_row: 2,
+            cell_x_offset: 4,
+            cell_y_offset: 6,
+            pixel_width: 20,
+            pixel_height: 10,
+            source_x: 1,
+            source_y: 0,
+            source_width: 2,
+            source_height: 1,
+        };
+
+        let geometry = kitty_placement_geometry(&placement, 10.0, 20.0, 20, 40).unwrap();
+        assert_eq!(geometry.left_px, -8.0);
+        assert_eq!(geometry.top_px, 43.0);
+        assert_eq!(geometry.width_px, 10.0);
+        assert_eq!(geometry.height_px, 5.0);
+        assert_eq!(geometry.image_left_px, -5.0);
+        assert_eq!(geometry.image_top_px, 0.0);
+        assert_eq!(geometry.image_width_px, 20.0);
+        assert_eq!(geometry.image_height_px, 10.0);
+    }
+
+    #[test]
+    fn kitty_placement_stays_aligned_after_fractional_cell_rounding() {
+        let placement = KittyPlacement {
+            image: Arc::new(KittyImage {
+                id: 1,
+                generation: 2,
+                width: 140,
+                height: 30,
+                rgba: vec![0; 140 * 30 * 4].into(),
+            }),
+            placement_id: 3,
+            z: 0,
+            viewport_col: 40,
+            viewport_row: 2,
+            cell_x_offset: 14,
+            cell_y_offset: 0,
+            pixel_width: 140,
+            pixel_height: 30,
+            source_x: 0,
+            source_y: 0,
+            source_width: 140,
+            source_height: 30,
+        };
+
+        // A 9px logical cell rounds to 14 physical pixels at 1.5x. The
+        // placement must advance exactly one logical cell for every 14 device
+        // pixels rather than using 1 / 1.5 and accumulating column drift.
+        let geometry = kitty_placement_geometry(&placement, 9.0, 20.0, 14, 30).unwrap();
+        assert_eq!(geometry.left_px, 369.0);
+        assert_eq!(geometry.top_px, 40.0);
+        assert_eq!(geometry.width_px, 90.0);
+        assert_eq!(geometry.height_px, 20.0);
+    }
+
+    #[test]
+    fn kitty_layers_match_protocol_z_boundaries() {
+        assert!(KittyImageLayer::BelowBackground.contains(i32::MIN));
+        assert!(!KittyImageLayer::BelowBackground.contains(KITTY_BELOW_BACKGROUND_LIMIT));
+        assert!(KittyImageLayer::BelowText.contains(KITTY_BELOW_BACKGROUND_LIMIT));
+        assert!(KittyImageLayer::BelowText.contains(-1));
+        assert!(!KittyImageLayer::BelowText.contains(0));
+        assert!(KittyImageLayer::AboveText.contains(0));
+    }
+
+    #[test]
+    fn kitty_rgba_is_swizzled_for_gpui_render_images() {
+        let image = KittyImage {
+            id: 1,
+            generation: 1,
+            width: 1,
+            height: 1,
+            rgba: vec![0x11, 0x22, 0x33, 0x44].into(),
+        };
+        let render_image = kitty_image_to_render_image(&image).unwrap();
+        assert_eq!(
+            render_image.as_bytes(0),
+            Some(&[0x33, 0x22, 0x11, 0x44][..])
+        );
     }
 
     #[test]
@@ -1939,62 +4654,210 @@ mod tests {
     }
 
     #[test]
-    fn terminal_selection_row_range_handles_reverse_drag() {
-        let snapshot = ScreenSnapshot {
-            cols: 5,
-            rows: 3,
-            cells: Vec::new(),
-            dirty_rows: Vec::new(),
-            cursor: VtCursor {
-                col: 0,
-                row: 0,
-                visible: false,
-            },
-            alternate_screen: false,
-            scrollbar: None,
-            title: None,
-            generation: 1,
-        };
-        let selection = TerminalSelection {
-            anchor: (3, 1),
-            extent: (1, 0),
-        };
+    fn grapheme_rows_preserve_text_style_bytes_and_grid_columns() {
+        use con_ghostty::vt::VtScreen;
+        let screen = VtScreen::new(20, 2, None).unwrap();
+        screen.feed("\x1b[?2027he\u{301}\x1b[1m👩\u{200d}🚒\x1b[0mZ".as_bytes());
+        let snapshot = screen.snapshot();
+        let row = build_terminal_row(
+            &snapshot.cells[..20],
+            fg(),
+            bg(),
+            &base_font(),
+            None,
+            None,
+            bg(),
+        );
+        assert_eq!(
+            row.spans
+                .iter()
+                .map(|span| (span.start_col, span.columns, span.text.as_ref()))
+                .collect::<Vec<_>>(),
+            [(0, 1, "e\u{301}"), (1, 2, "👩\u{200d}🚒"), (3, 1, "Z")]
+        );
+        assert_eq!(row.spans[1].runs[0].len, 11);
+        assert_eq!(row.spans[1].runs[0].font.weight, FontWeight::BOLD);
 
-        assert_eq!(selection.row_range(0, &snapshot), Some((1, 4)));
-        assert_eq!(selection.row_range(1, &snapshot), Some((0, 3)));
-        assert_eq!(selection.row_range(2, &snapshot), None);
+        screen.feed(b"\x1b[?2027l\x1b[2K\r");
+        screen.feed("👩\u{200d}🚒hello".as_bytes());
+        let snapshot = screen.snapshot();
+        let row = build_terminal_row(
+            &snapshot.cells[..20],
+            fg(),
+            bg(),
+            &base_font(),
+            None,
+            None,
+            bg(),
+        );
+        assert_eq!(
+            row.spans
+                .iter()
+                .map(|span| (span.start_col, span.columns, span.text.as_ref()))
+                .collect::<Vec<_>>(),
+            [(0, 2, "👩\u{200d}"), (2, 2, "🚒"), (4, 5, "hello")]
+        );
     }
 
     #[test]
-    fn extracts_selected_text_from_snapshot() {
-        let mut cells = vec![VtCell::default(); 12];
-        for (idx, ch) in "one two     ".chars().enumerate() {
-            cells[idx].codepoint = ch as u32;
+    fn cursor_overlay_uses_wide_head_geometry_and_color() {
+        use con_ghostty::vt::CellWidth;
+        let mut snapshot = ScreenSnapshot {
+            cols: 8,
+            rows: 2,
+            cells: vec![VtCell::default(); 16],
+            ..ScreenSnapshot::default()
+        };
+        snapshot.cells[9] = VtCell {
+            codepoint: '中' as u32,
+            width: CellWidth::Wide,
+            fg: 0xff0000ff,
+            ..VtCell::default()
+        };
+        snapshot.cells[10].width = CellWidth::SpacerTail;
+        snapshot.cells[11] = VtCell {
+            codepoint: 'Z' as u32,
+            fg: 0x00ff00ff,
+            ..VtCell::default()
+        };
+        for style in [
+            CursorStyle::Bar,
+            CursorStyle::Underline,
+            CursorStyle::HollowBlock,
+        ] {
+            for col in [1, 2] {
+                let cursor = VtCursor {
+                    row: 1,
+                    col,
+                    visible: true,
+                    style,
+                    ..VtCursor::default()
+                };
+                let (head, cell) = cursor_overlay_cell(&snapshot, cursor).unwrap();
+                assert_eq!(head, 1);
+                assert_eq!(cell.codepoint, '中' as u32);
+                assert_eq!(cell.width, con_ghostty::vt::CellWidth::Wide);
+                assert_eq!(cell.fg, snapshot.cells[9].fg);
+            }
         }
-        let snapshot = ScreenSnapshot {
-            cols: 4,
-            rows: 3,
-            cells,
-            dirty_rows: Vec::new(),
-            cursor: VtCursor {
-                col: 0,
-                row: 0,
-                visible: false,
-            },
-            alternate_screen: false,
-            scrollbar: None,
-            title: None,
-            generation: 1,
+        let cursor = VtCursor {
+            row: 1,
+            col: 3,
+            ..VtCursor::default()
         };
+        let (col, cell) = cursor_overlay_cell(&snapshot, cursor).unwrap();
+        assert_eq!(col, 3);
+        assert_eq!(cell.codepoint, 'Z' as u32);
+        assert_eq!(cell.width, con_ghostty::vt::CellWidth::Narrow);
+        assert_ne!(cell.fg, snapshot.cells[9].fg);
+        assert!(cursor_overlay_cell(&snapshot, VtCursor { col: 8, ..cursor }).is_none());
+    }
 
-        let selection = TerminalSelection {
-            anchor: (1, 0),
-            extent: (2, 1),
+    #[test]
+    fn wide_tail_selection_and_cursor_cover_the_native_cluster() {
+        let screen = con_ghostty::vt::VtScreen::new(8, 2, None).unwrap();
+        screen.feed("中Z".as_bytes());
+        let snapshot = screen.snapshot();
+        for (cursor, selection) in [(None, Some((1, 1))), (Some(1), None)] {
+            let row = build_terminal_row(
+                &snapshot.cells[..8],
+                fg(),
+                bg(),
+                &base_font(),
+                cursor,
+                selection,
+                fg(),
+            );
+            assert_eq!(row.backgrounds[0].start_col, 0);
+            assert_eq!(row.backgrounds[0].len, 2);
+            assert!(row.backgrounds[0].overlay);
+            assert_eq!(row.spans[0].text.as_ref(), "中");
+            assert_eq!(row.spans[0].columns, 2);
+        }
+    }
+
+    #[test]
+    fn concealed_row_hides_glyphs_and_decorations_with_cursor_and_selection() {
+        use con_ghostty::vt::{ATTR_INVISIBLE, ATTR_STRIKE};
+
+        let attrs = ATTR_INVERSE | ATTR_UNDERLINE | ATTR_STRIKE;
+        let cells = [
+            make_cell('X', attrs | ATTR_INVISIBLE, 0xCC2211FF, 0x1133AAFF),
+            make_cell('Y', attrs, 0xCC2211FF, 0x1133AAFF),
+        ];
+        for (cursor, selection) in [(None, None), (Some(0), None), (None, Some((0, 0)))] {
+            let row = build_terminal_row(&cells, fg(), bg(), &base_font(), cursor, selection, fg());
+            assert_eq!(row.spans[0].text.as_ref(), " Y");
+            let runs = &row.spans[0].runs;
+            assert_eq!(runs.len(), 2);
+            assert!(runs[0].underline.is_none());
+            assert!(runs[0].strikethrough.is_none());
+            assert!(runs[1].underline.is_some());
+            assert!(runs[1].strikethrough.is_some());
+            let expected_bg = if cursor.is_some() {
+                vt_color_to_hsla(cells[0].bg).unwrap()
+            } else if selection.is_some() {
+                fg()
+            } else {
+                vt_color_to_hsla(cells[0].fg).unwrap()
+            };
+            assert_eq!(row.backgrounds[0].color, expected_bg);
+        }
+        assert_eq!(cells[0].codepoint, 'X' as u32);
+    }
+
+    #[test]
+    fn terminal_row_uses_bundled_fallback_for_private_use_icons() {
+        let font = Font {
+            family: "Definitely Missing Primary".into(),
+            features: FontFeatures::default(),
+            fallbacks: Some(FontFallbacks::from_fonts(vec![
+                BUNDLED_LINUX_FONT_FAMILY.to_string(),
+            ])),
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
         };
+        let cells = [make_cell('\u{E0B0}', 0, 0, 0)];
+        let row = build_terminal_row(&cells, fg(), bg(), &font, None, None, bg());
 
+        assert_eq!(row.spans.len(), 1);
         assert_eq!(
-            extract_selection_text(&snapshot, selection),
-            Some("ne\ntwo".to_string())
+            row.spans[0].runs[0].font.family.as_ref(),
+            BUNDLED_LINUX_FONT_FAMILY
+        );
+    }
+
+    #[test]
+    fn cursor_and_selection_backgrounds_render_above_negative_z_images() {
+        let cells = [
+            make_cell('a', 0, 0, 0x112233FF),
+            make_cell('b', 0, 0, 0x112233FF),
+            make_cell('c', 0, 0, 0x112233FF),
+        ];
+        let row = build_terminal_row(
+            &cells,
+            fg(),
+            bg(),
+            &base_font(),
+            Some(2),
+            Some((1, 1)),
+            bg(),
+        );
+
+        assert!(
+            row.backgrounds
+                .iter()
+                .any(|run| run.start_col == 0 && run.len == 1 && !run.overlay)
+        );
+        assert!(
+            row.backgrounds
+                .iter()
+                .any(|run| run.start_col == 1 && run.len == 1 && run.overlay)
+        );
+        assert!(
+            row.backgrounds
+                .iter()
+                .any(|run| run.start_col == 2 && run.len == 1 && run.overlay)
         );
     }
 
@@ -2004,11 +4867,14 @@ mod tests {
             cols: 4,
             rows: 3,
             cells: vec![Default::default(); 12],
+            selection_ranges: vec![None; 3],
+            kitty_placements: Default::default(),
             dirty_rows: vec![1],
             cursor: VtCursor {
                 col: 2,
                 row: 2,
                 visible: true,
+                ..Default::default()
             },
             alternate_screen: false,
             scrollbar: None,
@@ -2022,6 +4888,7 @@ mod tests {
                 col: 1,
                 row: 0,
                 visible: true,
+                ..Default::default()
             }),
             false,
         );
@@ -2029,5 +4896,297 @@ mod tests {
         rows.dedup();
 
         assert_eq!(rows, vec![0, 1, 2]);
+    }
+
+    /// A child that prints `row-001` to `row-200`, sets `modes`, then waits.
+    fn scrollback_script(modes: &str) -> String {
+        format!(
+            "stty raw -echo; i=1; while [ $i -le 200 ]; do printf 'row-%03d\\r\\n' $i; \
+             i=$((i+1)); done; printf '{modes}READY'; exec sleep 30"
+        )
+    }
+
+    fn wheel(x: f32, y: f32, delta: gpui::ScrollDelta, shift: bool) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(x), gpui::px(y)),
+            delta,
+            modifiers: gpui::Modifiers {
+                shift,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn lines(y: f32) -> gpui::ScrollDelta {
+        gpui::ScrollDelta::Lines(gpui::point(0.0, y))
+    }
+
+    fn scroll_offset(view: &super::GhosttyView) -> u64 {
+        view.terminal()
+            .unwrap()
+            .scrollbar()
+            .expect("scrollbar state")
+            .offset
+    }
+
+    // Inside the painted grid of `pty_test_view`'s pane at (31, 47).
+    const GRID_X: f32 = 100.0;
+    const GRID_Y: f32 = 120.0;
+
+    #[gpui::test]
+    fn wheel_scrolls_scrollback_when_the_app_does_not_track_the_mouse(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| {
+            let bottom = scroll_offset(view);
+            assert!(bottom > 0, "200 rows must overflow the pane");
+
+            assert!(view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, lines(5.0), false)));
+            assert_eq!(scroll_offset(view) + 5, bottom);
+
+            assert!(view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, lines(-5.0), false)));
+            assert_eq!(scroll_offset(view), bottom);
+        });
+    }
+
+    #[gpui::test]
+    fn fractional_wheel_deltas_add_up_to_whole_rows(cx: &mut gpui::TestAppContext) {
+        let view = pty_test_view(cx, 80, 1.5, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| {
+            let bottom = scroll_offset(view);
+            // GPUI on Wayland reports a high-resolution wheel as fractions
+            // of its three-line notch.
+            for _ in 0..4 {
+                view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, lines(0.75), false));
+            }
+            assert_eq!(scroll_offset(view) + 3, bottom);
+
+            let row = super::cell_height_px(super::effective_font_size(14.0));
+            for _ in 0..10 {
+                let pixels =
+                    gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(row / 10.0)));
+                view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, pixels, false));
+            }
+            assert_eq!(scroll_offset(view) + 4, bottom);
+        });
+    }
+
+    #[gpui::test]
+    fn wheel_goes_to_an_app_that_tracks_the_mouse(cx: &mut gpui::TestAppContext) {
+        let script = scrollback_script("\x1b[?1002h\x1b[?1006h");
+        let view = pty_test_view(cx, 80, 1.0, &script, "READY");
+        view.update(cx, |view, _cx| {
+            let terminal = view.terminal().unwrap().clone();
+            let bottom = scroll_offset(view);
+            let generation = terminal.input_generation();
+
+            assert!(view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, lines(3.0), false)));
+            assert_eq!(terminal.input_generation(), generation + 1, "wheel report");
+            assert_eq!(scroll_offset(view), bottom);
+
+            // Over the padding nothing is reported, and the view stays put.
+            assert!(!view.handle_scroll_wheel(&wheel(35.0, GRID_Y, lines(3.0), false)));
+            assert_eq!(terminal.input_generation(), generation + 1);
+            assert_eq!(scroll_offset(view), bottom);
+        });
+    }
+
+    #[gpui::test]
+    fn shift_wheel_scrolls_scrollback_even_when_the_app_tracks_the_mouse(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let script = scrollback_script("\x1b[?1002h\x1b[?1006h");
+        let view = pty_test_view(cx, 80, 1.0, &script, "READY");
+        view.update(cx, |view, _cx| {
+            let terminal = view.terminal().unwrap().clone();
+            let bottom = scroll_offset(view);
+            let generation = terminal.input_generation();
+
+            // GPUI's X11 and Wayland backends move a Shift+wheel onto the
+            // horizontal axis before the view sees it.
+            let shift_wheel_up = gpui::ScrollDelta::Lines(gpui::point(3.0, 0.0));
+            assert!(view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, shift_wheel_up, true)));
+            assert_eq!(
+                terminal.input_generation(),
+                generation,
+                "no report with Shift"
+            );
+            assert_eq!(scroll_offset(view) + 3, bottom);
+        });
+    }
+
+    #[gpui::test]
+    fn shift_wheel_scrolls_scrollback_at_a_prompt(cx: &mut gpui::TestAppContext) {
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| {
+            let bottom = scroll_offset(view);
+            let shift_wheel_up = gpui::ScrollDelta::Lines(gpui::point(3.0, 0.0));
+            assert!(view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, shift_wheel_up, true)));
+            assert_eq!(scroll_offset(view) + 3, bottom);
+
+            let shift_wheel_down = gpui::ScrollDelta::Lines(gpui::point(-3.0, 0.0));
+            assert!(view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, shift_wheel_down, true)));
+            assert_eq!(scroll_offset(view), bottom);
+        });
+    }
+
+    #[gpui::test]
+    fn horizontal_wheel_leaves_the_scrollback_alone(cx: &mut gpui::TestAppContext) {
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| {
+            let bottom = scroll_offset(view);
+            let sideways = gpui::ScrollDelta::Lines(gpui::point(3.0, 0.0));
+            assert!(!view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, sideways, false)));
+            assert_eq!(scroll_offset(view), bottom);
+        });
+    }
+
+    #[gpui::test]
+    fn wheel_without_a_session_does_nothing(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+
+        let app = Arc::new(
+            con_ghostty::GhosttyApp::new(
+                None, None, None, None, None, None, None, None, None, None, None, None, None, false,
+            )
+            .unwrap(),
+        );
+        let view = cx.new(|cx| super::GhosttyView::new(app, None, None, None, 14.0, cx));
+        view.update(cx, |view, _cx| {
+            assert!(!view.handle_scroll_wheel(&wheel(GRID_X, GRID_Y, lines(3.0), false)));
+        });
+    }
+
+    fn keystroke(text: &str) -> gpui::Keystroke {
+        gpui::Keystroke::parse(text).unwrap()
+    }
+
+    #[test]
+    fn shift_page_keys_page_the_primary_screen_scrollback() {
+        use super::scrollback_page_rows;
+
+        assert_eq!(
+            scrollback_page_rows(&keystroke("shift-pageup"), false, 24),
+            Some(-24)
+        );
+        assert_eq!(
+            scrollback_page_rows(&keystroke("shift-pagedown"), false, 24),
+            Some(24)
+        );
+        for (text, alternate_screen) in [
+            ("shift-pageup", true),
+            ("shift-pagedown", true),
+            ("pageup", false),
+            ("ctrl-shift-pageup", false),
+            ("alt-shift-pageup", false),
+            ("shift-up", false),
+        ] {
+            assert_eq!(
+                scrollback_page_rows(&keystroke(text), alternate_screen, 24),
+                None,
+                "{text} on the alternate screen: {alternate_screen}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn shift_page_up_pages_scrollback_without_writing_to_the_pty(cx: &mut gpui::TestAppContext) {
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| {
+            let terminal = view.terminal().unwrap().clone();
+            let bottom = scroll_offset(view);
+            let generation = terminal.input_generation();
+
+            assert!(view.try_page_scrollback(&keystroke("shift-pageup")));
+            assert_eq!(scroll_offset(view) + 24, bottom);
+            assert_eq!(terminal.input_generation(), generation);
+
+            assert!(view.try_page_scrollback(&keystroke("shift-pagedown")));
+            assert_eq!(scroll_offset(view), bottom);
+        });
+    }
+
+    #[gpui::test]
+    fn shift_page_up_belongs_to_alternate_screen_apps(cx: &mut gpui::TestAppContext) {
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script("\x1b[?1049h"), "READY");
+        view.update(cx, |view, _cx| {
+            assert!(!view.try_page_scrollback(&keystroke("shift-pageup")));
+        });
+    }
+
+    #[gpui::test]
+    fn scrollbar_thumb_appears_only_with_scrollback(cx: &mut gpui::TestAppContext) {
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| assert!(view.scrollbar_thumb().is_some()));
+
+        let view = pty_test_view(
+            cx,
+            80,
+            1.0,
+            "stty raw -echo; printf READY; exec sleep 30",
+            "READY",
+        );
+        view.update(cx, |view, _cx| assert!(view.scrollbar_thumb().is_none()));
+    }
+
+    #[gpui::test]
+    fn dragging_the_scrollbar_thumb_to_the_top_shows_the_oldest_row(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, px};
+
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| {
+            let (_, layout) = view.scrollbar_thumb().unwrap();
+            let x = px(31.0 + 790.0);
+            let grab = 47.0 + layout.thumb_top_px + layout.thumb_height_px / 2.0;
+            view.start_scrollbar_drag(point(x, px(grab)));
+            view.drag_scrollbar(point(x, px(grab - 2_000.0)));
+
+            assert_eq!(scroll_offset(view), 0);
+            let terminal = view.terminal().unwrap();
+            assert!(
+                terminal.read_screen_text(24).join("\n").contains("row-001"),
+                "{:?}",
+                terminal.read_screen_text(24)
+            );
+            assert!(view.end_scrollbar_drag());
+            assert!(!view.end_scrollbar_drag(), "the drag ends once");
+        });
+    }
+
+    #[gpui::test]
+    fn clicking_the_scrollbar_track_above_the_thumb_pages_up(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, px};
+
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| {
+            let bottom = scroll_offset(view);
+            let (scrollbar, layout) = view.scrollbar_thumb().unwrap();
+            view.page_scrollbar_toward(point(px(821.0), px(47.0 + layout.thumb_top_px - 5.0)));
+            assert_eq!(scroll_offset(view) + scrollbar.len, bottom);
+        });
+    }
+
+    #[gpui::test]
+    fn cancelling_pointer_interactions_ends_a_scrollbar_drag(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, px};
+
+        let view = pty_test_view(cx, 80, 1.0, &scrollback_script(""), "READY");
+        view.update(cx, |view, _cx| {
+            let (_, layout) = view.scrollbar_thumb().unwrap();
+            let grab = point(px(821.0), px(47.0 + layout.thumb_top_px + 1.0));
+
+            view.start_scrollbar_drag(grab);
+            view.cancel_pointer_interactions();
+            assert!(
+                !view.end_scrollbar_drag(),
+                "focus loss and shutdown end the drag"
+            );
+
+            view.start_scrollbar_drag(grab);
+            view.cancel_left_pointer_interactions(grab);
+            assert!(!view.end_scrollbar_drag(), "a new left press ends the drag");
+        });
     }
 }

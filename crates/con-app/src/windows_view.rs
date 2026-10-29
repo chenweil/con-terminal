@@ -36,35 +36,50 @@
 //!    stalling GPUI's thread.
 //! 4. Drop releases the `RenderSession` and ends the child shell.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use crate::terminal_find::{TerminalFind, TerminalFindDismissed, TerminalFindUpdated};
+use con_ghostty::cursor::CursorBlink;
+use con_ghostty::vt::{
+    SelectionAutoscroll, SelectionAutoscrollUpdate, SelectionGeometry, SelectionPoint, VtKeyAction,
+    VtKeyEvent, VtKeyModifiers, VtMouseButton, VtPasteResult, VtPasteSource,
+};
+use con_ghostty::{DesktopNotification, TerminalProgress};
 use con_ghostty::{GhosttyApp, GhosttyScrollbar, GhosttySplitDirection, GhosttyTerminal};
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::*;
-use gpui_component::ActiveTheme;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::ContextMenuExt;
+use gpui_component::{ActiveTheme, Sizable as _};
 use image::{Frame, RgbaImage};
 use smallvec::SmallVec;
 
+use crate::mouse_sequence::MouseButtonSequence;
 use crate::terminal_ime::{TerminalImeInputHandler, TerminalImeView};
 use crate::terminal_links::{self, TerminalLink};
 use crate::terminal_paste::{
     TerminalPastePayload, copy_selection_to_clipboard, payload_from_clipboard,
-    payload_from_external_paths,
+    payload_from_external_paths, unsafe_paste_preview,
 };
-use crate::terminal_restore::{key_down_may_write_terminal, restored_terminal_output};
-use con_ghostty::windows::host_view::{MouseEventMods, RenderSession};
+use crate::terminal_restore::restored_terminal_output;
+use crate::terminal_scrollbar::{SCROLLBAR_INSET_PX, SCROLLBAR_WIDTH_PX, thumb_layout};
+use con_ghostty::windows::host_view::{MouseDownRoute, MouseEventMods, RenderSession};
 use con_ghostty::windows::render::{FrameBgra, RenderOutcome};
 
-const SCROLLBAR_INSET_PX: f32 = 4.0;
-const SCROLLBAR_WIDTH_PX: f32 = 6.0;
-const SCROLLBAR_MIN_THUMB_PX: f32 = 28.0;
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(15);
 const TERMINAL_PADDING_X_PX: f32 = 10.0;
 const TERMINAL_PADDING_Y_PX: f32 = 8.0;
+
+#[derive(Clone, Copy)]
+struct MousePressRoute {
+    shift: bool,
+    local_selection: bool,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ScrollbarDrag {
@@ -92,23 +107,36 @@ fn mouse_mods_from(modifiers: &Modifiers) -> MouseEventMods {
 
 actions!(ghostty, [ConsumeTab, ConsumeTabPrev]);
 
-#[allow(dead_code)]
-pub struct GhosttyTitleChanged(pub Option<String>);
+pub struct GhosttyTitleChanged {
+    pub content_changed: bool,
+}
+pub struct GhosttyBell;
 pub struct GhosttyProcessExited;
 pub struct GhosttyFocusChanged;
 pub struct GhosttySplitRequested(pub GhosttySplitDirection);
 pub struct GhosttyCwdChanged(pub Option<String>);
+pub struct GhosttyProgressChanged;
+pub struct GhosttyDesktopNotification(pub DesktopNotification);
 
 impl EventEmitter<GhosttyTitleChanged> for GhosttyView {}
+impl EventEmitter<GhosttyBell> for GhosttyView {}
 impl EventEmitter<GhosttyProcessExited> for GhosttyView {}
 impl EventEmitter<GhosttyFocusChanged> for GhosttyView {}
 impl EventEmitter<GhosttySplitRequested> for GhosttyView {}
 impl EventEmitter<GhosttyCwdChanged> for GhosttyView {}
+impl EventEmitter<GhosttyProgressChanged> for GhosttyView {}
+impl EventEmitter<GhosttyDesktopNotification> for GhosttyView {}
 
 pub struct GhosttyView {
     app: Arc<GhosttyApp>,
     terminal: Option<Arc<GhosttyTerminal>>,
+    terminal_find: Option<Entity<TerminalFind>>,
     focus_handle: FocusHandle,
+    terminal_focused: bool,
+    cursor_blink: CursorBlink,
+    cursor_blink_task: Option<(Instant, Task<()>)>,
+    render_hold_task: Option<(Instant, Task<()>)>,
+    cursor_subscriptions: Vec<Subscription>,
     initial_cwd: Option<String>,
     restored_screen_text: Option<Vec<String>>,
     initial_font_size: f32,
@@ -119,18 +147,23 @@ pub struct GhosttyView {
     init_failed: bool,
     /// Emit `GhosttyProcessExited` exactly once on shell death.
     process_exit_emitted: bool,
+    pub(crate) terminal_title: con_core::terminal_title::TerminalTitle,
     last_cwd: Option<String>,
+    last_progress: Option<TerminalProgress>,
     /// Pane bounds in logical window pixels, captured during prepaint.
     pane_bounds: Option<Bounds<Pixels>>,
     scale_factor: f32,
     ime_marked_text: Option<String>,
     ime_selected_range: Option<Range<usize>>,
-    /// Last physical-pixel size we sent to `session.resize`. Avoids
-    /// resize churn when the logical bounds round to the same physical
-    /// size frame-to-frame.
+    /// Last physical-pixel size successfully applied by `session.resize`.
+    /// Avoids resize churn when the logical bounds round to the same
+    /// physical size frame-to-frame.
     last_physical_size: Option<(u32, u32)>,
-    /// Last scale factor handed to `session.set_dpi`.
-    last_scale_factor: f32,
+    /// Last physical DPI successfully applied by `session.set_dpi`.
+    last_dpi: u32,
+    /// Current geometry synchronization failure, retained so a retry loop
+    /// reports each failing stage once instead of warning every prepaint.
+    geometry_sync_failure: Option<GeometrySyncFailure>,
     /// The most recently rendered frame, wrapped as a GPUI image.
     cached_image: Option<Arc<RenderImage>>,
     /// CPU-side copy of the current BGRA frame. Dirty-row readbacks
@@ -151,11 +184,21 @@ pub struct GhosttyView {
     /// `Window::drop_image` to evict sprite-atlas tiles.
     images_to_drop: Vec<Arc<RenderImage>>,
     scrollbar_drag: Option<ScrollbarDrag>,
-    terminal_mouse_sequence_active: bool,
+    terminal_left_mouse_sequence: MouseButtonSequence<MousePressRoute>,
+    terminal_middle_mouse_sequence: MouseButtonSequence<MousePressRoute>,
+    terminal_right_mouse_sequence: MouseButtonSequence<MousePressRoute>,
+    /// Whether the most recent right-button press was captured by terminal
+    /// mouse tracking. The context-menu builder suppresses Con's menu even
+    /// when the active protocol legitimately emits no bytes for that press.
+    terminal_mouse_right_consumed: Option<bool>,
     mouse_down_link: Option<TerminalLink>,
     suppress_link_mouse_up: bool,
     hovered_link: Option<TerminalLink>,
     last_mouse_position: Option<Point<Pixels>>,
+    selection_autoscroll_epoch: u64,
+    selection_autoscroll_active: bool,
+    keys_awaiting_release: HashMap<String, crate::terminal_keys::TrackedVtKey>,
+    pending_unsafe_paste: Option<(String, VtPasteSource)>,
     /// Cloned and handed to `RenderSession::new`; the ConPTY reader
     /// thread sends at most one queued signal while a repaint wake is
     /// pending. The coalescer task spawned in `new()` consumes that
@@ -170,6 +213,12 @@ enum SyncRenderResult {
     Unchanged,
     Rendered { needs_followup_prepaint: bool },
     Pending,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GeometrySyncFailure {
+    SetDpi,
+    Resize,
 }
 
 pub fn init(cx: &mut App) {
@@ -202,7 +251,13 @@ impl GhosttyView {
         cx.spawn(async move |this, cx| {
             while wake_rx.next().await.is_some() {
                 pending_for_task.store(false, Ordering::Release);
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                if this
+                    .update(cx, |view, cx| {
+                        view.arm_render_hold(cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -212,20 +267,29 @@ impl GhosttyView {
         Self {
             app,
             terminal: Some(terminal),
+            terminal_find: None,
             focus_handle: cx.focus_handle(),
+            terminal_focused: false,
+            cursor_blink: CursorBlink::default(),
+            cursor_blink_task: None,
+            render_hold_task: None,
+            cursor_subscriptions: Vec::new(),
             initial_cwd: cwd,
             restored_screen_text,
             initial_font_size: font_size,
             initialized: false,
             init_failed: false,
             process_exit_emitted: false,
+            terminal_title: Default::default(),
             last_cwd: None,
+            last_progress: None,
             pane_bounds: None,
             scale_factor: 1.0,
             ime_marked_text: None,
             ime_selected_range: None,
             last_physical_size: None,
-            last_scale_factor: 0.0,
+            last_dpi: 0,
+            geometry_sync_failure: None,
             cached_image: None,
             cached_image_size: None,
             cached_frame: None,
@@ -233,11 +297,18 @@ impl GhosttyView {
             scrollbar_cache: None,
             images_to_drop: Vec::new(),
             scrollbar_drag: None,
-            terminal_mouse_sequence_active: false,
+            terminal_left_mouse_sequence: MouseButtonSequence::default(),
+            terminal_middle_mouse_sequence: MouseButtonSequence::default(),
+            terminal_right_mouse_sequence: MouseButtonSequence::default(),
+            terminal_mouse_right_consumed: None,
             mouse_down_link: None,
             suppress_link_mouse_up: false,
             hovered_link: None,
             last_mouse_position: None,
+            selection_autoscroll_epoch: 0,
+            selection_autoscroll_active: false,
+            keys_awaiting_release: HashMap::new(),
+            pending_unsafe_paste: None,
             wake_tx,
             wake_pending,
         }
@@ -245,6 +316,40 @@ impl GhosttyView {
 
     pub fn terminal(&self) -> Option<&Arc<GhosttyTerminal>> {
         self.terminal.as_ref()
+    }
+
+    /// Keep layout fixtures independent of ConPTY, GPU setup and worker wakes.
+    #[cfg(test)]
+    pub(crate) fn prepare_for_layout_test(&mut self) {
+        self.init_failed = true;
+        self.terminal = None;
+    }
+
+    pub(crate) fn show_terminal_find(
+        &mut self,
+        needle: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(find) = self.terminal_find.as_ref() {
+            find.update(cx, |find, cx| find.set_needle(needle, window, cx));
+            return;
+        }
+        let Some(terminal) = self.terminal.clone() else {
+            return;
+        };
+        let focus = self.focus_handle.clone();
+        let find = cx.new(|cx| TerminalFind::new(terminal, focus, needle, window, cx));
+        cx.subscribe(&find, |_, _, _: &TerminalFindUpdated, cx| cx.notify())
+            .detach();
+        cx.subscribe(&find, |this, _, _: &TerminalFindDismissed, cx| {
+            this.terminal_find = None;
+            cx.notify();
+        })
+        .detach();
+        find.update(cx, |find, cx| find.focus(window, cx));
+        self.terminal_find = Some(find);
+        cx.notify();
     }
 
     pub fn write_or_queue(&mut self, data: &[u8]) {
@@ -268,6 +373,10 @@ impl GhosttyView {
             .or_else(|| self.initial_cwd.clone())
     }
 
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        self.last_progress
+    }
+
     pub fn is_alive(&self) -> bool {
         self.terminal.as_ref().is_some_and(|t| t.is_alive())
     }
@@ -281,7 +390,26 @@ impl GhosttyView {
         self.terminal.as_ref().and_then(|t| t.selection_text())
     }
 
-    pub fn shutdown_surface(&mut self) {
+    pub fn release_mouse_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(position) = self.last_mouse_position else {
+            return;
+        };
+        if self.finish_terminal_mouse_sequence(
+            VtMouseButton::Left,
+            position,
+            MouseEventMods {
+                shift: false,
+                alt: false,
+                control: false,
+            },
+        ) {
+            cx.notify();
+        }
+    }
+
+    pub fn shutdown_surface(&mut self, _window: Option<&mut Window>, _cx: &mut App) {
+        self.release_tracked_keys();
+        self.cancel_pointer_interactions();
         if let Some(terminal) = &self.terminal {
             terminal.request_close();
         }
@@ -295,18 +423,35 @@ impl GhosttyView {
         self.cached_frame_size = None;
         self.scrollbar_cache = None;
         self.scrollbar_drag = None;
-        self.terminal_mouse_sequence_active = false;
+        self.terminal_left_mouse_sequence = MouseButtonSequence::default();
+        self.terminal_middle_mouse_sequence = MouseButtonSequence::default();
+        self.terminal_right_mouse_sequence = MouseButtonSequence::default();
+        self.terminal_mouse_right_consumed = None;
         self.ime_marked_text = None;
         self.ime_selected_range = None;
         self.mouse_down_link = None;
         self.suppress_link_mouse_up = false;
         self.hovered_link = None;
         self.last_mouse_position = None;
+        self.stop_selection_autoscroll();
+        self.keys_awaiting_release.clear();
+        self.pending_unsafe_paste = None;
         self.images_to_drop.clear();
         self.last_physical_size = None;
+        self.geometry_sync_failure = None;
     }
 
     pub fn set_surface_focus_state(&mut self, focused: bool) {
+        if !focused {
+            self.release_tracked_keys();
+            self.cancel_pointer_interactions();
+        }
+    }
+
+    pub fn sync_terminal_focus(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        let focused = window.is_window_active() && self.focus_handle.is_focused(window);
+        self.terminal_focused = focused;
+        self.set_surface_focus_state(focused);
         if let Some(terminal) = &self.terminal {
             terminal.set_focus(focused);
         }
@@ -362,8 +507,8 @@ impl GhosttyView {
         self.poll_terminal_state(cx)
     }
 
-    pub fn pump_deferred_work(&mut self, cx: &mut Context<Self>) -> bool {
-        self.poll_terminal_state(cx)
+    pub fn pump_deferred_work(&mut self, _cx: &mut Context<Self>) -> bool {
+        false
     }
 
     fn poll_terminal_state(&mut self, cx: &mut Context<Self>) -> bool {
@@ -377,6 +522,26 @@ impl GhosttyView {
 
         let mut changed = false;
 
+        if terminal.take_bell() {
+            changed = true;
+            cx.emit(GhosttyBell);
+        }
+
+        if let Some(text) = terminal.take_clipboard_write() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+
+        if let Some(notification) = terminal.take_desktop_notification() {
+            changed = true;
+            cx.emit(GhosttyDesktopNotification(notification));
+        }
+
+        let title = terminal.title();
+        if let Some(content_changed) = self.terminal_title.update(title) {
+            changed = true;
+            cx.emit(GhosttyTitleChanged { content_changed });
+        }
+
         let cwd = terminal.current_dir();
         if cwd != self.last_cwd {
             self.last_cwd = cwd.clone();
@@ -384,9 +549,16 @@ impl GhosttyView {
             cx.emit(GhosttyCwdChanged(cwd));
         }
 
-        // No action-callback channel on Windows (cf. macOS's
-        // `wake_generation`). Poll `is_alive` so workspace's
-        // `on_terminal_process_exited` runs when the child shell exits.
+        let progress = terminal.progress();
+        if progress != self.last_progress {
+            self.last_progress = progress;
+            changed = true;
+            cx.emit(GhosttyProgressChanged);
+        }
+
+        // Portable effects reuse the existing output wake and are drained
+        // above. Process exit has no corresponding VT effect, so poll it to
+        // ensure workspace's `on_terminal_process_exited` still runs.
         if !self.process_exit_emitted && !terminal.is_alive() {
             self.process_exit_emitted = true;
             changed = true;
@@ -428,16 +600,32 @@ impl GhosttyView {
 
         let cwd = self.initial_cwd.as_deref().map(std::path::PathBuf::from);
         let initial_output = restored_terminal_output(self.restored_screen_text.as_deref());
-        match RenderSession::new(width_px, height_px, dpi, config, cwd, initial_output, wake) {
+        let shell = self.app.shell_command();
+        match RenderSession::new(
+            width_px,
+            height_px,
+            dpi,
+            config,
+            shell,
+            cwd,
+            initial_output,
+            self.app.clipboard_write_enabled(),
+            self.app.desktop_notification_policy(),
+            wake,
+        ) {
             Ok(session) => {
                 if let Some(terminal) = &self.terminal {
                     terminal.attach(session);
+                    terminal.set_focus(self.terminal_focused);
                 }
                 self.restored_screen_text = None;
                 self.initialized = true;
+                self.terminal_title
+                    .update(self.terminal.as_ref().and_then(|t| t.title()));
                 self.last_cwd = self.terminal.as_ref().and_then(|t| t.current_dir());
                 self.last_physical_size = Some((width_px, height_px));
-                self.last_scale_factor = dpi as f32 / 96.0;
+                self.last_dpi = dpi;
+                self.geometry_sync_failure = None;
                 self.scrollbar_cache = None;
             }
             Err(err) => {
@@ -453,6 +641,49 @@ impl GhosttyView {
         self.pane_bounds = Some(bounds);
         self.scale_factor = scale_factor;
         bounds_changed || scale_changed
+    }
+
+    fn report_geometry_sync_failure(
+        &mut self,
+        failure: GeometrySyncFailure,
+        error: &anyhow::Error,
+    ) {
+        if self.geometry_sync_failure == Some(failure) {
+            return;
+        }
+        self.geometry_sync_failure = Some(failure);
+        let operation = match failure {
+            GeometrySyncFailure::SetDpi => "set_dpi",
+            GeometrySyncFailure::Resize => "resize",
+        };
+        log::warn!("RenderSession::{operation} failed: {error:#}");
+    }
+
+    fn arm_render_hold(&mut self, cx: &mut Context<Self>) {
+        let deadline = self
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.render_hold_deadline());
+        if self
+            .render_hold_task
+            .as_ref()
+            .map(|(deadline, _)| *deadline)
+            == deadline
+        {
+            return;
+        }
+        self.render_hold_task = deadline.map(|deadline| {
+            let terminal = self.terminal.as_ref().unwrap().clone();
+            let task = cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(deadline.saturating_duration_since(Instant::now()))
+                    .await;
+                if terminal.expire_render_hold(deadline) {
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                }
+            });
+            (deadline, task)
+        });
     }
 
     /// Drives session lifecycle (init/resize/DPI) and pumps one render
@@ -496,22 +727,52 @@ impl GhosttyView {
             return SyncRenderResult::Unchanged;
         };
 
-        if (scale_factor - self.last_scale_factor).abs() > f32::EPSILON {
-            if let Err(err) = session.set_dpi(dpi) {
-                log::warn!("RenderSession::set_dpi failed: {err:#}");
-            }
-            self.last_scale_factor = scale_factor;
-        }
+        // Recompute the grid and mouse cell geometry after a DPI change even
+        // when physical dimensions happen to be unchanged.
+        let dpi_changed = dpi != self.last_dpi;
+        let resize_needed = dpi_changed
+            || session.geometry_sync_pending()
+            || self.last_physical_size != Some((width_px, height_px));
+        if resize_needed {
+            let dpi_ready = if dpi_changed {
+                match session.set_dpi(dpi) {
+                    Ok(()) => {
+                        self.last_dpi = dpi;
+                        true
+                    }
+                    Err(err) => {
+                        self.report_geometry_sync_failure(GeometrySyncFailure::SetDpi, &err);
+                        false
+                    }
+                }
+            } else {
+                true
+            };
 
-        if self.last_physical_size != Some((width_px, height_px)) {
-            if let Err(err) = session.resize(width_px, height_px) {
-                log::warn!("RenderSession::resize failed: {err:#}");
+            if dpi_ready {
+                match session.resize(width_px, height_px) {
+                    Ok(()) => {
+                        self.last_physical_size = Some((width_px, height_px));
+                        self.geometry_sync_failure = None;
+                    }
+                    Err(err) => {
+                        // A resize may have updated an earlier subsystem before
+                        // a later one failed. Force the full idempotent sequence
+                        // to run again on the next prepaint.
+                        self.last_physical_size = None;
+                        self.report_geometry_sync_failure(GeometrySyncFailure::Resize, &err);
+                    }
+                }
             }
-            self.last_physical_size = Some((width_px, height_px));
+        } else {
+            // Returning to the last applied geometry also ends a failed DPI
+            // transition, even though no synchronization call was required.
+            self.geometry_sync_failure = None;
         }
 
         let render_started = perf_trace_enabled().then(Instant::now);
-        let outcome = match session.render_frame() {
+        let focused = self.focus_handle.is_focused(window) && window.is_window_active();
+        let outcome = match session.render_frame(&mut self.cursor_blink, focused) {
             Ok(RenderOutcome::Unchanged) => SyncRenderResult::Unchanged,
             Ok(RenderOutcome::Rendered {
                 frame,
@@ -574,14 +835,16 @@ impl GhosttyView {
     }
 
     fn refresh_scrollbar_cache_from_session(&mut self, session: &RenderSession) {
-        let generation = session.generation();
+        let Some((generation, scrollbar)) = session.snapshot_scrollbar() else {
+            return;
+        };
         if self
             .scrollbar_cache
             .is_some_and(|cache| cache.generation == generation)
         {
             return;
         }
-        let state = session.scrollbar().filter(Self::scrollbar_visible);
+        let state = scrollbar.filter(Self::scrollbar_visible);
         self.scrollbar_cache = Some(ScrollbarCache { generation, state });
     }
 
@@ -711,34 +974,15 @@ impl GhosttyView {
                 let scale_factor = self.scale_factor.max(f32::EPSILON);
                 let image_width = frame_width as f32 / scale_factor;
                 let image_height = frame_height as f32 / scale_factor;
-                if let (Some(bounds), Some(background)) = (self.pane_bounds, gap_background) {
-                    let content_width = f32::from(bounds.size.width);
-                    let content_height = f32::from(bounds.size.height);
-                    if image_width + 0.5 < content_width {
-                        children.push(
-                            div()
-                                .absolute()
-                                .left(px(image_width))
-                                .right_0()
-                                .top_0()
-                                .bottom_0()
-                                .bg(background)
-                                .into_any_element(),
-                        );
-                    }
-                    if image_height + 0.5 < content_height {
-                        children.push(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .w(px(image_width.min(content_width).max(0.0)))
-                                .top(px(image_height))
-                                .bottom_0()
-                                .bg(background)
-                                .into_any_element(),
-                        );
-                    }
-                }
+                children.push(
+                    crate::terminal_geometry::retained_frame_gaps(
+                        size(px(image_width), px(image_height)),
+                        gap_background,
+                    )
+                    .absolute()
+                    .size_full()
+                    .into_any_element(),
+                );
                 image.w(px(image_width)).h(px(image_height))
             } else {
                 // `ObjectFit::Fill` keeps each image quad exactly equal
@@ -760,23 +1004,29 @@ impl GhosttyView {
     /// (col, row) cell address. Returns `None` when we don't yet have a
     /// session / bounds to project into.
     fn cell_from_event_position(&self, pos: Point<Pixels>) -> Option<(u16, u16)> {
-        self.cell_from_event_position_impl(pos, false)
+        self.selection_input_from_event_position(pos, false)
+            .map(|(point, _)| (point.col, point.row))
     }
 
-    fn clamped_cell_from_event_position(&self, pos: Point<Pixels>) -> Option<(u16, u16)> {
-        self.cell_from_event_position_impl(pos, true)
-    }
-
-    fn cell_from_event_position_impl(
+    fn selection_input_from_event_position(
         &self,
         pos: Point<Pixels>,
         clamp_to_grid: bool,
-    ) -> Option<(u16, u16)> {
-        let bounds = self.pane_bounds?;
+    ) -> Option<(SelectionPoint, SelectionGeometry)> {
         let terminal = self.terminal.as_ref()?;
         let inner = terminal.inner();
         let guard = inner.lock();
         let session = guard.as_ref()?;
+        self.selection_input_for_session(session, pos, clamp_to_grid)
+    }
+
+    fn selection_input_for_session(
+        &self,
+        session: &RenderSession,
+        pos: Point<Pixels>,
+        clamp_to_grid: bool,
+    ) -> Option<(SelectionPoint, SelectionGeometry)> {
+        let bounds = self.pane_bounds?;
         let metrics = session.metrics();
         if metrics.cell_width_px == 0 || metrics.cell_height_px == 0 {
             return None;
@@ -784,29 +1034,43 @@ impl GhosttyView {
         let scale = self.scale_factor.max(f32::EPSILON);
         let width_px = ((f32::from(bounds.size.width) * scale).ceil() as u32).max(1);
         let height_px = ((f32::from(bounds.size.height) * scale).ceil() as u32).max(1);
-        let cols = (width_px / metrics.cell_width_px.max(1)).max(1);
-        let rows = (height_px / metrics.cell_height_px.max(1)).max(1);
+        let (cols, rows) = session.vt().size();
+        let cols = u32::from(cols.max(1));
+        let rows = u32::from(rows.max(1));
         let grid_width_px = (cols * metrics.cell_width_px.max(1)) as f32;
         let grid_height_px = (rows * metrics.cell_height_px.max(1)) as f32;
         let local_x = f32::from(pos.x) - f32::from(bounds.origin.x);
         let local_y = f32::from(pos.y) - f32::from(bounds.origin.y);
-        let mut phys_x = local_x * scale;
-        let mut phys_y = local_y * scale;
-        if clamp_to_grid {
-            phys_x = phys_x.clamp(0.0, (grid_width_px - f32::EPSILON).max(0.0));
-            phys_y = phys_y.clamp(0.0, (grid_height_px - f32::EPSILON).max(0.0));
-        } else if phys_x < 0.0
-            || phys_y < 0.0
-            || phys_x >= width_px as f32
-            || phys_y >= height_px as f32
-            || phys_x >= grid_width_px
-            || phys_y >= grid_height_px
+        let surface_x = local_x * scale;
+        let surface_y = local_y * scale;
+        if !clamp_to_grid
+            && (surface_x < 0.0
+                || surface_y < 0.0
+                || surface_x >= width_px as f32
+                || surface_y >= height_px as f32
+                || surface_x >= grid_width_px
+                || surface_y >= grid_height_px)
         {
             return None;
         }
-        let col = ((phys_x as u32) / metrics.cell_width_px.max(1)).min(cols - 1) as u16;
-        let row = ((phys_y as u32) / metrics.cell_height_px.max(1)).min(rows - 1) as u16;
-        Some((col, row))
+        let grid_x = surface_x.clamp(0.0, (grid_width_px - f32::EPSILON).max(0.0));
+        let grid_y = surface_y.clamp(0.0, (grid_height_px - f32::EPSILON).max(0.0));
+        let col = ((grid_x as u32) / metrics.cell_width_px.max(1)).min(cols - 1) as u16;
+        let row = ((grid_y as u32) / metrics.cell_height_px.max(1)).min(rows - 1) as u16;
+        Some((
+            SelectionPoint {
+                col,
+                row,
+                surface_x_px: f64::from(surface_x),
+                surface_y_px: f64::from(surface_y),
+            },
+            SelectionGeometry {
+                columns: cols,
+                cell_width_px: metrics.cell_width_px,
+                padding_left_px: 0,
+                screen_height_px: height_px,
+            },
+        ))
     }
 
     fn link_at_position(&self, pos: Point<Pixels>) -> Option<TerminalLink> {
@@ -815,6 +1079,11 @@ impl GhosttyView {
         let inner = terminal.inner();
         let guard = inner.lock();
         let session = guard.as_ref()?;
+        // Query the hit cell before the plain-text snapshot fallback. Errors
+        // suppress activation rather than opening a potentially deceptive label.
+        if let Some(uri) = session.vt().hyperlink_at(col, row).ok()? {
+            return Some(TerminalLink::osc8(&uri, col, row));
+        }
         let snapshot = session.vt().snapshot();
         terminal_links::link_at_snapshot(&snapshot, col, row)
     }
@@ -835,7 +1104,12 @@ impl GhosttyView {
 
     fn clear_hovered_link(&mut self) -> bool {
         let changed = self.hovered_link.take().is_some();
-        self.last_mouse_position = None;
+        if !self.terminal_left_mouse_sequence.is_active()
+            && !self.terminal_middle_mouse_sequence.is_active()
+            && !self.terminal_right_mouse_sequence.is_active()
+        {
+            self.last_mouse_position = None;
+        }
         changed
     }
 
@@ -864,48 +1138,232 @@ impl GhosttyView {
         )
     }
 
-    fn forward_mouse_down(&self, pos: Point<Pixels>, mods: MouseEventMods) -> bool {
-        if let Some((col, row)) = self.cell_from_event_position(pos) {
+    fn forward_mouse_down(
+        &self,
+        button: VtMouseButton,
+        pos: Point<Pixels>,
+        mods: MouseEventMods,
+        click_count: usize,
+    ) -> MouseDownRoute {
+        if let Some((point, geometry)) = self.selection_input_from_event_position(pos, false) {
             if let Some(terminal) = &self.terminal {
                 let inner = terminal.inner();
                 if let Some(session) = inner.lock().as_ref() {
-                    session.mouse_down(col, row, mods);
-                    return true;
+                    return session.mouse_down(
+                        button,
+                        point,
+                        geometry,
+                        mods,
+                        u8::try_from(click_count).unwrap_or(u8::MAX),
+                    );
                 }
             }
         }
-        false
+        MouseDownRoute::Ignored
     }
 
-    fn forward_mouse_drag(&self, pos: Point<Pixels>, mods: MouseEventMods, clamp: bool) {
-        let cell = if clamp {
-            self.clamped_cell_from_event_position(pos)
-        } else {
-            self.cell_from_event_position(pos)
-        };
-        if let Some((col, row)) = cell {
+    fn forward_mouse_drag(
+        &self,
+        button: VtMouseButton,
+        pos: Point<Pixels>,
+        mods: MouseEventMods,
+        clamp: bool,
+        local_selection: bool,
+    ) -> SelectionAutoscroll {
+        if let Some((point, geometry)) = self.selection_input_from_event_position(pos, clamp) {
             if let Some(terminal) = &self.terminal {
                 let inner = terminal.inner();
                 if let Some(session) = inner.lock().as_ref() {
-                    session.mouse_drag(col, row, mods);
+                    return session.mouse_drag(button, point, geometry, mods, local_selection);
                 }
+            }
+        }
+        SelectionAutoscroll::None
+    }
+
+    fn forward_mouse_up(
+        &self,
+        button: VtMouseButton,
+        pos: Point<Pixels>,
+        mods: MouseEventMods,
+        clamp: bool,
+        local_selection: bool,
+    ) {
+        let point = self
+            .selection_input_from_event_position(pos, clamp)
+            .map(|(point, _)| point);
+        if let Some(terminal) = &self.terminal {
+            let inner = terminal.inner();
+            if let Some(session) = inner.lock().as_ref() {
+                session.mouse_up(button, point, mods, local_selection);
             }
         }
     }
 
-    fn forward_mouse_up(&self, pos: Point<Pixels>, mods: MouseEventMods, clamp: bool) {
-        let cell = if clamp {
-            self.clamped_cell_from_event_position(pos)
-        } else {
-            self.cell_from_event_position(pos)
+    fn forward_mouse_hover(&self, pos: Point<Pixels>, mods: MouseEventMods) -> bool {
+        let Some(terminal) = &self.terminal else {
+            return false;
         };
-        if let Some((col, row)) = cell {
-            if let Some(terminal) = &self.terminal {
-                let inner = terminal.inner();
-                if let Some(session) = inner.lock().as_ref() {
-                    session.mouse_up(col, row, mods);
+        let inner = terminal.inner();
+        let guard = inner.lock();
+        let Some(session) = guard.as_ref() else {
+            return false;
+        };
+        // Avoid renderer metrics and coordinate conversion on the common shell
+        // path where no application has enabled terminal mouse tracking.
+        if !session.mouse_tracking_active() {
+            return false;
+        }
+        let Some((point, _)) = self.selection_input_for_session(session, pos, false) else {
+            return false;
+        };
+        session.mouse_hover(point, mods)
+    }
+
+    fn finish_terminal_mouse_sequence(
+        &mut self,
+        button: VtMouseButton,
+        pos: Point<Pixels>,
+        mut mods: MouseEventMods,
+    ) -> bool {
+        if button == VtMouseButton::Left {
+            self.stop_selection_autoscroll();
+        }
+        let route = match button {
+            VtMouseButton::Left => self.terminal_left_mouse_sequence.finish(),
+            VtMouseButton::Middle => self.terminal_middle_mouse_sequence.finish(),
+            VtMouseButton::Right => self.terminal_right_mouse_sequence.finish(),
+            _ => None,
+        };
+        let Some(route) = route else {
+            return false;
+        };
+
+        mods.shift = route.shift;
+        self.forward_mouse_up(button, pos, mods, true, route.local_selection);
+        true
+    }
+
+    fn update_selection_autoscroll(
+        &mut self,
+        autoscroll: SelectionAutoscroll,
+        cx: &mut Context<Self>,
+    ) {
+        if autoscroll == SelectionAutoscroll::None {
+            self.stop_selection_autoscroll();
+            return;
+        }
+        if self.selection_autoscroll_active {
+            return;
+        }
+
+        self.selection_autoscroll_epoch = self.selection_autoscroll_epoch.wrapping_add(1);
+        let epoch = self.selection_autoscroll_epoch;
+        self.selection_autoscroll_active = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(SELECTION_AUTOSCROLL_INTERVAL)
+                    .await;
+                let keep_scrolling = this
+                    .update(cx, |this, cx| {
+                        if !this.selection_autoscroll_active
+                            || this.selection_autoscroll_epoch != epoch
+                            || !this
+                                .terminal_left_mouse_sequence
+                                .payload()
+                                .is_some_and(|route| route.local_selection)
+                        {
+                            return false;
+                        }
+                        let update = this.selection_autoscroll_tick();
+                        if update.direction == SelectionAutoscroll::None {
+                            this.stop_selection_autoscroll();
+                            return false;
+                        }
+                        if update.changed {
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_scrolling {
+                    break;
                 }
             }
+        })
+        .detach();
+    }
+
+    fn selection_autoscroll_tick(&self) -> SelectionAutoscrollUpdate {
+        let Some(position) = self.last_mouse_position else {
+            return SelectionAutoscrollUpdate::default();
+        };
+        let Some((point, geometry)) = self.selection_input_from_event_position(position, true)
+        else {
+            return SelectionAutoscrollUpdate::default();
+        };
+        let Some(terminal) = &self.terminal else {
+            return SelectionAutoscrollUpdate::default();
+        };
+        let inner = terminal.inner();
+        let guard = inner.lock();
+        guard
+            .as_ref()
+            .map_or(SelectionAutoscrollUpdate::default(), |session| {
+                session.selection_autoscroll_tick(point, geometry)
+            })
+    }
+
+    fn stop_selection_autoscroll(&mut self) {
+        if !self.selection_autoscroll_active {
+            return;
+        }
+        self.selection_autoscroll_active = false;
+        self.selection_autoscroll_epoch = self.selection_autoscroll_epoch.wrapping_add(1);
+    }
+
+    fn cancel_left_pointer_interactions(&mut self, position: Point<Pixels>) {
+        self.stop_selection_autoscroll();
+        self.scrollbar_drag = None;
+        self.mouse_down_link = None;
+        self.suppress_link_mouse_up = false;
+        self.finish_terminal_mouse_sequence(
+            VtMouseButton::Left,
+            position,
+            MouseEventMods::default(),
+        );
+    }
+
+    fn cancel_pointer_interactions(&mut self) {
+        self.stop_selection_autoscroll();
+        if let Some(position) = self.last_mouse_position {
+            self.cancel_left_pointer_interactions(position);
+            self.finish_terminal_mouse_sequence(
+                VtMouseButton::Middle,
+                position,
+                MouseEventMods::default(),
+            );
+            self.finish_terminal_mouse_sequence(
+                VtMouseButton::Right,
+                position,
+                MouseEventMods::default(),
+            );
+        } else {
+            self.scrollbar_drag = None;
+            self.mouse_down_link = None;
+            self.suppress_link_mouse_up = false;
+            if self
+                .terminal_left_mouse_sequence
+                .finish()
+                .is_some_and(|route| route.local_selection)
+                && let Some(terminal) = &self.terminal
+                && let Some(session) = terminal.inner().lock().as_ref()
+            {
+                session.cancel_drag();
+            }
+            self.terminal_middle_mouse_sequence.finish();
+            self.terminal_right_mouse_sequence.finish();
         }
     }
 
@@ -930,7 +1388,7 @@ impl GhosttyView {
         }
 
         // Only report wheel to the shell when it has explicitly enabled
-        // mouse tracking (SGR). Otherwise scroll Con's own viewport via
+        // mouse tracking. Otherwise scroll Con's own viewport via
         // libghostty-vt. Shift bypasses reporting per xterm convention
         // so the user can scroll Con's scrollback even when a TUI has
         // `set mouse=a`.
@@ -939,11 +1397,10 @@ impl GhosttyView {
             return true;
         }
 
-        let Some((col0, row0)) = self.cell_from_event_position(pos) else {
+        let Some((point, _)) = self.selection_input_from_event_position(pos, false) else {
             return false;
         };
-        // `forward_wheel` expects 1-based SGR coordinates.
-        session.forward_wheel(col0 + 1, row0 + 1, delta_y_px, mods);
+        session.forward_wheel(point, delta_y_px, mods);
         false
     }
 
@@ -957,18 +1414,12 @@ impl GhosttyView {
 
     fn scrollbar_layout(&self, scrollbar: GhosttyScrollbar) -> Option<(f32, f32, f32)> {
         let bounds = self.pane_bounds?;
-        let height = f32::from(bounds.size.height);
-        let track_height = (height - (SCROLLBAR_INSET_PX * 2.0)).max(0.0);
-        if track_height <= 0.0 || scrollbar.total <= scrollbar.len || scrollbar.len == 0 {
-            return None;
-        }
-        let thumb_height = ((scrollbar.len as f32 / scrollbar.total as f32) * track_height)
-            .clamp(SCROLLBAR_MIN_THUMB_PX.min(track_height), track_height);
-        let travel = (track_height - thumb_height).max(0.0);
-        let max_offset = scrollbar.total.saturating_sub(scrollbar.len).max(1);
-        let offset = scrollbar.offset.min(max_offset);
-        let thumb_top = SCROLLBAR_INSET_PX + (offset as f32 / max_offset as f32) * travel;
-        Some((track_height, thumb_height, thumb_top))
+        let layout = thumb_layout(f32::from(bounds.size.height), scrollbar)?;
+        Some((
+            layout.track_height_px,
+            layout.thumb_height_px,
+            layout.thumb_top_px,
+        ))
     }
 
     fn start_scrollbar_drag(&mut self, pos: Point<Pixels>) {
@@ -1111,23 +1562,100 @@ impl GhosttyView {
         )
     }
 
-    /// Translate a GPUI `KeyDownEvent` into bytes and forward to the
-    /// ConPTY. Returns `true` if the key was handled (so GPUI can stop
-    /// propagation).
-    ///
-    /// GPUI owns keyboard focus on Windows — there's no child HWND in
-    /// the focus chain — so we translate at this layer into byte
-    /// sequences a terminal emulator expects. DECCKM-aware arrows live
-    /// alongside the printable / Ctrl-letter paths.
+    fn send_vt_key(
+        &mut self,
+        tracking_key: &str,
+        event: &VtKeyEvent<'_>,
+    ) -> Result<con_ghostty::vt::VtKeyOutcome, String> {
+        let Some(terminal) = self.terminal.as_ref().cloned() else {
+            return Ok(con_ghostty::vt::VtKeyOutcome::default());
+        };
+        let outcome = terminal.send_key(event)?;
+        if outcome.output_accepted {
+            self.cursor_blink.reset();
+            self.clear_restored_screen_text();
+            if outcome.report_releases
+                && event.action != VtKeyAction::Release
+                && !self.keys_awaiting_release.contains_key(tracking_key)
+            {
+                self.keys_awaiting_release.insert(
+                    tracking_key.to_owned(),
+                    crate::terminal_keys::TrackedVtKey::from_non_release_event(event),
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn handle_key_up(&mut self, event: &KeyUpEvent) -> bool {
+        let Some(tracked) = self.keys_awaiting_release.remove(&event.keystroke.key) else {
+            return false;
+        };
+        let release =
+            tracked.release_with_modifiers(&event.keystroke.key, &event.keystroke.modifiers);
+        match self.send_vt_key(&event.keystroke.key, &release) {
+            Ok(outcome) => outcome.output_accepted,
+            Err(err) => {
+                // Preserve the press so focus loss can retry the release if
+                // this was a transient PTY write failure.
+                self.keys_awaiting_release
+                    .insert(event.keystroke.key.clone(), tracked);
+                log::debug!("windows terminal key release failed: {err}");
+                false
+            }
+        }
+    }
+
+    fn release_tracked_keys(&mut self) {
+        let tracked_keys = std::mem::take(&mut self.keys_awaiting_release);
+        let Some(terminal) = self.terminal.as_ref().cloned() else {
+            return;
+        };
+        for (key, tracked) in tracked_keys {
+            let release = tracked.release(&key);
+            if let Err(err) = terminal.send_key(&release) {
+                self.keys_awaiting_release.insert(key, tracked);
+                log::debug!("windows terminal key release failed: {err}");
+            }
+        }
+    }
+
+    fn send_tab_key(&mut self, shift: bool) -> bool {
+        let event = VtKeyEvent {
+            key: "tab",
+            text: "",
+            unshifted_codepoint: None,
+            action: if self.keys_awaiting_release.contains_key("tab") {
+                VtKeyAction::Repeat
+            } else {
+                VtKeyAction::Press
+            },
+            modifiers: VtKeyModifiers {
+                shift,
+                ..VtKeyModifiers::default()
+            },
+            consumed_modifiers: VtKeyModifiers::default(),
+        };
+        match self.send_vt_key("tab", &event) {
+            Ok(outcome) => outcome.output_accepted,
+            Err(err) => {
+                log::debug!("windows terminal key encoding failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// Translate a GPUI key event with libghostty-vt and forward the
+    /// encoded bytes to ConPTY. App shortcuts remain ahead of this path.
     fn handle_key_down(
-        &self,
+        &mut self,
         event: &KeyDownEvent,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(terminal) = self.terminal.as_ref() else {
+        if self.terminal.is_none() {
             return false;
-        };
+        }
         let keystroke = &event.keystroke;
 
         if crate::terminal_shortcuts::key_down_starts_action_binding(
@@ -1142,6 +1670,10 @@ impl GhosttyView {
             event,
             window,
             &crate::SearchFiles,
+        ) || crate::terminal_shortcuts::key_down_starts_action_binding(
+            event,
+            window,
+            &crate::FindInTerminal,
         ) {
             return false;
         }
@@ -1167,7 +1699,10 @@ impl GhosttyView {
             && !keystroke.modifiers.alt
             && !keystroke.modifiers.platform
             && keystroke.key == "c"
-            && copy_selection_to_clipboard(terminal, cx)
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| copy_selection_to_clipboard(terminal, cx))
         {
             cx.notify();
             return true;
@@ -1183,36 +1718,30 @@ impl GhosttyView {
         {
             match keystroke.key.as_str() {
                 "c" => {
-                    if copy_selection_to_clipboard(terminal, cx) {
+                    if self
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|terminal| copy_selection_to_clipboard(terminal, cx))
+                    {
                         cx.notify();
                     }
                     return true;
                 }
                 "v" => {
-                    paste_from_clipboard(terminal, cx);
+                    if self.paste_from_clipboard(cx) {
+                        cx.notify();
+                    }
                     return true;
                 }
                 _ => {}
             }
         }
 
-        let decckm = {
-            let inner = terminal.inner();
-            inner.lock().as_ref().is_some_and(|s| s.is_decckm())
-        };
-
-        // Named / special keys — arrows, home/end, page nav, insert,
-        // delete, F1-F12, tab/shift-tab, enter, backspace, escape. Each
-        // honours DECCKM (arrows) and xterm modifier-parameter encoding
-        // for Ctrl/Shift/Alt (CSI 1;m<X> for arrows + F1-F4, CSI n;m~
-        // for tilde-terminated keys).
-        if let Some(bytes) = encode_special_key(&keystroke.key, &keystroke.modifiers, decckm) {
-            terminal.send_text(&bytes);
-            return true;
-        }
-
-        if event.prefer_character_input
-            && !keystroke.modifiers.control
+        // A dead-key/IME composition may complete as an ordinary keydown
+        // while GPUI still owns marked text. Let its InputHandler commit the
+        // text and clear that state instead of bypassing it through the VT
+        // encoder and leaving a stale preedit overlay behind.
+        if self.ime_marked_text.is_some()
             && keystroke
                 .key_char
                 .as_deref()
@@ -1221,74 +1750,174 @@ impl GhosttyView {
             return false;
         }
 
-        // Ctrl + defined ASCII keys → C0 control bytes. This includes
-        // punctuation controls terminals rely on, such as Ctrl+] for tmux's
-        // `C-]` prefix (GS / 0x1d), not just Ctrl+A-Z.
-        if keystroke.modifiers.control
-            && !keystroke.modifiers.alt
-            && !keystroke.modifiers.platform
-            && (keystroke.key.len() == 1
-                || keystroke
-                    .key_char
-                    .as_deref()
-                    .is_some_and(|text| text.len() == 1))
-        {
-            if let Some(code) = crate::terminal_keys::ctrl_keystroke_to_c0(
-                &keystroke.key,
-                keystroke.key_char.as_deref(),
-                keystroke.modifiers.shift,
-            ) {
-                let byte = [code];
-                let text = std::str::from_utf8(&byte)
-                    .expect("terminal C0 control bytes are always valid UTF-8");
-                terminal.send_text(text);
-                return true;
+        let Some(vt_event) = crate::terminal_keys::vt_key_down_event(event) else {
+            return false;
+        };
+        match self.send_vt_key(&keystroke.key, &vt_event) {
+            Ok(outcome) => outcome.output_accepted,
+            Err(err) => {
+                log::debug!("windows terminal key encoding failed: {err}");
+                false
             }
         }
+    }
 
-        // Alt + printable ASCII → ESC + char (meta-prefix convention
-        // readline / vim / tmux / fzf all recognise: Alt+B word-back,
-        // Alt+F word-forward, Alt+D word-delete, Alt+. last-arg, …).
-        // Only when Alt is the only app-consumable modifier — AltGr-
-        // produced characters already arrive decoded via `key_char`
-        // without the `alt` flag on most layouts, and Ctrl+Alt is left
-        // for the terminal's own modifyOtherKeys semantics if added
-        // later.
-        if keystroke.modifiers.alt && !keystroke.modifiers.control && !keystroke.modifiers.platform
-        {
-            if let Some(ch) = keystroke.key_char.as_deref().filter(|s| !s.is_empty()) {
-                let mut out = String::with_capacity(1 + ch.len());
-                out.push('\x1b');
-                out.push_str(ch);
-                terminal.send_text(&out);
-                return true;
-            }
-        }
+    fn handle_terminal_paste_payload(
+        &mut self,
+        payload: TerminalPastePayload,
+        source: VtPasteSource,
+    ) -> bool {
+        // A new paste intent invalidates any confirmation for older text,
+        // even when this attempt later turns out to be empty or fails.
+        let replaced_confirmation = self.pending_unsafe_paste.take().is_some();
+        let Some(terminal) = self.terminal.as_ref().cloned() else {
+            return replaced_confirmation;
+        };
 
-        if let Some(ch) = keystroke.key_char.as_deref() {
-            if !ch.is_empty() {
-                if !keystroke.modifiers.control
-                    && !keystroke.modifiers.alt
-                    && !keystroke.modifiers.platform
-                {
-                    return false;
+        match payload {
+            TerminalPastePayload::Text(text) if !text.is_empty() => {
+                match terminal.paste_text(&text, source, false) {
+                    Ok(VtPasteResult::Accepted) => {
+                        self.clear_restored_screen_text();
+                        true
+                    }
+                    Ok(VtPasteResult::RequiresConfirmation) => {
+                        self.pending_unsafe_paste = Some((text, source));
+                        true
+                    }
+                    Ok(VtPasteResult::Empty) => replaced_confirmation,
+                    Err(err) => {
+                        log::debug!("windows terminal paste failed: {err}");
+                        replaced_confirmation
+                    }
                 }
-                terminal.send_text(ch);
-                return true;
             }
-        }
-        if keystroke.key.len() == 1 {
-            if !keystroke.modifiers.control
-                && !keystroke.modifiers.alt
-                && !keystroke.modifiers.platform
-            {
-                return false;
+            TerminalPastePayload::ForwardCtrlV => {
+                self.clear_restored_screen_text();
+                terminal.send_text("\x16");
+                true
             }
-            terminal.send_text(&keystroke.key);
-            return true;
+            TerminalPastePayload::Text(_) => replaced_confirmation,
         }
+    }
 
-        false
+    fn paste_from_clipboard(&mut self, cx: &mut App) -> bool {
+        let replaced_confirmation = self.pending_unsafe_paste.take().is_some();
+        let Some(payload) = cx
+            .read_from_clipboard()
+            .and_then(|item| payload_from_clipboard(&item))
+        else {
+            return replaced_confirmation;
+        };
+        self.handle_terminal_paste_payload(payload, VtPasteSource::Clipboard)
+            || replaced_confirmation
+    }
+
+    fn confirm_unsafe_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((text, source)) = self.pending_unsafe_paste.take() else {
+            return;
+        };
+        let Some(terminal) = self.terminal.as_ref().cloned() else {
+            self.pending_unsafe_paste = Some((text, source));
+            return;
+        };
+
+        match terminal.paste_text(&text, source, true) {
+            Ok(VtPasteResult::Accepted) => self.clear_restored_screen_text(),
+            Ok(VtPasteResult::Empty) => {}
+            Ok(VtPasteResult::RequiresConfirmation) => {
+                self.pending_unsafe_paste = Some((text, source));
+            }
+            Err(err) => {
+                log::debug!("windows confirmed terminal paste failed: {err}");
+                self.pending_unsafe_paste = Some((text, source));
+            }
+        }
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn cancel_unsafe_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_unsafe_paste = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn render_unsafe_paste_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let text = self.pending_unsafe_paste.as_ref()?.0.as_str();
+        let preview = unsafe_paste_preview(text);
+        let theme = cx.theme();
+
+        Some(
+            div()
+                .absolute()
+                .left(px(12.0))
+                .right(px(12.0))
+                .bottom(px(12.0))
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .occlude()
+                        .w_full()
+                        .max_w(px(620.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .p(px(10.0))
+                        .rounded(px(8.0))
+                        .bg(theme
+                            .warning
+                            .opacity(if theme.is_dark() { 0.18 } else { 0.12 }))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.foreground)
+                                .child("This paste can run commands. Review it before continuing."),
+                        )
+                        .child(
+                            div()
+                                .max_h(px(88.0))
+                                .overflow_hidden()
+                                .px(px(8.0))
+                                .py(px(6.0))
+                                .rounded(px(6.0))
+                                .bg(theme.foreground.opacity(0.06))
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(px(11.0))
+                                .line_height(px(15.0))
+                                .text_color(theme.foreground.opacity(0.82))
+                                .child(preview),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    Button::new("windows-cancel-unsafe-paste")
+                                        .label("Cancel")
+                                        .small()
+                                        .ghost()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.cancel_unsafe_paste(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("windows-confirm-unsafe-paste")
+                                        .label("Paste")
+                                        .small()
+                                        .primary()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm_unsafe_paste(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn ime_cursor_bounds(&self) -> Option<Bounds<Pixels>> {
@@ -1359,121 +1988,6 @@ fn bgra_frame_to_image(bytes: Vec<u8>, width: u32, height: u32) -> Option<Arc<Re
     Some(Arc::new(RenderImage::new(data)))
 }
 
-/// xterm modifier parameter (`m`) — `1 + (shift | alt<<1 | ctrl<<2)`,
-/// where `1` itself means "no modifier" (so the encoder omits it).
-///
-/// Used in CSI `1;m{A|B|C|D|H|F|P|Q|R|S}` and CSI `{n};m~` sequences.
-/// Source: xterm's "PC-Style Function Keys" encoding.
-fn xterm_modifier_param(modifiers: &Modifiers) -> Option<u8> {
-    let mask = u8::from(modifiers.shift)
-        | (u8::from(modifiers.alt) << 1)
-        | (u8::from(modifiers.control) << 2);
-    if mask == 0 { None } else { Some(1 + mask) }
-}
-
-/// Translate a GPUI key name + modifiers into the byte sequence the
-/// shell / TUI expects. Returns `None` for keys that should flow
-/// through the printable-character path (letters, digits, symbols).
-///
-/// Covers arrows (DECCKM-aware and modifier-aware), home/end, pageup/
-/// pagedown, insert/delete, F1-F12, enter, backspace, tab/shift-tab,
-/// escape. xterm modifier encoding is applied uniformly: any combination
-/// of Shift/Alt/Ctrl shifts the sequence into its CSI `1;m<final>`
-/// (arrows, home/end, F1-F4) or CSI `n;m~` (tilde-terminated) form.
-fn encode_special_key(key: &str, modifiers: &Modifiers, decckm: bool) -> Option<String> {
-    let m = xterm_modifier_param(modifiers);
-
-    let tilde = |code: u8| match m {
-        Some(m) => format!("\x1b[{};{}~", code, m),
-        None => format!("\x1b[{}~", code),
-    };
-
-    // CSI-1-final covers arrows + home/end + F1-F4. For the no-modifier
-    // case: arrows honour DECCKM, F1-F4 use SS3 (ESC O x), home/end use
-    // plain CSI.
-    let csi1 = |final_byte: char, ss3_when_plain: bool, decckm_arrow: bool| match m {
-        Some(m) => format!("\x1b[1;{}{}", m, final_byte),
-        None if decckm_arrow && decckm => format!("\x1bO{}", final_byte),
-        None if ss3_when_plain => format!("\x1bO{}", final_byte),
-        None => format!("\x1b[{}", final_byte),
-    };
-
-    Some(match key {
-        "up" => csi1('A', false, true),
-        "down" => csi1('B', false, true),
-        "right" => csi1('C', false, true),
-        "left" => csi1('D', false, true),
-        "home" => csi1('H', false, false),
-        "end" => csi1('F', false, false),
-        "pageup" => tilde(5),
-        "pagedown" => tilde(6),
-        "insert" => tilde(2),
-        "delete" => tilde(3),
-        "f1" => csi1('P', true, false),
-        "f2" => csi1('Q', true, false),
-        "f3" => csi1('R', true, false),
-        "f4" => csi1('S', true, false),
-        "f5" => tilde(15),
-        "f6" => tilde(17),
-        "f7" => tilde(18),
-        "f8" => tilde(19),
-        "f9" => tilde(20),
-        "f10" => tilde(21),
-        "f11" => tilde(23),
-        "f12" => tilde(24),
-        "enter" | "return" => "\r".into(),
-        "escape" => "\x1b".into(),
-        // Alt+Backspace is readline's word-delete (ESC + DEL).
-        "backspace" if modifiers.alt && !modifiers.control && !modifiers.platform => {
-            "\x1b\x7f".into()
-        }
-        "backspace" => "\x7f".into(),
-        // Shift+Tab is the xterm "back-tab" CSI Z — bash/zsh completion
-        // menus and fzf use it to cycle backwards.
-        "tab" if modifiers.shift && !modifiers.control && !modifiers.platform => "\x1b[Z".into(),
-        "tab" => "\t".into(),
-        _ => return None,
-    })
-}
-
-fn send_paste(terminal: &GhosttyTerminal, text: &str) {
-    // Bracketed paste lets the shell tell pasted text apart from real
-    // typing, so vim / readline can disable auto-indent. Hold the lock
-    // across both wrapper writes so the session can't be swapped out
-    // mid-paste (which would strip the trailing `ESC[201~`).
-    let inner = terminal.inner();
-    let guard = inner.lock();
-    if let Some(session) = guard.as_ref() {
-        if session.is_bracketed_paste() {
-            session.write_pty_raw(b"\x1b[200~");
-            session.write_input(text);
-            session.write_pty_raw(b"\x1b[201~");
-        } else {
-            session.write_input(text);
-        }
-    }
-}
-
-fn send_terminal_paste_payload(terminal: &GhosttyTerminal, payload: TerminalPastePayload) {
-    match payload {
-        TerminalPastePayload::Text(text) if !text.is_empty() => send_paste(terminal, &text),
-        TerminalPastePayload::ForwardCtrlV => terminal.send_text("\x16"),
-        TerminalPastePayload::Text(_) => {}
-    }
-}
-
-fn paste_from_clipboard(terminal: &GhosttyTerminal, cx: &mut App) -> bool {
-    let Some(payload) = cx
-        .read_from_clipboard()
-        .and_then(|item| payload_from_clipboard(&item))
-    else {
-        return false;
-    };
-
-    send_terminal_paste_payload(terminal, payload);
-    true
-}
-
 impl Focusable for GhosttyView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -1503,6 +2017,7 @@ impl TerminalImeView for GhosttyView {
 
     fn send_ime_text(&mut self, text: &str, _cx: &mut Context<Self>) {
         if !text.is_empty() {
+            self.cursor_blink.reset();
             self.clear_restored_screen_text();
         }
         if let Some(terminal) = &self.terminal {
@@ -1517,6 +2032,19 @@ impl TerminalImeView for GhosttyView {
 
 impl Render for GhosttyView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.cursor_subscriptions.is_empty() {
+            self.cursor_subscriptions = vec![
+                cx.on_focus(&self.focus_handle, window, |this, _, cx| {
+                    this.cursor_blink.reset();
+                    cx.notify();
+                }),
+                cx.on_blur(&self.focus_handle, window, |_, _, cx| cx.notify()),
+                cx.observe_window_activation(window, |this, _, cx| {
+                    this.cursor_blink.reset();
+                    cx.notify();
+                }),
+            ];
+        }
         match self.sync_render(window) {
             SyncRenderResult::Pending => cx.notify(),
             SyncRenderResult::Rendered {
@@ -1526,6 +2054,25 @@ impl Render for GhosttyView {
                 needs_followup_prepaint: false,
             }
             | SyncRenderResult::Unchanged => {}
+        }
+
+        self.arm_render_hold(cx);
+
+        if self
+            .cursor_blink_task
+            .as_ref()
+            .map(|(deadline, _)| *deadline)
+            != self.cursor_blink.deadline()
+        {
+            self.cursor_blink_task = self.cursor_blink.deadline().map(|deadline| {
+                let task = cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(deadline.saturating_duration_since(Instant::now()))
+                        .await;
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                });
+                (deadline, task)
+            });
         }
 
         let terminal_background = self.placeholder_background();
@@ -1539,17 +2086,28 @@ impl Render for GhosttyView {
             terminal_background.unwrap_or_else(|| cx.theme().background.opacity(0.0));
         let entity = cx.entity().downgrade();
         let input_entity = entity.clone();
+        let menu_entity = entity.clone();
         let mut terminal_children = self.image_children(terminal_background);
         if let Some(overlay) = self.render_link_cursor_overlay() {
             terminal_children.push(overlay);
         }
+        if let Some(preview) = self
+            .hovered_link
+            .as_ref()
+            .zip(self.pane_bounds)
+            .and_then(|(link, bounds)| link.preview(cx.theme(), bounds.size.width))
+        {
+            terminal_children.push(preview.into_any_element());
+        }
         if let Some(scrollbar) = self.render_terminal_scrollbar(cx) {
             terminal_children.push(scrollbar);
         }
+        let unsafe_paste_confirmation = self.render_unsafe_paste_confirmation(cx);
 
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
         let context_focus = focus.clone();
+        let middle_focus = focus.clone();
         let menu_focus = focus.clone();
         let ui_font = cx.theme().font_family.clone();
 
@@ -1568,19 +2126,13 @@ impl Render for GhosttyView {
                 if !this.focus_handle.is_focused(window) {
                     return;
                 }
-                this.clear_restored_screen_text();
-                if let Some(terminal) = &this.terminal {
-                    terminal.send_text("\t");
-                }
+                this.send_tab_key(false);
             }))
             .on_action(cx.listener(|this, _: &ConsumeTabPrev, window, _cx| {
                 if !this.focus_handle.is_focused(window) {
                     return;
                 }
-                this.clear_restored_screen_text();
-                if let Some(terminal) = &this.terminal {
-                    terminal.send_text("\x1b[Z");
-                }
+                this.send_tab_key(true);
             }))
             .on_action(cx.listener(|this, _: &crate::Copy, _window, cx| {
                 if let Some(terminal) = &this.terminal {
@@ -1590,10 +2142,7 @@ impl Render for GhosttyView {
                 }
             }))
             .on_action(cx.listener(|this, _: &crate::Paste, _window, cx| {
-                this.clear_restored_screen_text();
-                if let Some(terminal) = &this.terminal
-                    && paste_from_clipboard(terminal, cx)
-                {
+                if this.paste_from_clipboard(cx) {
                     cx.notify();
                 }
             }))
@@ -1604,9 +2153,7 @@ impl Render for GhosttyView {
                 };
                 window.focus(&this.focus_handle, cx);
                 cx.emit(GhosttyFocusChanged);
-                this.clear_restored_screen_text();
-                if let Some(terminal) = &this.terminal {
-                    send_terminal_paste_payload(terminal, payload);
+                if this.handle_terminal_paste_payload(payload, VtPasteSource::Text) {
                     cx.notify();
                 }
             }))
@@ -1614,13 +2161,16 @@ impl Render for GhosttyView {
                 if !this.focus_handle.is_focused(window) {
                     return;
                 }
-                let special_key_writes =
-                    encode_special_key(&event.keystroke.key, &event.keystroke.modifiers, false)
-                        .is_some();
-                if key_down_may_write_terminal(event, special_key_writes) {
-                    this.clear_restored_screen_text();
-                }
                 if this.handle_key_down(event, window, cx) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, window, cx| {
+                if !this.focus_handle.is_focused(window) {
+                    return;
+                }
+                if this.handle_key_up(event) {
                     window.prevent_default();
                     cx.stop_propagation();
                 }
@@ -1642,10 +2192,53 @@ impl Render for GhosttyView {
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     window.focus(&context_focus, cx);
                     this.last_mouse_position = Some(event.position);
-                    this.terminal_mouse_sequence_active = false;
-                    this.mouse_down_link = None;
-                    this.suppress_link_mouse_up = false;
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Right,
+                        event.position,
+                        MouseEventMods::default(),
+                    );
                     let _ = this.update_hovered_link(&event.modifiers);
+                    let consumed = this.forward_mouse_down(
+                        VtMouseButton::Right,
+                        event.position,
+                        mouse_mods_from(&event.modifiers),
+                        event.click_count,
+                    ) == MouseDownRoute::TerminalCapture;
+                    this.terminal_mouse_right_consumed = Some(consumed);
+                    if consumed {
+                        this.terminal_right_mouse_sequence.begin(MousePressRoute {
+                            shift: event.modifiers.shift,
+                            local_selection: false,
+                        });
+                    }
+                    cx.emit(GhosttyFocusChanged);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&middle_focus, cx);
+                    this.last_mouse_position = Some(event.position);
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Middle,
+                        event.position,
+                        MouseEventMods::default(),
+                    );
+                    let _ = this.update_hovered_link(&event.modifiers);
+                    let mods = mouse_mods_from(&event.modifiers);
+                    if this.forward_mouse_down(
+                        VtMouseButton::Middle,
+                        event.position,
+                        mods,
+                        event.click_count,
+                    ) == MouseDownRoute::TerminalCapture
+                    {
+                        this.terminal_middle_mouse_sequence.begin(MousePressRoute {
+                            shift: mods.shift,
+                            local_selection: false,
+                        });
+                    }
                     cx.emit(GhosttyFocusChanged);
                     cx.notify();
                 }),
@@ -1655,14 +2248,11 @@ impl Render for GhosttyView {
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     window.focus(&focus, cx);
                     this.last_mouse_position = Some(event.position);
-                    this.terminal_mouse_sequence_active = false;
-                    this.mouse_down_link = None;
-                    this.suppress_link_mouse_up = false;
+                    this.cancel_left_pointer_interactions(event.position);
+                    let preview = this.hovered_link.take();
                     let _ = this.update_hovered_link(&event.modifiers);
-                    if terminal_links::should_open_link(&event.modifiers)
-                        && let Some(link) = this.link_at_position(event.position)
-                    {
-                        this.mouse_down_link = Some(link);
+                    if let Some(link) = this.hovered_link.clone() {
+                        this.mouse_down_link = link.for_press(preview.as_ref());
                         this.suppress_link_mouse_up = true;
                         window.prevent_default();
                         cx.stop_propagation();
@@ -1670,8 +2260,31 @@ impl Render for GhosttyView {
                         cx.notify();
                         return;
                     }
-                    this.terminal_mouse_sequence_active =
-                        this.forward_mouse_down(event.position, mouse_mods_from(&event.modifiers));
+                    // Left button has two valid continuation modes: local
+                    // selection when mouse tracking is off/Shift-bypassed, or
+                    // terminal reporting when tracking captures the press.
+                    // Zero-byte protocol outcomes remain captured; only an
+                    // actual PTY write failure abandons the sequence.
+                    let mods = mouse_mods_from(&event.modifiers);
+                    let route = match this.forward_mouse_down(
+                        VtMouseButton::Left,
+                        event.position,
+                        mods,
+                        event.click_count,
+                    ) {
+                        MouseDownRoute::TerminalCapture => Some(MousePressRoute {
+                            shift: mods.shift,
+                            local_selection: false,
+                        }),
+                        MouseDownRoute::LocalSelection => Some(MousePressRoute {
+                            shift: mods.shift,
+                            local_selection: true,
+                        }),
+                        MouseDownRoute::Ignored => None,
+                    };
+                    if let Some(route) = route {
+                        this.terminal_left_mouse_sequence.begin(route);
+                    }
                     cx.emit(GhosttyFocusChanged);
                     cx.notify();
                 }),
@@ -1679,53 +2292,122 @@ impl Render for GhosttyView {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 this.last_mouse_position = Some(event.position);
                 if this.scrollbar_drag.is_some() {
-                    if event.pressed_button != Some(MouseButton::Left) {
-                        this.scrollbar_drag = None;
-                        this.update_hovered_link(&event.modifiers);
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.drag_scrollbar(event.position);
                         cx.notify();
                         return;
                     }
-                    this.drag_scrollbar(event.position);
-                    cx.notify();
-                    return;
-                }
-                if this.suppress_link_mouse_up {
-                    let mut changed = this.update_hovered_link(&event.modifiers);
-                    if event.pressed_button != Some(MouseButton::Left) {
-                        changed |= this.mouse_down_link.take().is_some();
-                        this.suppress_link_mouse_up = false;
-                    } else if let Some(down_link) = this.mouse_down_link.as_ref() {
-                        let still_on_same_link =
-                            this.link_at_position(event.position).as_ref() == Some(down_link);
-                        if !still_on_same_link {
-                            this.mouse_down_link = None;
-                            changed = true;
-                        }
-                    }
-                    cx.stop_propagation();
-                    if changed {
+                    if event.pressed_button.is_none() {
+                        this.scrollbar_drag = None;
+                        this.update_hovered_link(&event.modifiers);
                         cx.notify();
                     }
-                    return;
+                }
+                if this.suppress_link_mouse_up {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        let mut changed = this.update_hovered_link(&event.modifiers);
+                        if let Some(down_link) = this.mouse_down_link.as_ref() {
+                            let still_on_same_link = this
+                                .link_at_position(event.position)
+                                .is_some_and(|link| link.same_link(down_link));
+                            if !still_on_same_link {
+                                this.mouse_down_link = None;
+                                changed = true;
+                            }
+                        }
+                        cx.stop_propagation();
+                        if changed {
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    if event.pressed_button.is_none() {
+                        let mut changed = this.update_hovered_link(&event.modifiers);
+                        changed |= this.mouse_down_link.take().is_some();
+                        this.suppress_link_mouse_up = false;
+                        cx.stop_propagation();
+                        if changed {
+                            cx.notify();
+                        }
+                    }
                 }
                 let hover_changed = this.update_hovered_link(&event.modifiers);
                 if event.pressed_button == Some(MouseButton::Left) {
-                    if this.terminal_mouse_sequence_active {
-                        this.forward_mouse_drag(
+                    if let Some(route) = this.terminal_left_mouse_sequence.payload().copied() {
+                        let autoscroll = this.forward_mouse_drag(
+                            VtMouseButton::Left,
                             event.position,
-                            mouse_mods_from(&event.modifiers),
+                            MouseEventMods {
+                                shift: route.shift,
+                                ..mouse_mods_from(&event.modifiers)
+                            },
                             true,
+                            route.local_selection,
                         );
+                        if route.local_selection {
+                            this.update_selection_autoscroll(autoscroll, cx);
+                        }
                         cx.notify();
                     } else if hover_changed {
                         cx.notify();
                     }
-                } else if this.terminal_mouse_sequence_active {
-                    this.forward_mouse_up(event.position, mouse_mods_from(&event.modifiers), true);
-                    this.terminal_mouse_sequence_active = false;
+                } else if event.pressed_button == Some(MouseButton::Middle)
+                    && let Some(route) = this.terminal_middle_mouse_sequence.payload().copied()
+                {
+                    let _ = this.forward_mouse_drag(
+                        VtMouseButton::Middle,
+                        event.position,
+                        MouseEventMods {
+                            shift: route.shift,
+                            ..mouse_mods_from(&event.modifiers)
+                        },
+                        true,
+                        false,
+                    );
                     cx.notify();
-                } else if hover_changed {
+                } else if event.pressed_button == Some(MouseButton::Right)
+                    && let Some(route) = this.terminal_right_mouse_sequence.payload().copied()
+                {
+                    let _ = this.forward_mouse_drag(
+                        VtMouseButton::Right,
+                        event.position,
+                        MouseEventMods {
+                            shift: route.shift,
+                            ..mouse_mods_from(&event.modifiers)
+                        },
+                        true,
+                        false,
+                    );
                     cx.notify();
+                } else if event.pressed_button.is_none()
+                    && (this.terminal_left_mouse_sequence.is_active()
+                        || this.terminal_middle_mouse_sequence.is_active()
+                        || this.terminal_right_mouse_sequence.is_active())
+                {
+                    let release_mods = mouse_mods_from(&event.modifiers);
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Left,
+                        event.position,
+                        release_mods,
+                    );
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Middle,
+                        event.position,
+                        release_mods,
+                    );
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Right,
+                        event.position,
+                        release_mods,
+                    );
+                    cx.notify();
+                } else {
+                    let mouse_reported = event.pressed_button.is_none()
+                        && this
+                            .forward_mouse_hover(event.position, mouse_mods_from(&event.modifiers));
+                    if hover_changed || mouse_reported {
+                        cx.notify();
+                    }
                 }
             }))
             .on_mouse_up(
@@ -1737,14 +2419,15 @@ impl Render for GhosttyView {
                         cx.notify();
                         return;
                     }
-                    let had_terminal_mouse_sequence = this.terminal_mouse_sequence_active;
                     if this.suppress_link_mouse_up {
                         let down_link = this.mouse_down_link.take();
                         this.suppress_link_mouse_up = false;
                         if let Some(down_link) = down_link
-                            && this.link_at_position(event.position).as_ref() == Some(&down_link)
+                            && this
+                                .link_at_position(event.position)
+                                .is_some_and(|link| link.same_link(&down_link))
                         {
-                            cx.open_url(&down_link.url);
+                            down_link.open(window, cx);
                         }
                         window.prevent_default();
                         cx.stop_propagation();
@@ -1752,14 +2435,91 @@ impl Render for GhosttyView {
                         cx.notify();
                         return;
                     }
-                    if had_terminal_mouse_sequence {
-                        this.forward_mouse_up(
-                            event.position,
-                            mouse_mods_from(&event.modifiers),
-                            true,
-                        );
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Left,
+                        event.position,
+                        mouse_mods_from(&event.modifiers),
+                    );
+                    let _ = this.update_hovered_link(&event.modifiers);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    let owns_sequence = this.scrollbar_drag.is_some()
+                        || this.suppress_link_mouse_up
+                        || this.terminal_left_mouse_sequence.is_active();
+                    if !owns_sequence {
+                        return;
                     }
-                    this.terminal_mouse_sequence_active = false;
+                    this.last_mouse_position = Some(event.position);
+                    this.scrollbar_drag = None;
+                    this.mouse_down_link = None;
+                    this.suppress_link_mouse_up = false;
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Left,
+                        event.position,
+                        mouse_mods_from(&event.modifiers),
+                    );
+                    let _ = this.update_hovered_link(&event.modifiers);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.last_mouse_position = Some(event.position);
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Middle,
+                        event.position,
+                        mouse_mods_from(&event.modifiers),
+                    );
+                    let _ = this.update_hovered_link(&event.modifiers);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if !this.terminal_middle_mouse_sequence.is_active() {
+                        return;
+                    }
+                    this.last_mouse_position = Some(event.position);
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Middle,
+                        event.position,
+                        mouse_mods_from(&event.modifiers),
+                    );
+                    let _ = this.update_hovered_link(&event.modifiers);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    this.last_mouse_position = Some(event.position);
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Right,
+                        event.position,
+                        mouse_mods_from(&event.modifiers),
+                    );
+                    let _ = this.update_hovered_link(&event.modifiers);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                    if !this.terminal_right_mouse_sequence.is_active() {
+                        return;
+                    }
+                    this.last_mouse_position = Some(event.position);
+                    this.finish_terminal_mouse_sequence(
+                        VtMouseButton::Right,
+                        event.position,
+                        mouse_mods_from(&event.modifiers),
+                    );
                     let _ = this.update_hovered_link(&event.modifiers);
                     cx.notify();
                 }),
@@ -1772,12 +2532,22 @@ impl Render for GhosttyView {
                     event.delta,
                     mouse_mods_from(&event.modifiers),
                 );
-                if scrolled_viewport && this.terminal_mouse_sequence_active {
-                    this.forward_mouse_drag(
+                if scrolled_viewport
+                    && let Some(route) = this.terminal_left_mouse_sequence.payload().copied()
+                {
+                    let autoscroll = this.forward_mouse_drag(
+                        VtMouseButton::Left,
                         event.position,
-                        mouse_mods_from(&event.modifiers),
+                        MouseEventMods {
+                            shift: route.shift,
+                            ..mouse_mods_from(&event.modifiers)
+                        },
                         true,
+                        route.local_selection,
                     );
+                    if route.local_selection {
+                        this.update_selection_autoscroll(autoscroll, cx);
+                    }
                 }
                 cx.notify();
             }))
@@ -1863,11 +2633,23 @@ impl Render for GhosttyView {
                             .bottom(px(TERMINAL_PADDING_Y_PX))
                             .w(px(TERMINAL_PADDING_X_PX))
                             .bg(padding_background),
-                    ),
+                    )
+                    .children(self.terminal_find.clone())
+                    .children(unsafe_paste_confirmation),
             )
             .context_menu(move |menu, window, cx| {
+                // Empty PopupMenu renders nothing; suppress con's menu only
+                // when the terminal app consumed the right-button press.
+                let right_consumed = menu_entity.upgrade().is_some_and(|view| {
+                    view.read(cx).terminal_mouse_right_consumed.unwrap_or(false)
+                });
+                if right_consumed {
+                    return menu;
+                }
                 crate::terminal_context_menu::terminal_context_menu(
                     menu.action_context(menu_focus.clone()),
+                    // Agent Handoff is macOS-only.
+                    false,
                     window,
                     cx,
                 )
@@ -1877,6 +2659,8 @@ impl Render for GhosttyView {
 
 impl Drop for GhosttyView {
     fn drop(&mut self) {
+        self.release_tracked_keys();
+        self.cancel_pointer_interactions();
         if let Some(terminal) = &self.terminal {
             terminal.request_close();
         }

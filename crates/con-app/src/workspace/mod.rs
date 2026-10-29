@@ -19,8 +19,29 @@ use tokio::sync::oneshot;
 const AGENT_PANEL_DEFAULT_WIDTH: f32 = 400.0;
 const AGENT_PANEL_MIN_WIDTH: f32 = 200.0;
 const TERMINAL_MIN_CONTENT_WIDTH: f32 = 360.0;
+/// macOS caption row: 5pt between the 22pt controls, the window top and the
+/// card below, with the native traffic lights centred in the same row.
+#[cfg(target_os = "macos")]
+pub(crate) const CAPTION_HEIGHT: f32 = 32.0;
+#[cfg(target_os = "macos")]
+const TOP_BAR_COMPACT_HEIGHT: f32 = CAPTION_HEIGHT;
+#[cfg(not(target_os = "macos"))]
 const TOP_BAR_COMPACT_HEIGHT: f32 = 28.0;
+#[cfg(target_os = "macos")]
+const TOP_BAR_TABS_HEIGHT: f32 = TOP_BAR_COMPACT_HEIGHT;
+#[cfg(not(target_os = "macos"))]
 const TOP_BAR_TABS_HEIGHT: f32 = 36.0;
+#[cfg(target_os = "macos")]
+const TOP_BAR_TAB_HEIGHT: f32 = 24.0;
+#[cfg(not(target_os = "macos"))]
+const TOP_BAR_TAB_HEIGHT: f32 = 30.0;
+/// Visible selection clearance inside a horizontal tab target.
+const TOP_BAR_TAB_SELECTION_INSET: f32 = 2.0;
+#[cfg(target_os = "macos")]
+const TAB_DROP_PREVIEW_TOP: f32 = 0.0;
+#[cfg(not(target_os = "macos"))]
+const TAB_DROP_PREVIEW_TOP: f32 = TOP_BAR_COMPACT_HEIGHT;
+const TAB_DROP_PREVIEW_HEIGHT: f32 = TOP_BAR_TABS_HEIGHT - TAB_DROP_PREVIEW_TOP;
 const CHROME_TRANSITION_SEAM_COVER: f32 = 4.0;
 const CHROME_MOTION_SEAM_OVERDRAW: f32 = 6.0;
 #[cfg(target_os = "macos")]
@@ -32,7 +53,7 @@ const MAX_GLOBAL_SHELL_HISTORY: usize = 240;
 const MAX_GLOBAL_INPUT_HISTORY: usize = 240;
 const SPLIT_PREVIEW_SEAM_THICKNESS: f32 = 6.0;
 const TAB_DRAG_PREVIEW_WIDTH: f32 = 180.0;
-const TAB_DRAG_PREVIEW_HEIGHT: f32 = 28.0;
+const TAB_DRAG_PREVIEW_HEIGHT: f32 = TOP_BAR_TAB_HEIGHT - 4.0;
 
 use crate::activity_bar::{ActivityBar, ActivitySlot, ActivitySlotChanged, ActivityTogglePanel};
 use crate::agent_panel::{
@@ -50,7 +71,7 @@ use crate::input_bar::{
     SkillAutocompleteChanged, SubmitInput, TogglePaneScopePicker as TogglePaneScopePickerRequested,
 };
 use crate::model_registry::ModelRegistry;
-use crate::motion::MotionValue;
+use crate::motion::{MotionValue, SidebarMotion};
 use crate::pane_tree::{
     PaneTree, SplitDirection, SplitPlacement, SurfaceCreateOptions, SurfaceRenameEditor,
 };
@@ -63,30 +84,35 @@ use crate::sidebar::{
 };
 use crate::sidebar_search_view::SidebarSearchView;
 use crate::terminal_pane::{TerminalPane, subscribe_terminal_pane};
+use crate::ui_scale::{mono_icon_px, ui_icon_px};
+use con_ghostty::TerminalProgress;
 use con_terminal::TerminalTheme;
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use crate::ghostty_view::GhosttyDesktopNotification;
 use crate::ghostty_view::{
-    GhosttyCwdChanged, GhosttyFocusChanged, GhosttyProcessExited, GhosttySplitRequested,
-    GhosttyTitleChanged, GhosttyView,
+    GhosttyBell, GhosttyCwdChanged, GhosttyFocusChanged, GhosttyProcessExited,
+    GhosttyProgressChanged, GhosttySplitRequested, GhosttyTitleChanged, GhosttyView,
 };
 use crate::{
-    AddWorkspaceLayoutTabs, ClearRestoredTerminalHistory, ClearTerminal, ClosePane, CloseSurface,
-    CloseTab, CollapseSidebar, Copy, Cut, CycleInputMode, EditorDeleteBackward,
+    AddWorkspaceLayoutTabs, AskAi, ClearRestoredTerminalHistory, ClearTerminal, ClosePane,
+    CloseSurface, CloseTab, CollapseSidebar, Copy, Cut, CycleInputMode, EditorDeleteBackward,
     EditorDeleteForward, EditorInsertNewline, EditorMoveDown, EditorMoveEnd, EditorMoveHome,
     EditorMoveLeft, EditorMoveLineEnd, EditorMoveLineStart, EditorMoveRight, EditorMoveUp,
     EditorSave, EditorSelectDown, EditorSelectEnd, EditorSelectHome, EditorSelectLeft,
-    EditorSelectRight, EditorSelectUp, ExportWorkspaceLayout, FocusFiles, FocusInput, Minimize,
-    NewSurface, NewSurfaceSplitDown, NewSurfaceSplitRight, NewTab, NextSurface, NextTab,
-    OpenWorkspaceLayoutWindow, Paste, PreviousSurface, PreviousTab, Quit, RenameSurface,
-    SearchFiles, SelectAll, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
-    SelectTab7, SelectTab8, SelectTab9, SplitDown, SplitLeft, SplitRight, SplitUp,
-    ToggleAgentPanel, ToggleLeftPanel, TogglePaneScopePicker, TogglePaneZoom, Undo,
+    EditorSelectRight, EditorSelectUp, EditorTogglePreview, ExportWorkspaceLayout, FindInTerminal,
+    FocusFiles, FocusInput, Minimize, NewSurface, NewSurfaceSplitDown, NewSurfaceSplitRight,
+    NewTab, NextSurface, NextTab, OpenWorkspaceLayoutWindow, Paste, PreviousSurface, PreviousTab,
+    Quit, RenameSurface, SearchFiles, SelectAll, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
+    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitDown, SplitLeft, SplitRight,
+    SplitUp, ToggleAgentPanel, ToggleLeftPanel, TogglePaneScopePicker, TogglePaneZoom, Undo,
 };
 use con_agent::{
     AgentConfig, Conversation, ProviderKind, TerminalExecRequest, TerminalExecResponse,
 };
 use con_core::config::{
-    AppearanceConfig, Config, TabsOrientation, TerminalConfig, sanitize_terminal_font_family,
+    AppearanceConfig, Config, TabsOrientation, TerminalConfig, sanitize_app_icon,
+    sanitize_terminal_font_fallback, sanitize_terminal_font_family,
 };
 use con_core::control::{
     AgentAskResult, ControlCommand, ControlError, ControlRequestEnvelope, ControlResult,
@@ -105,6 +131,7 @@ use con_core::{
     TabSummaryRequest,
 };
 
+mod agent_handoff;
 mod agent_panel_events;
 mod caption;
 mod chrome;
@@ -113,6 +140,8 @@ mod control_agent_tools;
 mod control_requests;
 mod control_surfaces;
 mod editor_actions;
+#[cfg(target_os = "macos")]
+pub(crate) mod frame;
 mod helpers;
 mod input_events;
 mod lifecycle;
@@ -123,8 +152,10 @@ mod session_worker;
 mod sidebar_settings;
 mod suggestions;
 mod tab_actions;
+mod tab_motion;
 mod tab_presentation;
 mod terminal_factory;
+mod terminal_status;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -142,12 +173,20 @@ pub struct ConWorkspace {
     config: Config,
     sidebar: Entity<SessionSidebar>,
     tabs: Vec<Tab>,
+    terminal_presentation: terminal_status::TerminalPresentation,
+    tab_activity: Entity<crate::tab_activity::TabActivity>,
+    chrome_preparation_dirty: bool,
     active_tab: usize,
+    /// Stable summary id of the last activated editor-only tab.
+    ///
+    /// This must not be an index: tab closes and reorders shift indices.
+    last_editor_tab_id: Option<u64>,
     /// True when this workspace is the singleton quick terminal,
     /// which must never be fully closed — closing the last tab
     /// should reinitialize a fresh tab and hide the window instead.
     is_quick_terminal: bool,
     terminal_font_family: String,
+    terminal_font_fallback: Vec<String>,
     ui_font_family: String,
     ui_font_size: f32,
     font_size: f32,
@@ -155,6 +194,7 @@ pub struct ConWorkspace {
     terminal_opacity: f32,
     terminal_blur: bool,
     ui_opacity: f32,
+    app_icon: String,
     tab_accent_inactive_alpha: f32,
     tab_accent_inactive_hover_alpha: f32,
     background_image: Option<String>,
@@ -166,6 +206,7 @@ pub struct ConWorkspace {
     input_bar: Entity<InputBar>,
     settings_panel: Entity<SettingsPanel>,
     settings_window: Option<AnyWindowHandle>,
+    handoff_window: Option<AnyWindowHandle>,
     settings_window_panel: Option<Entity<SettingsPanel>>,
     command_palette: Entity<CommandPalette>,
     model_registry: ModelRegistry,
@@ -175,15 +216,27 @@ pub struct ConWorkspace {
     global_input_history: VecDeque<String>,
     pane_scope_picker_open: bool,
     agent_panel_open: bool,
-    agent_panel_motion: MotionValue,
+    agent_panel_motion: SidebarMotion,
+    left_panel_motion: SidebarMotion,
+    #[cfg(target_os = "macos")]
+    caption_dock: frame::CaptionLayout,
+    #[cfg(target_os = "macos")]
+    canvas_depth_progress: f32,
+    #[cfg(target_os = "macos")]
+    native_caption_height: f32,
+    #[cfg(target_os = "macos")]
+    canvas_surround: frame::CanvasSurround,
     agent_panel_width: f32,
     tab_strip_motion: MotionValue,
+    tab_slot_motion: tab_motion::TabSlotMotion,
     input_bar_visible: bool,
-    input_bar_motion: MotionValue,
+    input_bar_motion: SidebarMotion,
     /// Tracks whether a modal was open on the last render, so we can
     /// restore terminal focus when a modal dismisses itself internally.
     modal_was_open: bool,
     ghostty_hidden: bool,
+    #[cfg(target_os = "macos")]
+    native_tab_handoff_pending: bool,
     /// Agent panel drag state: start X position and start width when drag began.
     agent_panel_drag: Option<(f32, f32)>,
     /// Vertical tabs panel drag state: start X position and start width when drag began.
@@ -199,15 +252,7 @@ pub struct ConWorkspace {
     #[cfg(target_os = "macos")]
     agent_panel_snap_guard_until: Option<Instant>,
     #[cfg(target_os = "macos")]
-    input_bar_snap_guard_until: Option<Instant>,
-    #[cfg(target_os = "macos")]
-    top_chrome_snap_guard_until: Option<Instant>,
-    #[cfg(target_os = "macos")]
     agent_panel_release_cover_until: Option<Instant>,
-    #[cfg(target_os = "macos")]
-    input_bar_release_cover_until: Option<Instant>,
-    #[cfg(target_os = "macos")]
-    top_chrome_release_cover_until: Option<Instant>,
     #[cfg(target_os = "linux")]
     linux_window_shape_signature: Option<(u32, u32, crate::LinuxWindowShapeRadii)>,
     /// Pending create-pane requests that need a window context to process.
@@ -287,6 +332,9 @@ pub struct ConWorkspace {
     /// resolve pane-title drag slot when cursor is in the tab bar.
     /// Vec index == tab index; each entry is the tab's window-coordinate bounds.
     tab_strip_tab_bounds: std::sync::Arc<std::sync::Mutex<Vec<Bounds<Pixels>>>>,
+    horizontal_tab_scroll: gpui::ScrollHandle,
+    horizontal_tab_reveal_key: HorizontalTabRevealState,
+    horizontal_tab_edges: Rc<Cell<(bool, bool)>>,
     /// Bounds of real tabs only (no ghost placeholder), in render order.
     /// Used exclusively by pane-title-drag slot calculation so it never
     /// needs to know where the ghost tab sits in the visual layout.

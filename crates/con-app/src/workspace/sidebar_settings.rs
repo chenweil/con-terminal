@@ -318,24 +318,27 @@ impl ConWorkspace {
         // Seed from the rendered tab label so focus→blur without edits
         // preserves AI/SSH/CWD-derived naming instead of materializing the
         // raw terminal title as a new explicit label.
+        let is_editor_only = tab.pane_tree.pane_terminals().is_empty();
         let (hostname, title, current_dir) =
             if let Some(terminal) = tab.pane_tree.try_focused_terminal() {
                 (
                     self.effective_remote_host_for_tab(index, terminal, cx),
-                    terminal.title(cx),
+                    terminal.title_name(cx),
                     terminal.current_dir(cx),
                 )
             } else {
-                (None, None, None)
+                (None, Some(tab.title.clone()), None)
             };
         let initial = tab_rename_initial_label(
             tab.user_label.as_deref(),
             tab.ai_label.as_deref(),
             tab.ai_icon.map(|kind| kind.svg_path()),
+            tab.agent_cli,
             hostname.as_deref(),
             title.as_deref(),
             current_dir.as_deref(),
             index,
+            is_editor_only,
         );
 
         let input = cx.new(|cx| {
@@ -599,47 +602,83 @@ impl ConWorkspace {
     }
 
     pub(super) fn sync_sidebar(&self, cx: &mut Context<Self>) {
-        let sessions: Vec<SessionEntry> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, tab)| {
-                let (hostname, title, current_dir) =
-                    if let Some(terminal) = tab.pane_tree.try_focused_terminal() {
-                        (
-                            self.effective_remote_host_for_tab(i, terminal, cx),
-                            terminal.title(cx),
-                            terminal.current_dir(cx),
-                        )
-                    } else {
-                        (None, None, None)
-                    };
-                let presentation = smart_tab_presentation(
-                    tab.user_label.as_deref(),
-                    tab.ai_label.as_deref(),
-                    tab.ai_icon.map(|k| k.svg_path()),
-                    hostname.as_deref(),
-                    title.as_deref(),
-                    current_dir.as_deref(),
-                    i,
-                );
-                let pane_count = tab.pane_tree.pane_terminals().len();
-                SessionEntry {
-                    id: tab.summary_id,
-                    name: presentation.name,
-                    subtitle: presentation.subtitle,
-                    is_ssh: presentation.is_ssh,
-                    needs_attention: tab.needs_attention,
-                    icon: presentation.icon,
-                    has_user_label: tab.user_label.is_some(),
-                    pane_count,
-                    color: tab.color,
-                }
-            })
+        let sessions = (0..self.tabs.len())
+            .map(|index| self.sidebar_entry(index, cx))
             .collect();
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.sync_sessions(sessions, self.active_tab, cx);
         });
+    }
+
+    /// Shared by full synchronization and the single-row title update path.
+    pub(super) fn sidebar_entry(&self, index: usize, cx: &App) -> SessionEntry {
+        let tab = &self.tabs[index];
+        let terminal_pane_count = tab.pane_tree.pane_terminals().len();
+        let pane_count = tab.pane_tree.pane_count();
+        let (hostname, title, current_dir) =
+            if let Some(terminal) = tab.pane_tree.try_focused_terminal() {
+                (
+                    self.effective_remote_host_for_tab(index, terminal, cx),
+                    terminal.title_name(cx),
+                    terminal.current_dir(cx),
+                )
+            } else {
+                (None, Some(tab.title.clone()), None)
+            };
+        let mut presentation = smart_tab_presentation(
+            tab.user_label.as_deref(),
+            tab.ai_label.as_deref(),
+            tab.ai_icon.map(|k| k.svg_path()),
+            tab.agent_cli,
+            hostname.as_deref(),
+            title.as_deref(),
+            current_dir.as_deref(),
+            index,
+            terminal_pane_count == 0,
+        );
+        if !presentation.is_ssh
+            && tab.agent_cli.is_none()
+            && let Some(terminal) = tab.pane_tree.try_focused_terminal()
+            && terminal.presentation_icon() != crate::terminal_identity::TERMINAL
+        {
+            presentation.icon = terminal.presentation_icon();
+        }
+        SessionEntry {
+            id: tab.summary_id,
+            name: presentation.name,
+            subtitle: presentation.subtitle,
+            is_ssh: presentation.is_ssh,
+            needs_attention: tab.needs_attention,
+            status: self
+                .terminal_presentation
+                .tabs
+                .get(&tab.summary_id)
+                .copied()
+                .flatten(),
+            status_detail: self.program_status_context(tab.summary_id),
+            icon: presentation.icon,
+            pane_icons: if tab.pane_tree.pane_count() > 1 {
+                let mut icons = Vec::new();
+                for (_, terminal) in tab.pane_tree.pane_terminals() {
+                    icons.push(terminal.presentation_icon());
+                }
+                if tab.pane_tree.find_editor_pane().is_some() {
+                    icons.push("phosphor/file-code.svg");
+                }
+                crate::assets::unique_tab_identities(icons, presentation.icon)
+            } else {
+                vec![crate::assets::tab_identity_asset(presentation.icon)]
+            },
+            pane_details: self
+                .terminal_presentation
+                .pane_details
+                .get(&tab.summary_id)
+                .cloned()
+                .unwrap_or_default(),
+            has_user_label: tab.user_label.is_some(),
+            pane_count,
+            color: tab.color,
+        }
     }
 
     pub(super) fn on_palette_select(
@@ -650,6 +689,7 @@ impl ConWorkspace {
         cx: &mut Context<Self>,
     ) {
         match event.action_id.as_str() {
+            "handoff-agent" => self.open_agent_handoff(&crate::HandoffAgent, window, cx),
             "new-window" => {
                 cx.dispatch_action(&crate::NewWindow);
             }
@@ -745,20 +785,24 @@ impl ConWorkspace {
                 self.close_current_surface_in_focused_pane(window, cx);
             }
             "clear-terminal" => {
-                if self.has_active_tab() {
-                    if let Some(t) = self.try_active_terminal() {
-                        t.clear_scrollback(cx);
-                    }
+                if self.has_active_tab()
+                    && let Some(t) = self.try_active_terminal()
+                {
+                    t.clear_scrollback(cx);
                 }
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            "find-in-terminal" => {
+                self.find_in_terminal(&FindInTerminal, window, cx);
             }
             "clear-restored-terminal-history" => {
                 self.clear_restored_terminal_history(window, cx);
             }
             "focus-terminal" => {
-                if self.has_active_tab() {
-                    if let Some(t) = self.try_active_terminal() {
-                        t.focus(window, cx);
-                    }
+                if self.has_active_tab()
+                    && let Some(t) = self.try_active_terminal()
+                {
+                    t.focus(window, cx);
                 }
             }
             "toggle-input-bar" => {
@@ -821,9 +865,16 @@ impl ConWorkspace {
         restore_focus: bool,
     ) {
         let full_config = settings.read(cx).config().clone();
+        #[cfg(target_os = "macos")]
+        if let Err(error) = self.apply_native_config(&full_config) {
+            log::error!("Failed to apply saved native Ghostty configuration: {error}");
+            return;
+        }
         let restore_terminal_text_was_enabled = self.config.appearance.restore_terminal_text;
         let old_keybindings = self.config.keybindings.clone();
         self.config = full_config.clone();
+        #[cfg(target_os = "macos")]
+        self.sync_handoff_menu_entry(cx);
         if !self.vertical_tabs_enabled() {
             self.sidebar_tools_open = self.left_panel_open;
         }
@@ -860,24 +911,27 @@ impl ConWorkspace {
 
         // Sync auto-approve to agent panel UI
         self.agent_panel.update(cx, |panel, cx| {
-            panel.set_auto_approve(auto_approve);
+            panel.set_auto_approve(auto_approve, cx);
             panel.set_session_provider_options(
                 AgentPanel::configured_session_providers(&active_agent_config),
                 window,
                 cx,
             );
             panel.set_provider_name(active_agent_config.provider.clone(), window, cx);
-            panel.set_model_name(AgentHarness::active_model_name_for(&active_agent_config));
+            panel.set_model_name(
+                AgentHarness::active_model_name_for(&active_agent_config),
+                cx,
+            );
             panel.set_session_model_options(active_agent_models, window, cx);
         });
 
         // Apply updated skills paths (forces rescan on next cwd check)
         let skills_config = full_config.skills.clone();
         self.harness.update_skills_config(skills_config);
-        if self.has_active_tab() {
-            if let Some(cwd) = self.try_active_terminal().and_then(|t| t.current_dir(cx)) {
-                self.request_skill_scan_for_cwd(&cwd);
-            }
+        if self.has_active_tab()
+            && let Some(cwd) = self.try_active_terminal().and_then(|t| t.current_dir(cx))
+        {
+            self.request_skill_scan_for_cwd(&cwd);
         }
 
         // Note: network/proxy config changes take effect on next app restart.
@@ -886,6 +940,24 @@ impl ConWorkspace {
 
         let term_config = full_config.terminal.clone();
         let appearance_config = full_config.appearance.clone();
+        #[cfg(not(target_os = "macos"))]
+        match self
+            .ghostty_app
+            .set_clipboard_write_enabled(term_config.clipboard_write)
+        {
+            Ok(()) => {
+                for tab in &self.tabs {
+                    for terminal in tab.pane_tree.all_surface_terminals() {
+                        if let Err(err) =
+                            terminal.set_clipboard_write_enabled(term_config.clipboard_write, cx)
+                        {
+                            log::error!("Failed to update terminal clipboard write policy: {err}");
+                        }
+                    }
+                }
+            }
+            Err(err) => log::error!("Failed to update clipboard write policy: {err}"),
+        }
         self.apply_terminal_and_ui_appearance(&term_config, &appearance_config, window, cx);
         self.sync_tab_strip_motion();
         if restore_terminal_text_was_enabled && !appearance_config.restore_terminal_text {
@@ -919,6 +991,16 @@ impl ConWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(target_os = "macos")]
+        if let Err(error) = self.apply_native_config(settings.read(cx).config()) {
+            log::error!("Failed to preview native Ghostty configuration: {error}");
+            return;
+        }
+        // Feature gates (Experimental section) live-apply with the preview so
+        // entry points appear/disappear immediately.
+        self.config.experimental = settings.read(cx).config().experimental.clone();
+        #[cfg(target_os = "macos")]
+        self.sync_handoff_menu_entry(cx);
         let term_config = settings.read(cx).terminal_config().clone();
         let appearance_config = settings.read(cx).appearance_config().clone();
         self.apply_terminal_and_ui_appearance(&term_config, &appearance_config, window, cx);
@@ -928,13 +1010,33 @@ impl ConWorkspace {
     pub(super) fn on_theme_preview(
         &mut self,
         _settings: &Entity<SettingsPanel>,
-        event: &ThemePreview,
+        ThemePreview(_theme_name): &ThemePreview,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_theme_preview(&event.0, window, cx);
+        #[cfg(target_os = "macos")]
+        {
+            self.apply_appearance_preview_from_panel(_settings, window, cx);
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.apply_theme_preview(_theme_name, window, cx);
     }
 
+    #[cfg(target_os = "macos")]
+    fn apply_native_config(&mut self, config: &Config) -> Result<(), String> {
+        let text = native_config_for_app(config)?;
+        let base_dir = native_config_base_dir(config)?;
+        let effective = self.ghostty_app.apply_native_config(text, base_dir)?;
+        self.terminal_theme = native_appearance_theme(
+            config.terminal.theme.clone(),
+            effective.foreground,
+            effective.background,
+            &effective.palette,
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn apply_theme_preview(
         &mut self,
         theme_name: &str,
@@ -957,12 +1059,25 @@ impl ConWorkspace {
         cx: &mut Context<Self>,
     ) {
         let next_terminal_font_family = sanitize_terminal_font_family(&term_config.font_family);
+        let next_terminal_font_fallback =
+            sanitize_terminal_font_fallback(&term_config.font_fallback, &next_terminal_font_family);
         let next_ui_font_family = appearance_config.ui_font_family.clone();
         let next_ui_font_size = appearance_config.ui_font_size;
+        #[cfg(not(target_os = "macos"))]
         let next_font_size = term_config.font_size;
+        #[cfg(target_os = "macos")]
+        let effective = self
+            .ghostty_app
+            .native_appearance()
+            .expect("native config was applied before UI synchronization");
+        #[cfg(target_os = "macos")]
+        let next_font_size = effective.font_size;
         let next_terminal_cursor_style = term_config.cursor_style.clone();
+        #[cfg(not(target_os = "macos"))]
         let next_terminal_opacity =
             Self::effective_terminal_opacity(appearance_config.terminal_opacity);
+        #[cfg(target_os = "macos")]
+        let next_terminal_opacity = effective.background_opacity as f32;
         let next_terminal_blur = Self::effective_terminal_blur(appearance_config.terminal_blur);
         let next_background_image = appearance_config.background_image.clone();
         let next_background_image_opacity =
@@ -972,9 +1087,11 @@ impl ConWorkspace {
         let next_background_image_repeat = appearance_config.background_image_repeat;
         let next_tabs_orientation = appearance_config.tabs_orientation;
 
-        let font_changed = self.terminal_font_family != next_terminal_font_family
+        let terminal_font_metrics_changed = self.terminal_font_family != next_terminal_font_family
             || (self.font_size - next_font_size).abs() > f32::EPSILON;
-        let terminal_appearance_changed = font_changed
+        let terminal_font_changed = terminal_font_metrics_changed
+            || self.terminal_font_fallback != next_terminal_font_fallback;
+        let terminal_appearance_changed = terminal_font_changed
             || self.terminal_cursor_style != next_terminal_cursor_style
             || (self.terminal_opacity - next_terminal_opacity).abs() > f32::EPSILON
             || self.terminal_blur != next_terminal_blur
@@ -983,11 +1100,12 @@ impl ConWorkspace {
             || self.background_image_position != next_background_image_position
             || self.background_image_fit != next_background_image_fit
             || self.background_image_repeat != next_background_image_repeat;
-        let ui_theme_changed = font_changed
+        let ui_theme_changed = terminal_font_metrics_changed
             || self.ui_font_family != next_ui_font_family
             || (self.ui_font_size - next_ui_font_size).abs() > f32::EPSILON;
 
         self.terminal_font_family = next_terminal_font_family;
+        self.terminal_font_fallback = next_terminal_font_fallback;
         self.ui_font_family = next_ui_font_family;
         self.ui_font_size = next_ui_font_size;
         self.font_size = next_font_size;
@@ -1004,7 +1122,7 @@ impl ConWorkspace {
             cx.notify();
         });
         self.sync_tab_strip_motion();
-        if font_changed {
+        if terminal_font_metrics_changed {
             let editor_views = self
                 .tabs
                 .iter()
@@ -1030,13 +1148,17 @@ impl ConWorkspace {
         self.background_image_repeat = next_background_image_repeat;
 
         let effective_ui_opacity = Self::effective_ui_opacity(self.ui_opacity);
-        self.agent_panel
-            .update(cx, |panel, _cx| panel.set_ui_opacity(effective_ui_opacity));
-        self.input_bar
-            .update(cx, |bar, _cx| bar.set_ui_opacity(effective_ui_opacity));
-        self.sidebar
-            .update(cx, |s, cx| s.set_ui_opacity(effective_ui_opacity, cx));
+        self.agent_panel.update(cx, |panel, cx| {
+            panel.set_ui_opacity(effective_ui_opacity, cx);
+            panel.set_assistant_avatar_asset(
+                con_core::config::agent_avatar_asset(&appearance_config.agent_avatar),
+                cx,
+            );
+        });
+        self.config.appearance.agent_avatar =
+            con_core::config::sanitize_agent_avatar(&appearance_config.agent_avatar);
         self.sidebar.update(cx, |s, cx| {
+            s.set_ui_opacity(effective_ui_opacity, cx);
             s.set_tab_accent_alphas(
                 self.tab_accent_inactive_alpha,
                 self.tab_accent_inactive_hover_alpha,
@@ -1047,16 +1169,20 @@ impl ConWorkspace {
             palette.set_ui_opacity(effective_ui_opacity)
         });
 
-        if let Some(new_theme) = TerminalTheme::by_name(&term_config.theme) {
+        #[cfg(target_os = "macos")]
+        let new_theme = Some(self.terminal_theme.clone());
+        #[cfg(not(target_os = "macos"))]
+        let new_theme = TerminalTheme::by_name(&term_config.theme);
+        if let Some(new_theme) = new_theme {
             let theme_changed = new_theme.name != self.terminal_theme.name;
             if theme_changed {
                 self.terminal_theme = new_theme.clone();
             }
-            if theme_changed || terminal_appearance_changed {
+            if cfg!(target_os = "macos") || theme_changed || terminal_appearance_changed {
                 self.sync_terminal_surface_appearance(&new_theme, window, cx);
             }
-            if theme_changed || ui_theme_changed {
-                self.sync_gpui_theme_appearance(&new_theme, window, cx);
+            if cfg!(target_os = "macos") || theme_changed || ui_theme_changed {
+                self.sync_gpui_theme_appearance(&new_theme, cx);
             }
         } else {
             log::warn!(
@@ -1070,9 +1196,12 @@ impl ConWorkspace {
             self.hide_pane_title_bar = next_hide_pane_title_bar;
             cx.notify();
         }
+
+        self.app_icon = sanitize_app_icon(&appearance_config.app_icon);
     }
 
     /// Apply a new terminal theme to all panes and sync UI mode.
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn apply_terminal_theme(
         &mut self,
         theme: TerminalTheme,
@@ -1081,23 +1210,34 @@ impl ConWorkspace {
     ) {
         self.terminal_theme = theme.clone();
         self.sync_terminal_surface_appearance(&theme, window, cx);
-        self.sync_gpui_theme_appearance(&theme, window, cx);
+        self.sync_gpui_theme_appearance(&theme, cx);
     }
 
     pub(super) fn sync_terminal_surface_appearance(
         &self,
-        theme: &TerminalTheme,
+        _theme: &TerminalTheme,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let colors = theme_to_ghostty_colors(theme);
+        #[cfg(target_os = "macos")]
+        {
+            for tab in &self.tabs {
+                for terminal in tab.pane_tree.all_surface_terminals() {
+                    terminal.sync_window_background_blur(cx);
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let colors = theme_to_ghostty_colors(_theme);
         // Update all terminal panes (legacy gets full theme, ghostty gets color scheme)
+        #[cfg(not(target_os = "macos"))]
         for tab in &self.tabs {
             for terminal in tab.pane_tree.all_surface_terminals() {
                 terminal.set_theme(
-                    theme,
+                    _theme,
                     &colors,
                     &self.terminal_font_family,
+                    &self.terminal_font_fallback,
                     self.font_size,
                     self.terminal_opacity,
                     self.terminal_blur,
@@ -1111,9 +1251,11 @@ impl ConWorkspace {
                 );
             }
         }
+        #[cfg(not(target_os = "macos"))]
         if let Err(e) = self.ghostty_app.update_appearance(
             &colors,
             &self.terminal_font_family,
+            &self.terminal_font_fallback,
             self.font_size,
             self.terminal_opacity,
             self.terminal_blur,
@@ -1126,6 +1268,7 @@ impl ConWorkspace {
         ) {
             log::error!("Failed to update Ghostty appearance: {}", e);
         }
+        #[cfg(not(target_os = "macos"))]
         for tab in &self.tabs {
             for terminal in tab.pane_tree.all_surface_terminals() {
                 terminal.sync_window_background_blur(cx);
@@ -1133,25 +1276,17 @@ impl ConWorkspace {
         }
         #[cfg(target_os = "windows")]
         crate::set_windows_backdrop_blur(_window, self.terminal_blur);
-        #[cfg(target_os = "macos")]
-        crate::set_macos_window_glass_backdrop(_window, self.terminal_blur, self.terminal_opacity);
         #[cfg(target_os = "linux")]
         crate::set_linux_window_blur(_window, self.terminal_blur);
     }
 
-    pub(super) fn sync_gpui_theme_appearance(
-        &self,
-        theme: &TerminalTheme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn sync_gpui_theme_appearance(&self, theme: &TerminalTheme, cx: &mut Context<Self>) {
         // Sync GPUI UI theme colors with terminal theme
         crate::theme::sync_gpui_theme(
             theme,
             &self.terminal_font_family,
             &self.ui_font_family,
             self.ui_font_size,
-            window,
             cx,
         );
     }

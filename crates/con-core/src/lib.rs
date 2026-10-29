@@ -1,10 +1,14 @@
 pub mod config;
 pub mod control;
+pub mod handoff;
 pub mod harness;
+pub mod program_status;
 pub mod release_channel;
 pub mod session;
 pub mod suggestions;
 pub mod tab_summary;
+pub mod terminal_status;
+pub mod terminal_title;
 pub mod workspace_layout;
 
 pub use config::Config;

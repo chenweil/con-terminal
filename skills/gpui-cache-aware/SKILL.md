@@ -100,11 +100,50 @@ If a cached view causes overlap, clipping, or stale layout, the cache boundary i
 - Keep terminal surfaces and heavy side panels isolated.
 - Avoid reading terminal runtime state during ordinary render unless already cached.
 - Be cautious with transparency, animation, and resize interactions; measure before adding visual layers.
+- Check GPU composition bounds as well as CPU caches. In the pinned Metal
+  renderer, paths are copied from an intermediate texture over their bounds.
+  A viewport-sized path with a hole can still require a large blit. For canvas
+  gutters, use narrow quads and separately cached, corner-sized paths; test that
+  they never paint over terminal pixels and keep their bounds small.
 - For hover affordances that only need cursor feedback, prefer a tiny overlay /
   hitbox and `cursor_pointer()` over repainting terminal text. Keep the overlay
   state bounded to the hovered link/range.
 
 ### GPUI interaction gotchas
+
+- Do not return a child's layout ID from a presentation wrapper and then call
+  `prepaint_as_root` on that same child. The node is still parented in Taffy;
+  GPUI's absolute-origin lookup can count the parent offset again. Give the
+  wrapper its own layout node and lay out the child as an independent root.
+  Test hitbox positions against visible geometry, not merely whether a click
+  at the hitbox's reported (possibly wrong) position invokes its callback.
+- Caption `.occlude()` targets can block an ancestor's wheel listener. Forward
+  wheel events from the real occluded target to its shared scroll handle, and
+  include occlusion in the interaction test fixture. A plain layout fixture can
+  pass while the native caption cannot scroll.
+- Component popover triggers need mouse-down to reach their wrapper. Apply
+  native-caption occlusion outside the whole popover, not to its inner button;
+  retain mouse-down consumption on ordinary caption buttons.
+- When observing scroll endpoints after layout, request a follow-up frame only
+  when visibility changes. An unconditional `on_next_frame` from prepaint creates
+  idle frame demand even when no animation is running.
+- Recheck the pinned view-cache key before animating an ancestor's opacity.
+  The current key includes bounds, content mask and text style, but not inherited
+  opacity. Keep such a subtree uncached while its opacity changes, and restore
+  caching at the fully opaque endpoint. A changing clip can invalidate the cache,
+  but rounded pixel bounds are not a reliable opacity invalidation mechanism.
+- Native-surface overlays cannot rely on an opaque GPUI fill hiding a drop
+  shadow's interior. If elevation is needed, paint only exterior content-mask
+  strips, never a shadow-only full-surface div over terminal glass. The pinned
+  Metal shadow vertex stage uses clip distances for these masks. Verify both
+  the content's unchanged appearance and the masked geometry; do not infer a
+  frame-rate improvement from a smaller painted region alone.
+- A pane's undecorated/single-pane path must still run native clip prepaint.
+  A native scroll host also needs its own backing layer before a layer mask
+  can work; a Metal-backed descendant does not imply parent backing.
+  Reusing its terminal after closing a sibling can otherwise retain a split
+  mask even though its view frame has expanded. Test the real rendering path,
+  not just the native mask setter in isolation.
 
 - `.hover(|style| ...)` is a style hook on `Div`; `.on_hover(...)` is an
   enter/exit listener and requires a `Stateful<Div>`.

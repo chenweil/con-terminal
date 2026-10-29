@@ -46,6 +46,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PWSTR;
 
+use crate::pty_write::{PtyWriteQueue, PtyWriteWorker};
+use crate::vt::PtyWriteClass;
+
 fn perf_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -101,6 +104,106 @@ impl Drop for OwnedHandle {
     }
 }
 
+struct PendingPseudoConsole(Option<HPCON>);
+
+impl PendingPseudoConsole {
+    fn new(handle: HPCON) -> Self {
+        Self(Some(handle))
+    }
+
+    fn handle(&self) -> HPCON {
+        self.0.expect("pending pseudo-console handle was taken")
+    }
+
+    fn take(&mut self) -> HPCON {
+        self.0
+            .take()
+            .expect("pending pseudo-console handle was already taken")
+    }
+}
+
+impl Drop for PendingPseudoConsole {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            // SAFETY: this guard exclusively owns the HPCON until a
+            // successfully-created ConPty takes it.
+            unsafe { ClosePseudoConsole(handle) }
+        }
+    }
+}
+
+/// Cloneable write-only view of the host side of ConPTY's input pipe.
+///
+/// libghostty-vt callbacks receive this instead of the full `ConPty` so
+/// terminal replies cannot re-enter `RenderSession` while the VT lock is
+/// held. One bounded writer queue preserves ordering with user input without
+/// allowing a blocked child pipe to stall parser output or rendering.
+#[derive(Clone)]
+pub(crate) struct ConPtyWriter {
+    queue: PtyWriteQueue,
+}
+
+impl ConPtyWriter {
+    pub(crate) fn write_all(&self, bytes: &[u8], class: PtyWriteClass) -> io::Result<()> {
+        match class {
+            PtyWriteClass::Regular => self.queue.enqueue(bytes),
+            PtyWriteClass::ReservedControl => self.queue.enqueue_with_reserved_capacity(bytes),
+        }
+    }
+}
+
+fn write_conpty_input(handle: &OwnedHandle, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let mut written = 0u32;
+        // SAFETY: the dedicated writer thread exclusively owns this handle.
+        unsafe {
+            WriteFile(handle.as_handle(), Some(bytes), Some(&mut written), None)
+                .map_err(|e| io::Error::other(e.message()))?;
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "ConPTY input pipe accepted zero bytes",
+            ));
+        }
+        bytes = &bytes[written as usize..];
+    }
+    Ok(())
+}
+
+/// Pipe endpoints created before the child process starts.
+///
+/// This two-phase construction lets the VT capture a `ConPtyWriter` before
+/// the shell can emit its first query or output byte.
+pub(crate) struct PreparedConPty {
+    input_read: OwnedHandle,
+    input_writer: ConPtyWriter,
+    input_worker: PtyWriteWorker,
+    output_read: OwnedHandle,
+    output_write: OwnedHandle,
+}
+
+impl PreparedConPty {
+    pub(crate) fn writer(&self) -> ConPtyWriter {
+        self.input_writer.clone()
+    }
+
+    pub(crate) fn spawn<F, E>(
+        self,
+        command_line: &str,
+        cwd: Option<&Path>,
+        size: PtySize,
+        on_output: F,
+        on_eof: E,
+    ) -> Result<ConPty>
+    where
+        F: FnMut(&[u8]) + Send + 'static,
+        E: FnOnce() + Send + 'static,
+    {
+        ConPty::spawn_prepared(self, command_line, cwd, size, on_output, on_eof)
+    }
+}
+
 /// A live ConPTY session.
 pub struct ConPty {
     /// Pseudo-console handle, shared with the exit-watcher thread.
@@ -109,9 +212,13 @@ pub struct ConPty {
     /// skips. See `close_hpcon_slot`.
     pcon: Arc<Mutex<Option<HPCON>>>,
     /// Host end of the pipe the child reads from.
-    input_write: Arc<Mutex<OwnedHandle>>,
+    _input_writer: ConPtyWriter,
+    /// Sole owner of the blocking pipe handle. Joined only after the child and
+    /// pseudo-console have been terminated so a pending write cannot hang Drop.
+    input_worker: PtyWriteWorker,
     /// Process handle (kept so callers can `WaitForSingleObject` for exit).
     process: OwnedHandle,
+    root_identity: Option<crate::process::ProcessIdentity>,
     /// Child thread handle.
     _thread: OwnedHandle,
     /// Output reader thread; joined on drop.
@@ -132,19 +239,57 @@ pub struct PtySize {
 }
 
 impl ConPty {
+    pub(crate) fn prepare() -> Result<PreparedConPty> {
+        let (input_read, input_write) = create_pipe().context("input pipe")?;
+        let (output_read, output_write) = create_pipe().context("output pipe")?;
+        let (input_queue, input_worker) = PtyWriteQueue::spawn("con-conpty-writer", move |bytes| {
+            write_conpty_input(&input_write, bytes)
+        })
+        .context("spawn ConPTY writer")?;
+        Ok(PreparedConPty {
+            input_read,
+            input_writer: ConPtyWriter { queue: input_queue },
+            input_worker,
+            output_read,
+            output_write,
+        })
+    }
+
     /// Spawn a child shell, wire up ConPTY, and start a background reader
     /// that calls `on_output` for each chunk of bytes the shell writes.
-    pub fn spawn<F>(
+    pub fn spawn<F, E>(
         command_line: &str,
         cwd: Option<&Path>,
         size: PtySize,
         on_output: F,
+        on_eof: E,
     ) -> Result<Self>
     where
         F: FnMut(&[u8]) + Send + 'static,
+        E: FnOnce() + Send + 'static,
     {
-        let (input_read, input_write) = create_pipe().context("input pipe")?;
-        let (output_read, output_write) = create_pipe().context("output pipe")?;
+        Self::prepare()?.spawn(command_line, cwd, size, on_output, on_eof)
+    }
+
+    fn spawn_prepared<F, E>(
+        prepared: PreparedConPty,
+        command_line: &str,
+        cwd: Option<&Path>,
+        size: PtySize,
+        on_output: F,
+        on_eof: E,
+    ) -> Result<Self>
+    where
+        F: FnMut(&[u8]) + Send + 'static,
+        E: FnOnce() + Send + 'static,
+    {
+        let PreparedConPty {
+            input_read,
+            input_writer,
+            input_worker,
+            output_read,
+            output_write,
+        } = prepared;
 
         let coord = COORD {
             X: size.cols as i16,
@@ -157,6 +302,7 @@ impl ConPty {
             CreatePseudoConsole(coord, input_read.as_handle(), output_write.as_handle(), 0)
         }
         .context("CreatePseudoConsole failed")?;
+        let mut pending_pcon = PendingPseudoConsole::new(hpcon);
 
         // Per Microsoft docs, after CreatePseudoConsole the captured
         // child-side ends should be closed by the host so only the
@@ -164,9 +310,7 @@ impl ConPty {
         drop(input_read);
         drop(output_write);
 
-        let pcon = Arc::new(Mutex::new(Some(hpcon)));
-
-        let (startup_info, attribute_buffer) = build_startup_info(hpcon)?;
+        let (startup_info, attribute_buffer) = build_startup_info(pending_pcon.handle())?;
 
         let mut command_line_w: Vec<u16> = OsString::from(command_line)
             .encode_wide()
@@ -236,8 +380,8 @@ impl ConPty {
         let process = OwnedHandle::from_handle(process_info.hProcess);
         let thread = OwnedHandle::from_handle(process_info.hThread);
 
-        let input_write = Arc::new(Mutex::new(input_write));
-        let output_thread = spawn_output_reader(output_read, on_output);
+        let pcon = Arc::new(Mutex::new(Some(pending_pcon.take())));
+        let output_thread = spawn_output_reader(output_read, on_output, on_eof);
 
         // Duplicate the process handle so the watcher thread can wait
         // on it independently of the `OwnedHandle` stored on `Self`.
@@ -294,23 +438,15 @@ impl ConPty {
 
         Ok(Self {
             pcon,
-            input_write,
+            _input_writer: input_writer,
+            input_worker,
             process,
+            root_identity: crate::process::read_process(process_info.dwProcessId)
+                .map(|process| process.identity),
             _thread: thread,
             output_thread: Some(output_thread),
             exit_watcher,
         })
-    }
-
-    pub fn write(&self, bytes: &[u8]) -> io::Result<usize> {
-        let guard = self.input_write.lock();
-        let mut written = 0u32;
-        // SAFETY: guard handle is a valid pipe.
-        unsafe {
-            WriteFile(guard.as_handle(), Some(bytes), Some(&mut written), None)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.message()))?;
-        }
-        Ok(written as usize)
     }
 
     pub fn resize(&self, size: PtySize) -> Result<()> {
@@ -333,6 +469,12 @@ impl ConPty {
 
     pub fn process_handle(&self) -> HANDLE {
         self.process.as_handle()
+    }
+
+    pub fn root_identity(&self) -> Option<crate::process::ProcessIdentity> {
+        self.is_alive()
+            .then(|| self.root_identity.clone())
+            .flatten()
     }
 
     /// `true` while the pseudo-console is still open. Flips to `false`
@@ -377,6 +519,7 @@ impl Drop for ConPty {
         // Close the pseudo-console (idempotent with the watcher's
         // close via `close_hpcon_slot`).
         close_hpcon_slot(&self.pcon);
+        self.input_worker.shutdown();
 
         if let Some(handle) = self.output_thread.take() {
             let _ = handle.join();
@@ -470,9 +613,14 @@ fn build_startup_info(hpcon: HPCON) -> Result<(STARTUPINFOEXW, Vec<u8>)> {
     Ok((startup_info, buffer))
 }
 
-fn spawn_output_reader<F>(read_handle: OwnedHandle, mut on_output: F) -> JoinHandle<()>
+fn spawn_output_reader<F, E>(
+    read_handle: OwnedHandle,
+    mut on_output: F,
+    on_eof: E,
+) -> JoinHandle<()>
 where
     F: FnMut(&[u8]) + Send + 'static,
+    E: FnOnce() + Send + 'static,
 {
     thread::Builder::new()
         .name("conpty-output-reader".into())
@@ -521,6 +669,7 @@ where
                 );
                 on_output(&buf[..bytes_read as usize]);
             }
+            on_eof();
             // OwnedHandle::Drop closes the handle.
         })
         .expect("conpty reader thread spawn failed")
@@ -528,14 +677,25 @@ where
 
 /// Discover a sensible default shell.
 ///
-/// Users who want to force a different shell can point us at it via
-/// `CON_SHELL` (future: a config-file field). Otherwise we try to honor
-/// Windows Terminal's configured default profile before falling back to a
-/// simple executable search. Matching the user's Windows Terminal shell is
-/// important when comparing prompt latency: PowerShell profile scripts,
-/// prompt frameworks, and WSL startup can dominate the first 400-500ms.
+/// Without an explicit `[terminal].shell`, users can still force a shell via
+/// `CON_SHELL`. Otherwise we honor Windows Terminal's configured default
+/// profile before falling back to a simple executable search. Matching the
+/// user's Windows Terminal shell matters because PowerShell profiles, prompt
+/// frameworks, and WSL startup can dominate initial latency.
 pub fn default_shell_command() -> String {
-    let command = if let Some(cmd) = std::env::var("CON_SHELL")
+    shell_command(None)
+}
+
+/// Resolve the shell command for a new pane. Explicit config wins over the
+/// compatibility environment override and platform auto-detection.
+pub fn shell_command(configured: Option<&str>) -> String {
+    let command = if let Some(cmd) = configured
+        .map(str::trim)
+        .filter(|cmd| !cmd.is_empty())
+        .map(ToOwned::to_owned)
+    {
+        cmd
+    } else if let Some(cmd) = std::env::var("CON_SHELL")
         .ok()
         .filter(|s| !s.trim().is_empty())
     {
@@ -1018,6 +1178,11 @@ fn strip_jsonc_trailing_commas(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_shell_command_wins_without_changing_non_powershell_commands() {
+        assert_eq!(shell_command(Some("  cmd.exe /q  ")), "cmd.exe /q");
+    }
 
     #[test]
     fn reads_windows_terminal_default_profile_commandline() {

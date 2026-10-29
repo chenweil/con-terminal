@@ -7,7 +7,12 @@ impl ConWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if index >= self.tabs.len() || index == self.active_tab {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.horizontal_tab_reveal_key.set(None);
+        if index == self.active_tab {
+            cx.notify();
             return;
         }
         let old_active = self.active_tab;
@@ -24,25 +29,43 @@ impl ConWorkspace {
         self.active_tab = index;
         self.tabs[index].needs_attention = false;
 
+        if self.tabs[index].pane_tree.pane_terminals().is_empty() {
+            self.last_editor_tab_id = Some(self.tabs[index].summary_id);
+        }
+
+        #[cfg(target_os = "macos")]
+        for terminal in self.tabs[old_active].pane_tree.all_surface_terminals() {
+            terminal.set_focus_state(false, cx);
+        }
+
         // Show new tab's ghostty NSViews and focus active surface
         for terminal in self.tabs[index].pane_tree.all_terminals() {
             terminal.ensure_surface(window, cx);
         }
-        self.sync_tab_native_view_visibility(index, true, cx);
-        for terminal in self.tabs[old_active].pane_tree.all_surface_terminals() {
-            terminal.set_focus_state(false, cx);
+        #[cfg(target_os = "macos")]
+        {
+            // Keep the outgoing tab until the incoming native layout is ready,
+            // then exchange visibility before GPUI paints this frame.
+            self.native_tab_handoff_pending = true;
         }
-        let old_terminals: Vec<TerminalPane> = self.tabs[old_active]
-            .pane_tree
-            .all_surface_terminals()
-            .into_iter()
-            .cloned()
-            .collect();
-        cx.on_next_frame(window, move |_workspace, _window, cx| {
-            for terminal in &old_terminals {
-                terminal.set_native_view_visible(false, cx);
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.sync_tab_native_view_visibility(index, true, cx);
+            for terminal in self.tabs[old_active].pane_tree.all_surface_terminals() {
+                terminal.set_focus_state(false, cx);
             }
-        });
+            let old_terminals: Vec<TerminalPane> = self.tabs[old_active]
+                .pane_tree
+                .all_surface_terminals()
+                .into_iter()
+                .cloned()
+                .collect();
+            cx.on_next_frame(window, move |_workspace, _window, cx| {
+                for terminal in &old_terminals {
+                    terminal.set_native_view_visible(false, cx);
+                }
+            });
+        }
         if let Some(focused) = self.tabs[index].pane_tree.try_focused_terminal() {
             focused.focus(window, cx);
             self.sync_active_terminal_focus_states(cx);
@@ -362,6 +385,9 @@ impl ConWorkspace {
         self.tabs[self.active_tab].pane_tree.focus_pane(pane_id);
         self.clear_terminal_focus_states_for_active_tab(cx);
         self.sync_active_tab_native_view_visibility(cx);
+        if self.vertical_tabs_enabled() {
+            self.sync_sidebar(cx);
+        }
         let editor_view = self.tabs[self.active_tab]
             .pane_tree
             .editor_view_for_pane(pane_id);
@@ -435,6 +461,9 @@ impl ConWorkspace {
             pane_tree.focus(pane_id);
             entity.focus_handle(cx).focus(window, cx);
             self.sync_active_terminal_focus_states(cx);
+            if self.vertical_tabs_enabled() {
+                self.sync_sidebar(cx);
+            }
         }
         cx.notify();
     }
@@ -479,19 +508,21 @@ impl ConWorkspace {
             {
                 let terminal = outcome.terminal;
                 terminal.set_native_view_visible(false, cx);
-                terminal.shutdown_surface(cx);
+                terminal.shutdown_surface(Some(window), cx);
             }
             if tab_idx == self.active_tab {
                 self.sync_active_tab_native_view_visibility(cx);
-                if should_focus_replacement {
-                    if let Some(replacement) =
+                if should_focus_replacement
+                    && let Some(replacement) =
                         self.tabs[tab_idx].pane_tree.try_focused_terminal().cloned()
-                    {
-                        replacement.ensure_surface(window, cx);
-                        replacement.focus(window, cx);
-                    }
+                {
+                    replacement.ensure_surface(window, cx);
+                    replacement.focus(window, cx);
                 }
                 self.sync_active_terminal_focus_states(cx);
+            }
+            if self.vertical_tabs_enabled() {
+                self.sync_sidebar(cx);
             }
             self.save_session(cx);
             cx.notify();
@@ -519,19 +550,98 @@ impl ConWorkspace {
 
     pub(crate) fn on_terminal_title_changed(
         &mut self,
-        _entity: &Entity<GhosttyView>,
-        _event: &GhosttyTitleChanged,
+        entity: &Entity<GhosttyView>,
+        event: &GhosttyTitleChanged,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Title changed — sync sidebar and tab bar.
-        self.sync_sidebar(cx);
-        // The OSC title change is the most reliable signal that a
-        // tab's purpose just shifted (`vim` → `bash`, `bash` → `htop`).
-        // Re-ask the AI for an updated label/icon. The engine
-        // dedupes on cache key so this is cheap if context didn't
-        // actually change.
-        self.request_tab_summaries(cx);
+        // Application-owned animation frames are not naming context changes.
+        if event.content_changed {
+            self.sync_sidebar(cx);
+            self.request_tab_summaries(cx);
+            cx.notify();
+        }
+        // Record title evidence immediately, but only a semantic status change
+        // invalidates chrome. Individual application spinner frames do not.
+        self.observe_terminal_title(entity, cx);
+    }
+
+    pub(crate) fn on_terminal_bell(
+        &mut self,
+        _entity: &Entity<GhosttyView>,
+        _event: &GhosttyBell,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        window.play_system_bell();
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    pub(crate) fn on_terminal_desktop_notification(
+        &mut self,
+        _entity: &Entity<GhosttyView>,
+        event: &GhosttyDesktopNotification,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = if event.0.title.is_empty() {
+            "con".to_owned()
+        } else {
+            event.0.title.clone()
+        };
+        let body = event.0.body.clone();
+
+        #[cfg(target_os = "linux")]
+        {
+            let notification_id = format!("co.nowledge.con.terminal.{}", uuid::Uuid::new_v4());
+            cx.spawn(async move |_, _| {
+                use ashpd::desktop::notification::{Notification, NotificationProxy};
+
+                let proxy = match NotificationProxy::new().await {
+                    Ok(proxy) => proxy,
+                    Err(err) => {
+                        log::warn!("Failed to connect to desktop notification portal: {err}");
+                        return;
+                    }
+                };
+                let notification =
+                    Notification::new(&title).body((!body.is_empty()).then_some(body.as_str()));
+                if let Err(err) = proxy.add_notification(&notification_id, notification).await {
+                    log::warn!("Failed to show desktop notification: {err}");
+                }
+            })
+            .detach();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            use gpui_component::{WindowExt as _, notification::Notification};
+
+            _window.push_notification(Notification::new().title(title).message(body), cx);
+            if !_window.is_window_active() {
+                flash_windows_taskbar(_window);
+            }
+        }
+    }
+
+    pub(crate) fn on_terminal_progress_changed(
+        &mut self,
+        entity: &Entity<GhosttyView>,
+        _event: &GhosttyProgressChanged,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity_id = entity.entity_id();
+        if !self
+            .tabs
+            .iter()
+            .any(|tab| tab.pane_tree.focused_terminal_entity_id() == Some(entity_id))
+        {
+            return;
+        }
+        if self.vertical_tabs_enabled() {
+            self.sync_sidebar(cx);
+        }
         cx.notify();
     }
 
@@ -691,9 +801,20 @@ impl ConWorkspace {
         // terminal in each pane's cwd.
         let ghostty_app = self.ghostty_app.clone();
         let font_size = self.font_size;
+        let handoff_menu_entry_enabled = self.config.experimental.handoff;
         let mut make_terminal =
             |cwd: Option<&str>, _screen_text: Option<&[String]>, _force: bool| {
-                make_ghostty_terminal(&ghostty_app, cwd, None, font_size, window, cx)
+                make_ghostty_terminal(
+                    &ghostty_app,
+                    cwd,
+                    None,
+                    None,
+                    None,
+                    font_size,
+                    handoff_menu_entry_enabled,
+                    window,
+                    cx,
+                )
             };
         let pane_tree = PaneTree::from_state(&layout, focused_pane_id, &mut make_terminal);
 
@@ -705,6 +826,7 @@ impl ConWorkspace {
             user_label: self.tabs[index].user_label.clone(),
             ai_label: None,
             ai_icon: None,
+            agent_cli: None,
             color: self.tabs[index].color,
             summary_id,
             summary_epoch: 0,
@@ -722,10 +844,7 @@ impl ConWorkspace {
         if self.active_tab >= insert_at {
             self.active_tab += 1;
         }
-        if self.sync_tab_strip_motion() {
-            #[cfg(target_os = "macos")]
-            self.arm_top_chrome_snap_guard(cx);
-        }
+        self.sync_tab_strip_motion();
         self.activate_tab(insert_at, window, cx);
         cx.notify();
     }
@@ -739,6 +858,57 @@ impl ConWorkspace {
         if let Some(index) = self.tab_index_for_summary_id(tab_id) {
             self.duplicate_tab(index, window, cx);
         }
+    }
+
+    /// Create a new editor tab with the given file path.
+    pub(super) fn new_editor_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_view = self.create_editor_view_subscribed(window, cx);
+        let pane_tree = PaneTree::new_editor(editor_view.clone());
+
+        let summary_id = self.next_tab_summary_id;
+        self.next_tab_summary_id += 1;
+        let new_tab = Tab {
+            pane_tree,
+            title: editor_tab_title(None),
+            user_label: None,
+            ai_label: None,
+            ai_icon: None,
+            agent_cli: None,
+            color: None,
+            summary_id,
+            summary_epoch: 0,
+            needs_attention: false,
+            session: AgentSession::new(),
+            agent_routing: AgentRoutingState::default(),
+            panel_state: PanelState::new(),
+            runtime_trackers: RefCell::new(HashMap::new()),
+            runtime_cache: RefCell::new(HashMap::new()),
+            shell_history: HashMap::new(),
+        };
+
+        let active_tab = self.active_tab;
+        let insert_at = active_tab + 1;
+        self.reveal_vertical_tab_rail_for_new_tab_if_needed(cx);
+        self.tabs.insert(insert_at, new_tab);
+        if self.active_tab >= insert_at {
+            self.active_tab += 1;
+        }
+        self.sync_tab_strip_motion();
+        self.activate_tab(insert_at, window, cx);
+
+        let editor_focus = editor_view.read(cx).focus_handle(cx).clone();
+        editor_view.update(cx, |editor: &mut EditorView, cx| {
+            editor.open_file(path, cx);
+        });
+        editor_focus.focus(window, cx);
+        self.sync_file_tree_from_active_focus(cx);
+        self.save_session(cx);
+        cx.notify();
     }
 
     /// Close all tabs except the one at `index`.
@@ -825,5 +995,31 @@ impl ConWorkspace {
         if let Some(index) = self.tab_index_for_summary_id(tab_id) {
             self.set_tab_color(index, color, cx);
         }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn flash_windows_taskbar(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
+    };
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let info = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd: HWND(handle.hwnd.get() as *mut std::ffi::c_void),
+        dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+        uCount: 0,
+        dwTimeout: 0,
+    };
+    unsafe {
+        let _ = FlashWindowEx(&info);
     }
 }

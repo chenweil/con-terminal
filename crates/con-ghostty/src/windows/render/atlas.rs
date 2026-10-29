@@ -9,11 +9,12 @@
 //! sharp on a physical LCD panel but becomes colored fringe in that
 //! pipeline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 use etagere::{AllocId, AtlasAllocator, size2};
-use unicode_width::UnicodeWidthChar;
+use windows::Win32::Globalization::GetUserDefaultLocaleName;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
@@ -35,17 +36,42 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD,
     DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_METRICS,
     DWRITE_LINE_METRICS, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PIXEL_GEOMETRY_FLAT,
-    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, IDWriteFactory, IDWriteFontCollection,
-    IDWriteFontFace, IDWriteFontFallback, IDWriteRenderingParams, IDWriteTextFormat,
-    IDWriteTextFormat1,
+    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, IDWriteFactory, IDWriteFactory1,
+    IDWriteFontCollection, IDWriteFontFace, IDWriteFontFallback, IDWriteRenderingParams,
+    IDWriteRenderingParams1, IDWriteTextFormat, IDWriteTextFormat1,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
-const TEXT_ENHANCED_CONTRAST: f32 = 1.15;
-const CJK_TEXT_ENHANCED_CONTRAST: f32 = 1.45;
+const LOCALE_NAME_BUFFER_LENGTH: usize = 85;
+const FALLBACK_LOCALE_NAME: &str = "en-US";
+const DEFAULT_TEXT_GAMMA: f32 = 1.8;
+const DEFAULT_GRAYSCALE_CONTRAST: f32 = 1.0;
+const CJK_GRAYSCALE_CONTRAST_FLOOR: f32 = 1.45;
+
+static USER_LOCALE_NAME: LazyLock<Vec<u16>> = LazyLock::new(user_locale_name);
+
+fn user_locale_name() -> Vec<u16> {
+    // LOCALE_NAME_MAX_LENGTH is 85 UTF-16 code units including the terminator.
+    let mut locale = vec![0; LOCALE_NAME_BUFFER_LENGTH];
+    let length = unsafe { GetUserDefaultLocaleName(&mut locale) };
+    if length > 1 && (length as usize) <= locale.len() {
+        locale.truncate(length as usize);
+        log::info!(
+            "DirectWrite user locale: {}",
+            String::from_utf16_lossy(&locale[..locale.len() - 1])
+        );
+        return locale;
+    }
+
+    log::warn!("GetUserDefaultLocaleName failed; using DirectWrite locale {FALLBACK_LOCALE_NAME}");
+    FALLBACK_LOCALE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // offset_x/offset_y are wired in Phase 3b-2 (glyph bearing).
@@ -58,11 +84,25 @@ pub struct GlyphRect {
     pub offset_y: i16,
 }
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct GlyphKey {
     pub codepoint: u32,
+    pub grapheme: Option<Arc<str>>,
+    pub wide: bool,
     pub bold: bool,
     pub italic: bool,
+}
+
+impl From<&crate::vt::Cell> for GlyphKey {
+    fn from(cell: &crate::vt::Cell) -> Self {
+        Self {
+            codepoint: cell.codepoint,
+            grapheme: cell.grapheme.clone(),
+            wide: cell.width == crate::vt::CellWidth::Wide,
+            bold: cell.attrs & crate::vt::ATTR_BOLD != 0,
+            italic: cell.attrs & crate::vt::ATTR_ITALIC != 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +126,24 @@ pub struct CellMetrics {
     pub cell_width_px: u32,
     pub cell_height_px: u32,
     pub baseline_px: u32,
+}
+
+/// DirectWrite's color-dependent grayscale correction inputs. The atlas keeps
+/// reusable coverage; the final text pass applies these values after the real
+/// foreground color is known.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GlyphRenderingParams {
+    pub gamma_ratios: [f32; 4],
+    pub grayscale_contrast: f32,
+    pub cjk_grayscale_contrast: f32,
+}
+
+impl GlyphRenderingParams {
+    const LEGACY_ATLAS: Self = Self {
+        gamma_ratios: [0.0; 4],
+        grayscale_contrast: 0.0,
+        cjk_grayscale_contrast: 0.0,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,15 +188,18 @@ pub struct GlyphCache {
     device: ID3D11Device,
     _context: ID3D11DeviceContext,
     dwrite: IDWriteFactory,
-    /// Font collection that owns `font_family`. `Some` only for our
-    /// bundled IoskeleyMono collection; `None` means DirectWrite should
-    /// resolve the family from the system collection.
+    /// The bundled collection remains available even when the currently
+    /// selected family comes from the system collection, so a live settings
+    /// change can switch back to IoskeleyMono without recreating the renderer.
+    bundled_font_collection: Option<IDWriteFontCollection>,
+    /// Font collection that owns `font_family`. `Some` only when the resolved
+    /// family comes from our bundled collection; `None` means DirectWrite
+    /// resolves it from the system collection.
     font_collection: Option<IDWriteFontCollection>,
-    /// System font-fallback cascade. Attached to each
-    /// `IDWriteTextFormat1` so DirectWrite transparently swaps in
-    /// Segoe UI Emoji / Symbol / CJK fonts for codepoints the bundled
-    /// IoskeleyMono lacks. `None` on pre-Win8.1 hosts or if
-    /// `GetSystemFontFallback` fails at init.
+    /// Ordered custom cascade attached to each `IDWriteTextFormat1`:
+    /// user-selected installed families, bundled PUA icons, then Windows
+    /// system fallback. `None` only when the runtime cannot construct a
+    /// fallback object.
     font_fallback: Option<IDWriteFontFallback>,
     _d2d_factory: ID2D1Factory,
 
@@ -146,8 +207,11 @@ pub struct GlyphCache {
     _atlas_texture: ID3D11Texture2D,
     atlas_srv: ID3D11ShaderResourceView,
     d2d_rt: ID2D1RenderTarget,
-    text_rendering_params: Option<IDWriteRenderingParams>,
-    cjk_text_rendering_params: Option<IDWriteRenderingParams>,
+    /// Linear grayscale rasterization parameters. The atlas stores neutral
+    /// coverage; foreground-aware gamma and contrast correction happens in
+    /// the pixel shader when the actual text color is known.
+    _text_rendering_params: Option<IDWriteRenderingParams>,
+    rendering_params: GlyphRenderingParams,
     white_brush: ID2D1SolidColorBrush,
     /// Opaque-black brush. Used to clear each slot before `DrawText` so
     /// any stale pixels — from a neighbouring scaled-PUA glyph that bled
@@ -190,12 +254,17 @@ impl GlyphCache {
         dwrite: &IDWriteFactory,
         bundled_collection: Option<IDWriteFontCollection>,
         font_family: &str,
+        font_fallback_families: &[String],
         font_size_px: f32,
         atlas_size: u32,
     ) -> Result<Self> {
-        // OS-default fallback cascade (emoji / symbol / CJK). Built
-        // once here and shared across all four text-format weights.
-        let font_fallback = super::font_loader::system_font_fallback(dwrite);
+        // Ordered user / bundled-icon / system cascade. Built once here and
+        // shared across all text-format weights.
+        let font_fallback = super::font_loader::font_fallback(
+            dwrite,
+            bundled_collection.as_ref(),
+            font_fallback_families,
+        );
 
         // Resolve the family and the collection as a pair. Passing the
         // bundled collection for a user-selected system font makes
@@ -371,26 +440,12 @@ impl GlyphCache {
         let d2d_rt = unsafe { d2d_factory.CreateDxgiSurfaceRenderTarget(&dxgi_surface, &rt_props) }
             .context("CreateDxgiSurfaceRenderTarget failed")?;
 
-        // Custom rendering params give us consistent grayscale output
-        // across machines regardless of the user's ClearType Tuner
-        // settings. Natural symmetric preserves DirectWrite's vertical
-        // and horizontal antialiasing while avoiding RGB subpixel
-        // coverage in our offscreen atlas. A mild contrast bump offsets
-        // the perceived weight loss from dropping ClearType.
-        //
-        // CJK fallback glyphs need a separate, stronger grayscale
-        // contrast. The user-visible complaint in #78 was not Latin
-        // weight after the RGB-fringe fix; it was CJK strokes looking
-        // too thin. Keep Latin / PUA conservative and only switch to
-        // the heavier params for wide fallback glyph rasterization.
-        //
-        // If CreateCustomRenderingParams fails (very rare — it's a pure
-        // parameter validator) we leave the default params in place.
-        let text_rendering_params = custom_text_rendering_params(dwrite, TEXT_ENHANCED_CONTRAST);
-        let cjk_text_rendering_params = text_rendering_params
-            .is_some()
-            .then(|| custom_text_rendering_params(dwrite, CJK_TEXT_ENHANCED_CONTRAST))
-            .flatten();
+        // Store neutral grayscale coverage in the atlas. Baking gamma and
+        // contrast here would bake the white-on-black DrawText colors into
+        // every glyph, then incorrectly reuse those values for dark text on
+        // light themes. The pixel shader applies DirectWrite-compatible,
+        // foreground-aware correction when it knows the real colors.
+        let (text_rendering_params, rendering_params) = text_rendering_params(dwrite);
         // SAFETY: grayscale AA. Setting the mode is cheap; if a driver
         // clamps it, the shader still collapses coverage to one scalar
         // so colored subpixel fringe cannot escape to the final frame.
@@ -445,6 +500,7 @@ impl GlyphCache {
             device: device.clone(),
             _context: context.clone(),
             dwrite: dwrite.clone(),
+            bundled_font_collection: bundled_collection,
             font_collection,
             font_fallback,
             _d2d_factory: d2d_factory,
@@ -452,8 +508,8 @@ impl GlyphCache {
             _atlas_texture: atlas_texture,
             atlas_srv,
             d2d_rt,
-            text_rendering_params,
-            cjk_text_rendering_params,
+            _text_rendering_params: text_rendering_params,
+            rendering_params,
             white_brush,
             black_brush,
             allocator,
@@ -487,17 +543,21 @@ impl GlyphCache {
         self.atlas_size
     }
 
-    /// Return the glyph rect for a (codepoint, style) key, rasterizing
+    pub fn rendering_params(&self) -> GlyphRenderingParams {
+        self.rendering_params
+    }
+
+    /// Return the glyph rect for a (cluster, width, style) key, rasterizing
     /// on first sight. Returns `None` if the atlas is full.
-    pub fn get_or_rasterize(&mut self, key: GlyphKey) -> Option<GlyphRect> {
-        if let Some((_, rect)) = self.entries.get(&key).copied() {
+    pub fn get_or_rasterize(&mut self, key: &GlyphKey) -> Option<GlyphRect> {
+        if let Some((_, rect)) = self.entries.get(key).copied() {
             return Some(rect);
         }
 
         let cell_w = self.metrics.cell_width_px as i32;
         let cell_h = self.metrics.cell_height_px as i32;
 
-        // Nerd-Font PUA icons (U+E000..U+F8FF) are authored as roughly
+        // Nerd-Font PUA icons (BMP and supplementary private-use ranges) are authored as roughly
         // square glyphs (~1000du × ~1000du) with an advance of one
         // monospace cell (~600du). In a tall-narrow cell (e.g. 17×35
         // px at font 28) fitting them by WIDTH collapses to a ~15×15
@@ -521,9 +581,11 @@ impl GlyphCache {
         // `atlasSize.x` as the quad width (via the `max(cellSize.x,
         // atlasSize.x)` branch in `shaders.hlsl::vs_main`).
         let codepoint = key.codepoint;
-        let is_scalable_pua =
-            matches!(codepoint, 0xE000..=0xF8FF) && !matches!(codepoint, 0xE0A0..=0xE0D4);
-        let is_wide_text = is_wide_codepoint(codepoint);
+        let is_scalable_pua = matches!(
+            codepoint,
+            0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+        ) && !matches!(codepoint, 0xE0A0..=0xE0D4);
+        let is_wide_text = key.wide;
         let is_cjk_text = is_cjk_codepoint(codepoint);
         let metrics = if is_scalable_pua {
             self.primary_glyph_metrics_px(codepoint)
@@ -563,7 +625,11 @@ impl GlyphCache {
                     (w, 0.0, Some(scale))
                 }
             }
-            None if is_wide_text => (cell_w.saturating_mul(2), 0.0, None),
+            // When DirectWrite resolves a PUA glyph from the configured or
+            // bundled fallback, `primary_face` cannot provide its metrics.
+            // Reserve the same two-cell overflow budget rather than clipping
+            // the fallback icon to a narrow one-cell atlas slot.
+            None if is_scalable_pua || is_wide_text => (cell_w.saturating_mul(2), 0.0, None),
             None => (cell_w, 0.0, None),
         };
         let alloc = self.allocator.allocate(size2(glyph_w, cell_h))?;
@@ -571,7 +637,13 @@ impl GlyphCache {
 
         let ch = char::from_u32(key.codepoint).unwrap_or('\u{FFFD}');
         let mut utf16 = [0u16; 2];
-        let utf16_slice = ch.encode_utf16(&mut utf16);
+        let cluster_utf16;
+        let utf16_slice: &[u16] = if let Some(cluster) = &key.grapheme {
+            cluster_utf16 = cluster.encode_utf16().collect::<Vec<_>>();
+            &cluster_utf16
+        } else {
+            ch.encode_utf16(&mut utf16)
+        };
 
         let base_format = match (key.bold, key.italic) {
             (true, true) => &self.text_format_bold_italic,
@@ -713,9 +785,6 @@ impl GlyphCache {
                     utf16_slice,
                     target_baseline,
                 );
-                if is_cjk_text && let Some(params) = self.cjk_text_rendering_params.as_ref() {
-                    self.d2d_rt.SetTextRenderingParams(params);
-                }
                 self.d2d_rt.DrawText(
                     utf16_slice,
                     format,
@@ -724,9 +793,6 @@ impl GlyphCache {
                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                     DWRITE_MEASURING_MODE_NATURAL,
                 );
-                if is_cjk_text && let Some(params) = self.text_rendering_params.as_ref() {
-                    self.d2d_rt.SetTextRenderingParams(params);
-                }
             } else {
                 self.d2d_rt.DrawText(
                     utf16_slice,
@@ -749,7 +815,7 @@ impl GlyphCache {
             offset_x: 0,
             offset_y: 0,
         };
-        self.entries.insert(key, (alloc.id, glyph_rect));
+        self.entries.insert(key.clone(), (alloc.id, glyph_rect));
         Some(glyph_rect)
     }
 
@@ -810,126 +876,192 @@ impl GlyphCache {
         })
     }
 
-    /// Evict every cached glyph and reset the skyline allocator without
-    /// touching the text formats. Used by the renderer when a frame's
-    /// glyph set exceeds the atlas capacity: drop the old set, try
-    /// again. Re-rasterizing the live frame is O(cells) and cheap
-    /// compared to the D3D stall a texture recreate would cause.
-    pub fn purge(&mut self) {
-        self.entries.clear();
-        self.allocator = AtlasAllocator::new(size2(self.atlas_size as i32, self.atlas_size as i32));
-        // SAFETY: d2d_rt owned by self and aliases the atlas texture.
-        // Re-clear so stale glyph coverage doesn't bleed into freshly-
-        // allocated slots.
-        unsafe {
-            self.d2d_rt.BeginDraw();
-            self.d2d_rt.Clear(Some(&D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 1.0,
-            }));
-            let _ = self.d2d_rt.EndDraw(None, None);
+    /// Admit the entire visible set before any instances reference atlas slots.
+    /// On exhaustion, grow and repack here, never midway through a frame.
+    pub fn prepare_frame(
+        &mut self,
+        cells: &[crate::vt::Cell],
+        font_fallback_families: &[String],
+    ) -> Result<()> {
+        let visible: HashSet<_> = cells
+            .iter()
+            .filter(|cell| {
+                cell.attrs & crate::vt::ATTR_INVISIBLE == 0
+                    && (cell.grapheme.is_some() || (cell.codepoint != 0 && cell.codepoint != 0x20))
+            })
+            .map(GlyphKey::from)
+            .collect();
+        self.entries.retain(|key, (id, _)| {
+            if visible.contains(key) {
+                true
+            } else {
+                self.allocator.deallocate(*id);
+                false
+            }
+        });
+        let mut repacked = false;
+        loop {
+            if visible
+                .iter()
+                .all(|key| self.get_or_rasterize(key).is_some())
+            {
+                return Ok(());
+            }
+            if !repacked {
+                // Reclaim fragmentation before spending more GPU memory.
+                // Each rasterization clears its slot; no frame uses old UVs yet.
+                self.entries.clear();
+                self.allocator.clear();
+                repacked = true;
+                continue;
+            }
+            // The renderer requires feature level 11.0: 16384 is its maximum
+            // 2D texture dimension. Propagate resource exhaustion instead of
+            // presenting a successful frame with permanently missing text.
+            anyhow::ensure!(
+                self.atlas_size < 16384,
+                "visible glyphs exceed D3D11 atlas capacity"
+            );
+            let size = (self.atlas_size * 2).min(16384);
+            let grown = Self::new(
+                &self.device,
+                &self._context,
+                &self.dwrite,
+                self.bundled_font_collection.clone(),
+                &self.font_family,
+                font_fallback_families,
+                self.font_size_px,
+                size,
+            )?;
+            *self = grown;
         }
     }
 
-    pub fn rebuild(&mut self, font_size_px: f32) -> Result<()> {
-        self.font_size_px = font_size_px;
-        self.entries.clear();
-        self.allocator = AtlasAllocator::new(size2(self.atlas_size as i32, self.atlas_size as i32));
-        self.text_format_regular = make_text_format(
+    pub fn rebuild(
+        &mut self,
+        font_family: &str,
+        font_fallback_families: &[String],
+        font_size_px: f32,
+    ) -> Result<()> {
+        // Resolve both values together. In particular, the collection must
+        // change when settings switch between a bundled and a system font.
+        let resolved = resolve_font_family(
             &self.dwrite,
-            self.font_collection.as_ref(),
-            self.font_fallback.as_ref(),
-            &self.font_family,
+            self.bundled_font_collection.as_ref(),
+            font_family,
+        )?;
+        let resolved_family = resolved.family;
+        let font_collection = resolved.collection.cloned();
+        let collection = font_collection.as_ref();
+        let font_fallback = super::font_loader::font_fallback(
+            &self.dwrite,
+            self.bundled_font_collection.as_ref(),
+            font_fallback_families,
+        );
+
+        // Build every fallible DirectWrite object before mutating the cache,
+        // leaving the previous font fully usable if the requested font fails.
+        let text_format_regular = make_text_format(
+            &self.dwrite,
+            collection,
+            font_fallback.as_ref(),
+            &resolved_family,
             font_size_px,
             false,
             false,
         )?;
-        self.text_format_bold = make_text_format(
+        let text_format_bold = make_text_format(
             &self.dwrite,
-            self.font_collection.as_ref(),
-            self.font_fallback.as_ref(),
-            &self.font_family,
+            collection,
+            font_fallback.as_ref(),
+            &resolved_family,
             font_size_px,
             true,
             false,
         )?;
-        self.text_format_italic = make_text_format(
+        let text_format_italic = make_text_format(
             &self.dwrite,
-            self.font_collection.as_ref(),
-            self.font_fallback.as_ref(),
-            &self.font_family,
+            collection,
+            font_fallback.as_ref(),
+            &resolved_family,
             font_size_px,
             false,
             true,
         )?;
-        self.text_format_bold_italic = make_text_format(
+        let text_format_bold_italic = make_text_format(
             &self.dwrite,
-            self.font_collection.as_ref(),
-            self.font_fallback.as_ref(),
-            &self.font_family,
+            collection,
+            font_fallback.as_ref(),
+            &resolved_family,
             font_size_px,
             true,
             true,
         )?;
-        self.text_format_cjk_regular = make_text_format_with_weight(
+        let text_format_cjk_regular = make_text_format_with_weight(
             &self.dwrite,
-            self.font_collection.as_ref(),
-            self.font_fallback.as_ref(),
-            &self.font_family,
+            collection,
+            font_fallback.as_ref(),
+            &resolved_family,
             font_size_px,
             DWRITE_FONT_WEIGHT_MEDIUM,
             false,
         )?;
-        self.text_format_cjk_italic = make_text_format_with_weight(
+        let text_format_cjk_italic = make_text_format_with_weight(
             &self.dwrite,
-            self.font_collection.as_ref(),
-            self.font_fallback.as_ref(),
-            &self.font_family,
+            collection,
+            font_fallback.as_ref(),
+            &resolved_family,
             font_size_px,
             DWRITE_FONT_WEIGHT_MEDIUM,
             true,
         )?;
-        self.metrics = measure_cell(
+        let metrics = measure_cell(&self.dwrite, collection, &resolved_family, font_size_px)?;
+        let layout_baselines = TextFormatBaselines::measure(
             &self.dwrite,
-            self.font_collection.as_ref(),
-            &self.font_family,
-            font_size_px,
-        )?;
-        self.layout_baselines = TextFormatBaselines::measure(
-            &self.dwrite,
-            self.metrics.baseline_px as f32,
-            &self.text_format_regular,
-            &self.text_format_bold,
-            &self.text_format_italic,
-            &self.text_format_bold_italic,
+            metrics.baseline_px as f32,
+            &text_format_regular,
+            &text_format_bold,
+            &text_format_italic,
+            &text_format_bold_italic,
         );
         // Refresh the primary face + upm so per-glyph scale-to-fit
         // works after a font-size change (the face itself doesn't
         // depend on size, but re-resolving keeps the field in lockstep
         // with the current collection / family).
-        match resolve_font_face(
-            &self.dwrite,
-            self.font_collection.as_ref(),
-            &self.font_family,
-        ) {
-            Ok((face, _src)) => {
-                let mut fm = DWRITE_FONT_METRICS::default();
-                // SAFETY: windows-rs writes through the out pointer.
-                unsafe { face.GetMetrics(&mut fm) };
-                self.primary_upm = fm.designUnitsPerEm as f32;
-                self.primary_face = Some(face);
-            }
-            Err(err) => {
-                log::warn!(
-                    "GlyphCache::rebuild: primary face resolution failed ({err:?}); \
+        let (primary_face, primary_upm) =
+            match resolve_font_face(&self.dwrite, collection, &resolved_family) {
+                Ok((face, _src)) => {
+                    let mut fm = DWRITE_FONT_METRICS::default();
+                    // SAFETY: windows-rs writes through the out pointer.
+                    unsafe { face.GetMetrics(&mut fm) };
+                    (Some(face), fm.designUnitsPerEm as f32)
+                }
+                Err(err) => {
+                    log::warn!(
+                        "GlyphCache::rebuild: primary face resolution failed ({err:?}); \
                      wide Nerd-Font icons will render clipped at the cell edge"
-                );
-                self.primary_face = None;
-                self.primary_upm = 1.0;
-            }
-        }
+                    );
+                    (None, 1.0)
+                }
+            };
+
+        self.font_family = resolved_family;
+        self.font_collection = font_collection;
+        self.font_fallback = font_fallback;
+        self.font_size_px = font_size_px;
+        self.entries.clear();
+        self.allocator = AtlasAllocator::new(size2(self.atlas_size as i32, self.atlas_size as i32));
+        self.text_format_regular = text_format_regular;
+        self.text_format_bold = text_format_bold;
+        self.text_format_italic = text_format_italic;
+        self.text_format_bold_italic = text_format_bold_italic;
+        self.text_format_cjk_regular = text_format_cjk_regular;
+        self.text_format_cjk_italic = text_format_cjk_italic;
+        self.metrics = metrics;
+        self.layout_baselines = layout_baselines;
+        self.primary_face = primary_face;
+        self.primary_upm = primary_upm;
+
         // Clear the atlas texture so fresh rasterization doesn't blend
         // with stale pixels from the previous size. BeginDraw/Clear/End
         // is a single D2D op — the DXGI-backed RT aliases the same
@@ -986,7 +1118,7 @@ fn make_text_format_with_weight(
     italic: bool,
 ) -> Result<IDWriteTextFormat> {
     let family_w: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
-    let locale_w: Vec<u16> = "en-us".encode_utf16().chain(std::iter::once(0)).collect();
+    let locale_w = &*USER_LOCALE_NAME;
 
     let style = if italic {
         DWRITE_FONT_STYLE_ITALIC
@@ -1012,44 +1144,128 @@ fn make_text_format_with_weight(
     }
     .context("CreateTextFormat failed")?;
 
-    // Attach the system fallback cascade via IDWriteTextFormat1 (Win8.1+).
-    // DirectWrite then substitutes Segoe UI Emoji / Symbol / CJK for
-    // codepoints IoskeleyMono lacks — no per-glyph retry needed; the
-    // D2D DrawText at rasterize time picks the fallback transparently.
-    //
-    // Cast failures fall back silently: the format without a fallback
-    // still draws primary-font glyphs correctly; only the missing-glyph
-    // boxes stay visible.
+    // Attach the custom fallback cascade via IDWriteTextFormat1 (Win8.1+).
+    // Treat failure as a format-construction error rather than silently
+    // displaying missing-glyph boxes while claiming the setting was applied.
     if let Some(fb) = fallback {
-        if let Ok(fmt1) = format.cast::<IDWriteTextFormat1>() {
-            // SAFETY: fmt1 is a valid IDWriteTextFormat1 we own; fb is
-            // a live COM reference from GetSystemFontFallback.
-            let _ = unsafe { fmt1.SetFontFallback(fb) };
-        }
+        let fmt1 = format
+            .cast::<IDWriteTextFormat1>()
+            .context("IDWriteTextFormat1 is unavailable for font fallback")?;
+        // SAFETY: fmt1 and fb are live COM references owned by this cache.
+        unsafe { fmt1.SetFontFallback(fb) }.context("SetFontFallback failed")?;
     }
 
     Ok(format)
 }
 
-fn custom_text_rendering_params(
+fn text_rendering_params(
     dwrite: &IDWriteFactory,
-    enhanced_contrast: f32,
-) -> Option<IDWriteRenderingParams> {
-    // SAFETY: constants are valid for IDWriteFactory. ClearType level
-    // stays zero because this atlas is sampled and composited by our
-    // own shader; RGB subpixel coverage would survive screenshots and
-    // remote displays as colored fringe.
-    unsafe {
-        dwrite
-            .CreateCustomRenderingParams(
-                1.8,
-                enhanced_contrast,
-                0.0,
-                DWRITE_PIXEL_GEOMETRY_FLAT,
-                DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
-            )
-            .ok()
+) -> (Option<IDWriteRenderingParams>, GlyphRenderingParams) {
+    match foreground_aware_text_rendering_params(dwrite) {
+        Ok(params) => params,
+        Err(error) => {
+            // Windows 10+ exposes IDWriteFactory1, but preserve a usable
+            // terminal if a remote/compatibility environment rejects it. In
+            // that case DirectWrite bakes correction into the atlas and the
+            // shader's identity parameters avoid correcting it twice.
+            log::warn!(
+                "foreground-aware DirectWrite correction unavailable ({error:#}); using legacy atlas correction"
+            );
+            let legacy = unsafe {
+                dwrite.CreateCustomRenderingParams(
+                    DEFAULT_TEXT_GAMMA,
+                    1.15,
+                    0.0,
+                    DWRITE_PIXEL_GEOMETRY_FLAT,
+                    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+                )
+            }
+            .ok();
+            (legacy, GlyphRenderingParams::LEGACY_ATLAS)
+        }
     }
+}
+
+fn foreground_aware_text_rendering_params(
+    dwrite: &IDWriteFactory,
+) -> Result<(Option<IDWriteRenderingParams>, GlyphRenderingParams)> {
+    // This follows Windows Terminal's AtlasEngine contract: read the user's
+    // DirectWrite parameters once, rasterize neutral grayscale coverage, and
+    // defer color-dependent gamma/contrast correction to the pixel shader.
+    let factory = dwrite
+        .cast::<IDWriteFactory1>()
+        .context("IDWriteFactory1 is unavailable")?;
+    let defaults = unsafe { factory.CreateRenderingParams() }
+        .context("IDWriteFactory1::CreateRenderingParams failed")?;
+    let defaults_v1 = defaults
+        .cast::<IDWriteRenderingParams1>()
+        .context("IDWriteRenderingParams1 is unavailable")?;
+
+    let gamma = finite_or(unsafe { defaults.GetGamma() }, DEFAULT_TEXT_GAMMA).clamp(1.0, 2.2);
+    let grayscale_contrast = finite_or(
+        unsafe { defaults_v1.GetGrayscaleEnhancedContrast() },
+        DEFAULT_GRAYSCALE_CONTRAST,
+    )
+    .max(0.0);
+    let params = unsafe {
+        factory.CreateCustomRenderingParams(
+            1.0,
+            0.0,
+            0.0,
+            defaults.GetClearTypeLevel(),
+            defaults.GetPixelGeometry(),
+            defaults.GetRenderingMode(),
+        )
+    }
+    .context("IDWriteFactory1::CreateCustomRenderingParams failed")?;
+    let params = params
+        .cast::<IDWriteRenderingParams>()
+        .context("IDWriteRenderingParams1 -> IDWriteRenderingParams failed")?;
+
+    Ok((
+        Some(params),
+        GlyphRenderingParams {
+            gamma_ratios: gamma_ratios(gamma),
+            grayscale_contrast,
+            cjk_grayscale_contrast: grayscale_contrast.max(CJK_GRAYSCALE_CONTRAST_FLOOR),
+        },
+    ))
+}
+
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}
+
+/// Polynomial coefficients used by DirectWrite's grayscale alpha correction.
+/// The source table and normalization are from Windows Terminal's
+/// MIT-licensed `dwrite_helpers.cpp`.
+fn gamma_ratios(gamma: f32) -> [f32; 4] {
+    const TARGETS: [[f32; 4]; 13] = [
+        [0.0000, 0.0000, 0.0000, 0.0000],
+        [0.0166, -0.0807, 0.2227, -0.0751],
+        [0.0350, -0.1760, 0.4325, -0.1370],
+        [0.0543, -0.2821, 0.6302, -0.1876],
+        [0.0739, -0.3963, 0.8167, -0.2287],
+        [0.0933, -0.5161, 0.9926, -0.2616],
+        [0.1121, -0.6395, 1.1588, -0.2877],
+        [0.1300, -0.7649, 1.3159, -0.3080],
+        [0.1469, -0.8911, 1.4644, -0.3234],
+        [0.1627, -1.0170, 1.6051, -0.3347],
+        [0.1773, -1.1420, 1.7385, -0.3426],
+        [0.1908, -1.2652, 1.8650, -0.3476],
+        [0.2031, -1.3864, 1.9851, -0.3501],
+    ];
+    let index =
+        ((finite_or(gamma, DEFAULT_TEXT_GAMMA) * 10.0 + 0.5) as i32).clamp(10, 22) as usize - 10;
+    let target = TARGETS[index];
+    let norm_13 = 65_536.0 / (255.0 * 255.0);
+    let norm_24 = 256.0 / 255.0;
+    [
+        target[0] * norm_13,
+        target[1] * norm_24,
+        target[2] * norm_13,
+        target[3] * norm_24,
+    ]
 }
 
 fn text_layout_baseline(
@@ -1357,13 +1573,7 @@ fn family_exists_in(collection: &IDWriteFontCollection, family: &str) -> bool {
     hr.is_ok() && exists.as_bool()
 }
 
-fn is_wide_codepoint(codepoint: u32) -> bool {
-    char::from_u32(codepoint)
-        .and_then(UnicodeWidthChar::width)
-        .is_some_and(|width| width >= 2)
-}
-
-fn is_cjk_codepoint(codepoint: u32) -> bool {
+pub(super) fn is_cjk_codepoint(codepoint: u32) -> bool {
     matches!(
         codepoint,
         // Hangul Jamo.
@@ -1391,29 +1601,111 @@ fn is_cjk_codepoint(codepoint: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cjk_codepoint, is_wide_codepoint};
+    use super::{GlyphKey, gamma_ratios, is_cjk_codepoint};
 
     #[test]
-    fn wide_codepoint_uses_unicode_width_instead_of_local_ranges() {
-        // These ranges were easy to miss in a hand-written East Asian
-        // Width table. Keep the atlas decision delegated to
-        // unicode-width so newly covered Unicode ranges do not regress
-        // into one-cell clipped glyphs.
-        for codepoint in [
-            0x4E00,  // CJK Unified Ideograph
-            0xA960,  // Hangul Jamo Extended-A
-            0xD7B0,  // Hangul Jamo Extended-B
-            0x1B000, // Kana Supplement
-            0x16FE0, // Tangut / ideographic marks
-            0x1B170, // Nushu
-            0x1FA70, // Symbols and Pictographs Extended-A
-        ] {
-            assert!(is_wide_codepoint(codepoint), "U+{codepoint:04X}");
-        }
+    fn frame_preparation_grows_for_all_visible_clusters() {
+        use crate::vt::{Cell, CellWidth};
+        use windows::Win32::Graphics::DirectWrite::{
+            DWRITE_FACTORY_TYPE_SHARED, DWriteCreateFactory,
+        };
 
-        // Ambiguous-width punctuation should stay one cell unless the
-        // terminal layer explicitly gains a CJK-ambiguous-width mode.
-        assert!(!is_wide_codepoint(0x00B7));
+        let (device, context) = super::super::create_device().unwrap();
+        let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
+        let mut cache =
+            super::GlyphCache::new(&device, &context, &dwrite, None, "Consolas", &[], 14.0, 32)
+                .unwrap();
+        let cells: Vec<_> = (0x300..0x340)
+            .map(|suffix| Cell {
+                codepoint: 'e' as u32,
+                grapheme: Some(format!("e{}", char::from_u32(suffix).unwrap()).into()),
+                width: if suffix % 2 == 0 {
+                    CellWidth::Wide
+                } else {
+                    CellWidth::Narrow
+                },
+                ..Cell::default()
+            })
+            .collect();
+        cache.prepare_frame(&cells, &[]).unwrap();
+        assert!(
+            cache.atlas_size > 32,
+            "fixture must exhaust the initial atlas"
+        );
+        let size = cache.atlas_size;
+        let rects: Vec<_> = cells
+            .iter()
+            .map(|cell| {
+                let rect = cache.entries[&GlyphKey::from(cell)].1;
+                (rect.x, rect.y, rect.w, rect.h)
+            })
+            .collect();
+        // A redraw must keep every cluster, not repeatedly omit the same suffix.
+        cache.prepare_frame(&cells, &[]).unwrap();
+        assert_eq!(cache.atlas_size, size);
+        assert_eq!(cache.entries.len(), cells.len());
+        for (cell, expected) in cells.iter().zip(rects) {
+            let rect = cache.get_or_rasterize(&GlyphKey::from(cell)).unwrap();
+            assert_eq!((rect.x, rect.y, rect.w, rect.h), expected);
+        }
+    }
+
+    #[test]
+    fn gamma_ratios_match_directwrite_default() {
+        let actual = gamma_ratios(1.8);
+        let expected = [0.148054421, -0.894594550, 1.47590804, -0.324668258];
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 0.000_001);
+        }
+    }
+
+    #[test]
+    fn atlas_keys_distinguish_clusters_widths_and_styles() {
+        let base = GlyphKey {
+            codepoint: 'e' as u32,
+            grapheme: None,
+            wide: false,
+            bold: false,
+            italic: false,
+        };
+        let variants = [
+            base.clone(),
+            GlyphKey {
+                grapheme: Some("e\u{301}".into()),
+                ..base.clone()
+            },
+            GlyphKey {
+                grapheme: Some("e\u{300}".into()),
+                ..base.clone()
+            },
+            GlyphKey {
+                wide: true,
+                ..base.clone()
+            },
+            GlyphKey {
+                bold: true,
+                ..base.clone()
+            },
+            GlyphKey {
+                italic: true,
+                ..base
+            },
+        ];
+        let entries: std::collections::HashMap<_, _> = variants
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| (key, index))
+            .collect();
+        assert_eq!(entries.len(), 6);
+        // Independently allocated strings must hit the same cached entry.
+        let key = GlyphKey {
+            codepoint: 'e' as u32,
+            grapheme: Some(String::from("e\u{301}").into()),
+            wide: false,
+            bold: false,
+            italic: false,
+        };
+        assert_eq!(entries.get(&key), Some(&1));
     }
 
     #[test]

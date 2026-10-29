@@ -6,6 +6,9 @@ impl ConWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Reevaluate activity animation on both activation and deactivation,
+        // including when a modal prevents keyboard-focus restoration.
+        cx.notify();
         if !window.is_window_active() || self.is_modal_open(cx) {
             return;
         }
@@ -67,6 +70,11 @@ impl ConWorkspace {
     }
 
     pub(super) fn quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        self.prepare_app_exit(cx);
+        cx.quit();
+    }
+
+    pub(super) fn prepare_app_exit(&mut self, cx: &mut Context<Self>) {
         self.cancel_all_sessions();
         self.flush_session_save(cx);
         // Tear down ghostty surfaces before app exit to avoid Metal/NSView crashes.
@@ -79,7 +87,6 @@ impl ConWorkspace {
             }
         }
         self.tabs.clear();
-        cx.quit();
     }
 
     pub(super) fn focus_input(
@@ -100,6 +107,45 @@ impl ConWorkspace {
         self.focus_preferred_input_surface(window, cx);
     }
 
+    /// Send the focused terminal's selection to the agent input.
+    ///
+    /// Grabs the current selection (if any), routes it to the preferred
+    /// input surface (input bar in Agent mode, or the agent panel's inline
+    /// input when the bar is hidden), and focuses that input so the user
+    /// can type their question immediately. Without a selection this still
+    /// focuses the agent input, so the shortcut doubles as "ask AI".
+    pub(super) fn ask_ai(&mut self, _: &AskAi, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_modal_open(cx) {
+            return;
+        }
+
+        let selection = self
+            .has_active_tab()
+            .then(|| {
+                self.tabs[self.active_tab]
+                    .pane_tree
+                    .try_visible_focus_terminal()
+                    .and_then(|(_, terminal)| terminal.selection_text(cx))
+            })
+            .flatten()
+            .map(|text| text.trim_end().to_string())
+            .filter(|text| !text.is_empty());
+
+        if !self.input_bar_visible && self.agent_panel_open {
+            let inserted = self.agent_panel.update(cx, |panel, cx| {
+                panel.ask_ai_with_context(selection.as_deref(), window, cx)
+            });
+            if inserted {
+                return;
+            }
+        }
+
+        self.focus_input_bar_surface(window, cx);
+        self.input_bar.update(cx, |bar, cx| {
+            bar.ask_ai_with_context(selection.as_deref(), window, cx);
+        });
+    }
+
     pub(super) fn is_input_surface_focused(&self, window: &Window, cx: &App) -> bool {
         let input_bar_focused =
             self.input_bar_visible && self.input_bar.focus_handle(cx).is_focused(window);
@@ -117,16 +163,14 @@ impl ConWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.input_bar_visible {
-            if self.agent_panel_open {
-                let focused_inline = self
-                    .agent_panel
-                    .update(cx, |panel, cx| panel.focus_inline_input(window, cx));
-                if !focused_inline {
-                    self.focus_agent_inline_input_next_frame(window, cx);
-                }
-                return;
+        if !self.input_bar_visible && self.agent_panel_open {
+            let focused_inline = self
+                .agent_panel
+                .update(cx, |panel, cx| panel.focus_inline_input(window, cx));
+            if !focused_inline {
+                self.focus_agent_inline_input_next_frame(window, cx);
             }
+            return;
         }
         self.focus_input_bar_surface(window, cx);
     }
@@ -136,12 +180,7 @@ impl ConWorkspace {
             self.input_bar_visible = true;
             self.save_session(cx);
         }
-        let duration = Self::terminal_adjacent_chrome_duration(true, 180, 180);
-        #[cfg(target_os = "macos")]
-        if duration.is_zero() {
-            self.arm_input_bar_snap_guard(cx);
-        }
-        self.input_bar_motion.set_target(1.0, duration);
+        self.input_bar_motion.set_target(1.0);
         self.input_bar.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
@@ -199,6 +238,7 @@ impl ConWorkspace {
         // repeated key-down events while modifiers are held should focus the
         // palette, not close it and strand focus.
         self.command_palette.update(cx, |palette, cx| {
+            palette.set_handoff_enabled(self.config.experimental.handoff);
             palette.show(window, cx);
         });
         cx.notify();
@@ -227,13 +267,7 @@ impl ConWorkspace {
         let opened_panel_for_window = opened_panel.clone();
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(920.0), px(680.0)), cx)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Settings".into()),
-                // Match the main macOS window: the system owns the traffic
-                // lights, while Con paints the titlebar surface itself.
-                appears_transparent: cfg!(target_os = "macos"),
-                ..Default::default()
-            }),
+            titlebar: Some(crate::settings_panel::settings_titlebar_options()),
             window_background: WindowBackgroundAppearance::Opaque,
             ..Default::default()
         };
@@ -260,11 +294,10 @@ impl ConWorkspace {
 
             let workspace_for_theme = workspace.clone();
             let main_window_for_theme = main_window;
-            cx.subscribe(&panel, move |_settings, event: &ThemePreview, cx| {
-                let theme_name = event.0.clone();
+            cx.subscribe(&panel, move |settings, event: &ThemePreview, cx| {
                 let _ = main_window_for_theme.update(cx, |_, window, cx| {
                     let _ = workspace_for_theme.update(cx, |workspace, cx| {
-                        workspace.apply_theme_preview(&theme_name, window, cx);
+                        workspace.on_theme_preview(&settings, event, window, cx);
                     });
                 });
             })
@@ -284,9 +317,9 @@ impl ConWorkspace {
             let panel_for_close = panel.clone();
             let workspace_for_close = workspace.clone();
             let main_window_for_close = main_window;
-            settings_window.on_window_should_close(cx, move |window, cx| {
-                let should_close = panel_for_close
-                    .update(cx, |panel, cx| panel.request_standalone_close(window, cx));
+            settings_window.on_window_should_close(cx, move |_window, cx| {
+                let should_close =
+                    panel_for_close.update(cx, |panel, cx| panel.approve_native_close(cx));
 
                 if should_close {
                     let _ = main_window_for_close.update(cx, |_, _window, cx| {
@@ -351,7 +384,9 @@ impl ConWorkspace {
                     .and_then(|terminal| terminal.current_dir(cx))
             })
             .flatten();
-        let config = con_core::Config::load().unwrap_or_default();
+        let Some(config) = crate::load_config_for_new_window(cx) else {
+            return;
+        };
         let session = crate::fresh_window_session_with_history_for_cwd(
             cwd.as_deref().map(std::path::PathBuf::from),
         );
@@ -375,6 +410,7 @@ impl ConWorkspace {
             user_label: None,
             ai_label: None,
             ai_icon: None,
+            agent_cli: None,
             color: None,
             summary_id,
             summary_epoch: 0,
@@ -387,14 +423,12 @@ impl ConWorkspace {
             shell_history: HashMap::new(),
         });
 
-        if self.sync_tab_strip_motion() {
-            #[cfg(target_os = "macos")]
-            self.arm_top_chrome_snap_guard(cx);
-            if Self::should_defer_top_chrome_refresh_when_tab_strip_appears() {
-                cx.on_next_frame(window, |_, _, cx| {
-                    cx.notify();
-                });
-            }
+        if self.sync_tab_strip_motion()
+            && Self::should_defer_top_chrome_refresh_when_tab_strip_appears()
+        {
+            cx.on_next_frame(window, |_, _, cx| {
+                cx.notify();
+            });
         }
 
         let new_index = self.tabs.len() - 1;
@@ -496,9 +530,9 @@ impl ConWorkspace {
                 self.workspace_focus.clone().focus(window, cx);
             }
             self.sync_active_terminal_focus_states(cx);
-            cx.on_next_frame(window, move |_workspace, _window, cx| {
+            cx.on_next_frame(window, move |_workspace, window, cx| {
                 for terminal in &closing_terminals {
-                    terminal.shutdown_surface(cx);
+                    terminal.shutdown_surface(Some(&mut *window), cx);
                 }
                 for terminal in &surviving_terminals {
                     terminal.notify(cx);
@@ -526,6 +560,17 @@ impl ConWorkspace {
                 return;
             }
 
+            if !self.config.appearance.close_to_quit {
+                // Keep the window open: create a fresh tab, then close the
+                // old one. Creating the new tab first lets it inherit the
+                // current working directory before the old terminal is torn
+                // down. After new_tab we have two tabs (old at 0, new at 1),
+                // so the recursive close takes the normal multi-tab path.
+                self.new_tab(&NewTab, window, cx);
+                self.close_tab_by_index(0, window, cx);
+                return;
+            }
+
             self.close_window_from_last_tab(window, cx);
             return;
         }
@@ -535,6 +580,21 @@ impl ConWorkspace {
             .into_iter()
             .cloned()
             .collect();
+        if self.config.appearance.tabs_orientation == TabsOrientation::Horizontal
+            && self.tabs.len() > 2
+            && !cx.reduce_motion()
+        {
+            let presentation = self.sidebar.read(cx).session(index);
+            self.tab_slot_motion.depart(
+                self.tabs[index].summary_id,
+                presentation.map_or_else(
+                    || self.tabs[index].title.clone(),
+                    |entry| entry.name.clone(),
+                ),
+                presentation.map_or("phosphor/terminal.svg", |entry| entry.icon),
+                std::time::Instant::now(),
+            );
+        }
         // Save the closing tab's conversation
         {
             let conv = self.tabs[index].session.conversation();
@@ -549,10 +609,7 @@ impl ConWorkspace {
         // assigned the same summary_id (which won't happen, since
         // ids are monotonic) doesn't inherit stale state.
         self.tab_summary_engine.forget(removed.summary_id);
-        if self.sync_tab_strip_motion() {
-            #[cfg(target_os = "macos")]
-            self.arm_top_chrome_snap_guard(cx);
-        }
+        self.sync_tab_strip_motion();
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         } else if self.active_tab > index {
@@ -573,9 +630,9 @@ impl ConWorkspace {
             terminal.ensure_surface(window, cx);
         }
         self.sync_active_tab_native_view_visibility(cx);
-        cx.on_next_frame(window, move |_workspace, _window, cx| {
+        cx.on_next_frame(window, move |_workspace, window, cx| {
             for terminal in &closing_terminals {
-                terminal.shutdown_surface(cx);
+                terminal.shutdown_surface(Some(&mut *window), cx);
             }
         });
         let focused = self.tabs[self.active_tab].pane_tree.try_focused_terminal();
@@ -643,6 +700,17 @@ impl ConWorkspace {
 
         self.cancel_all_sessions();
         self.flush_session_save(cx);
+        // Restore the saved Dock image only if a Settings panel in this
+        // window last applied the preview. Matching on icon id would let
+        // closing one window cancel another window's identical preview.
+        self.settings_panel.update(cx, |panel, cx| {
+            panel.release_icon_preview(cx);
+        });
+        if let Some(panel) = self.settings_window_panel.clone() {
+            panel.update(cx, |panel, cx| {
+                panel.release_icon_preview(cx);
+            });
+        }
 
         if let Some(settings_window) = self.settings_window.take() {
             self.settings_window_panel = None;
@@ -701,7 +769,9 @@ impl ConWorkspace {
             let _ = conv.lock().save();
 
             for terminal in tab.pane_tree.all_surface_terminals() {
-                terminal.shutdown_surface(cx);
+                // The platform window is already closing and will release its
+                // sprite atlas; no current Window handle is available here.
+                terminal.shutdown_surface(None, cx);
             }
         }
     }

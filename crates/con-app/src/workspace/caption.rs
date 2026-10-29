@@ -8,6 +8,7 @@ pub(super) fn terminal_separator_over_backdrop(backdrop: Hsla, theme: &Theme) ->
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep existing production item ordering.
 mod tests {
     use super::*;
 
@@ -88,7 +89,7 @@ pub(super) fn max_sidebar_panel_width(window_width: f32, agent_panel_outer_width
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(super) fn caption_buttons(
     window: &Window,
-    theme: &gpui_component::theme::ThemeColor,
+    theme: &Theme,
     height: f32,
     // Linux Close needs a workspace handle so it can call
     // `prepare_window_close` (cancel sessions, flush state, drop
@@ -149,7 +150,7 @@ pub(super) fn caption_buttons(
             .child(
                 svg()
                     .path(icon)
-                    .size(px(10.0))
+                    .size(ui_icon_px(theme, 10.0))
                     .text_color(fg)
                     .group_hover(id, move |s| s.text_color(hover_fg)),
             );

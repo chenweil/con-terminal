@@ -39,9 +39,11 @@ con-ghostty.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
-gpui-component-assets.workspace = true
+gpui-kit-assets.workspace = true
+reqwest_client.workspace = true
 anyhow.workspace = true
 log.workspace = true
+ttf-parser = "0.25"
 env_logger.workspace = true
 tracing = { version = "0.1", features = ["log"] }
 crossbeam-channel.workspace = true
@@ -49,19 +51,24 @@ parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+notify.workspace = true
 tokio.workspace = true
 uuid.workspace = true
-toml.workspace = true
 rust-embed.workspace = true
 dirs.workspace = true
 chrono.workspace = true
 reqwest.workspace = true
 url.workspace = true
+webbrowser = "1.2.4"
 markdown = { version = "1.0.0", features = ["serde"] }
+html5ever.workspace = true
+markup5ever_rcdom.workspace = true
 ropey.workspace = true
 mermaid-rs-renderer.workspace = true
 mathjax-svg-rs.workspace = true
 regex = "1"
+imagesize = "0.13"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "=0.26.0"
@@ -77,29 +84,43 @@ windows = { version = "0.61", features = [
     "Win32_System_Kernel",             # EXCEPTION_POINTERS definition
     "Win32_System_Pipes",              # WaitNamedPipeW
     "Win32_Graphics_Dwm",              # DwmSetWindowAttribute — Mica/Acrylic backdrop
+    "Win32_Graphics_Gdi",              # WNDCLASSW for accessibility settings listener
+    "Win32_UI_WindowsAndMessaging",     # FlashWindowEx for terminal notifications
 ] }
-# Used only by the Windows `GhosttyView` to wrap D3D11-readback BGRA into
-# a GPUI `RenderImage` (GPUI's `RenderImage::new` takes a
-# `SmallVec<[image::Frame; 1]>` and it does not re-export either crate).
-image = { version = "0.25", default-features = false }
+# Windows GhosttyView wraps D3D11-readback BGRA frames in a GPUI RenderImage.
 smallvec = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
 unicode-width.workspace = true
 x11rb = "0.13.2"
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "notification"] }
+# Linux wraps shared libghostty-vt Kitty RGBA snapshots in GPUI
+# `RenderImage`s, whose constructor exposes these concrete crate types.
+smallvec = "1"
+fontdb = "0.23"
 
 [target.'cfg(unix)'.dependencies]
 socket2 = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+# Exercise the same multi-resolution encoder used by the Windows build script.
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+# Layout tests use gpui's visual test harness (debug_bounds, TestAppContext).
+gpui = { workspace = true, features = ["test-support"] }
+# Inspect the theme projection consumed by the component library's primitives.
+gpui-base = "=0.7.0"
 
 [build-dependencies]
 cc = "1"
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 
 [package.metadata.bundle]
-icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
+icon = ["../../assets/app-icons/con-raccoon-tail-A6.png"]
 identifier = "co.nowledge.con"
 name = "con"
 osx_minimum_system_version = "10.15.7"

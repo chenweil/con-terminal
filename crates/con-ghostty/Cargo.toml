@@ -6,11 +6,18 @@ version.workspace = true
 build = "build.rs"
 
 [dependencies]
+con-paths.workspace = true
+con-process.workspace = true
+con-terminal.workspace = true
 anyhow.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 
 [build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+serde_json.workspace = true
 cc = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -20,10 +27,12 @@ dispatch = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 serde_json.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Win32 API surface for the Windows terminal backend (Phase 3).
 # See docs/impl/windows-port.md for the staged plan.
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",             # User locale for regional CJK glyph fallback
     "Win32_System_Console",             # ConPTY: CreatePseudoConsole etc.
     "Win32_System_Threading",           # CreateProcessW, STARTUPINFOEXW
     "Win32_System_Pipes",               # CreatePipe (ConPTY I/O)
@@ -54,9 +63,11 @@ raw-window-handle = "0.6"
 # Skyline/shelf glyph-atlas packer. Same crate WebRender uses in
 # production; adopted by glyphon and several wgpu text renderers.
 etagere = "0.2"
-# Keep Windows glyph atlas slot width aligned with Unicode terminal
-# column width instead of maintaining a local East Asian Width table.
-unicode-width.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
 portable-pty = "0.9"
+serde_json.workspace = true
+shell-words = "1.1"
+uuid.workspace = true

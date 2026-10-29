@@ -4,6 +4,7 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, input::Input};
 
 use crate::motion::{MotionValue, vertical_reveal_offset};
+use crate::ui_scale::ui_icon_px;
 
 actions!(command_palette, [ToggleCommandPalette]);
 
@@ -61,6 +62,13 @@ const CLOSE_SURFACE_SHORTCUT: &str = "secondary-alt-shift-w";
 const CLOSE_SURFACE_SHORTCUT: &str = "alt-shift-x";
 
 const PALETTE_ACTIONS: &[PaletteAction] = &[
+    #[cfg(target_os = "macos")]
+    PaletteAction {
+        id: "handoff-agent",
+        label: "Handoff Agent…",
+        shortcut: "",
+        category: "Agent",
+    },
     PaletteAction {
         id: "new-window",
         label: "New Window",
@@ -127,6 +135,13 @@ const PALETTE_ACTIONS: &[PaletteAction] = &[
         id: "clear-terminal",
         label: "Clear Terminal",
         shortcut: "secondary-k",
+        category: "Terminal",
+    },
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    PaletteAction {
+        id: "find-in-terminal",
+        label: "Find in Terminal",
+        shortcut: "",
         category: "Terminal",
     },
     PaletteAction {
@@ -280,6 +295,7 @@ pub struct CommandPalette {
     scroll_handle: ScrollHandle,
     ui_opacity: f32,
     overlay_motion: MotionValue,
+    handoff_enabled: bool,
 }
 
 /// Emitted when the user selects an action
@@ -311,7 +327,14 @@ impl CommandPalette {
             scroll_handle: ScrollHandle::new(),
             ui_opacity: 0.90,
             overlay_motion: MotionValue::new(0.0),
+            handoff_enabled: true,
         }
+    }
+
+    /// Gate the experimental Handoff entry; the workspace refreshes this from
+    /// config every time the palette opens.
+    pub fn set_handoff_enabled(&mut self, enabled: bool) {
+        self.handoff_enabled = enabled;
     }
 
     pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -364,12 +387,15 @@ impl CommandPalette {
     }
 
     fn filtered_actions(&self) -> Vec<&PaletteAction> {
+        let handoff_enabled = self.handoff_enabled;
+        let available = |action: &&PaletteAction| handoff_enabled || action.id != "handoff-agent";
         if self.query_text.is_empty() {
-            return PALETTE_ACTIONS.iter().collect();
+            return PALETTE_ACTIONS.iter().filter(available).collect();
         }
         let query = self.query_text.to_lowercase();
         PALETTE_ACTIONS
             .iter()
+            .filter(available)
             .filter(|a| {
                 a.label.to_lowercase().contains(&query)
                     || a.category.to_lowercase().contains(&query)
@@ -379,6 +405,9 @@ impl CommandPalette {
     }
 
     fn select_action(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
         let actions = self.filtered_actions();
         if let Some(action) = actions.get(self.selected_index) {
             let id = action.id.to_string();
@@ -397,9 +426,22 @@ impl Focusable for CommandPalette {
     }
 }
 
+fn palette_results_height(action_count: usize, viewport_height: f32, top: f32) -> f32 {
+    const SEARCH_HEIGHT: f32 = 68.0;
+    const BOTTOM_INSET: f32 = 20.0;
+    const MAX_RESULTS_HEIGHT: f32 = 360.0;
+    let content_height = if action_count == 0 {
+        74.0
+    } else {
+        16.0 + action_count as f32 * 40.0
+    };
+    let available = (viewport_height - top - SEARCH_HEIGHT - BOTTOM_INSET).max(0.0);
+    content_height.min(MAX_RESULTS_HEIGHT).min(available)
+}
+
 impl Render for CommandPalette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let overlay_progress = self.overlay_motion.value(window);
+        let overlay_progress = self.overlay_motion.value(window, cx);
         if !self.visible && overlay_progress <= 0.001 {
             return div().id("palette-overlay");
         }
@@ -412,6 +454,7 @@ impl Render for CommandPalette {
             self.reveal_selected = true;
         }
         let actions = self.filtered_actions();
+        let action_count = actions.len();
         let selected = if !actions.is_empty() {
             self.selected_index.min(actions.len().saturating_sub(1))
         } else {
@@ -455,6 +498,8 @@ impl Render for CommandPalette {
             list_content = list_content.child(
                 div()
                     .id(SharedString::from(format!("palette-{}", action.id)))
+                    .role(Role::ListBoxOption)
+                    .aria_selected(is_selected)
                     .flex()
                     .items_center()
                     .justify_between()
@@ -562,10 +607,14 @@ impl Render for CommandPalette {
             self.reveal_selected = false;
         }
 
+        let viewport = window.viewport_size();
+        let top = (viewport.height.as_f32() * 0.08).clamp(12.0, 60.0);
+        let results_height = palette_results_height(action_count, viewport.height.as_f32(), top);
         let list = div()
+            .id("palette-results")
+            .role(Role::ListBox)
             .relative()
-            .max_h(px(360.0))
-            .min_h_0()
+            .h(px(results_height))
             .child(list_content)
             .vertical_scrollbar(&self.scroll_handle);
 
@@ -584,11 +633,12 @@ impl Render for CommandPalette {
 
         let card = div()
             .absolute()
-            .top(px(60.0))
+            .top(px(top))
             .left_0()
             .right_0()
             .mx_auto()
             .w(px(560.0))
+            .max_w((viewport.width - px(32.0)).max(px(0.0)))
             .rounded(px(16.0))
             .bg(theme.popover.opacity(self.ui_opacity))
             .opacity(overlay_progress)
@@ -600,32 +650,23 @@ impl Render for CommandPalette {
             .pt(vertical_reveal_offset(overlay_progress, 16.0))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                let actions = this.filtered_actions();
-                let count = actions.len();
+                let count = this.filtered_actions().len();
                 match event.keystroke.key.as_str() {
-                    "escape" => {
-                        this.dismiss(cx);
+                    "escape" => this.dismiss(cx),
+                    "enter" => this.select_action(cx),
+                    "up" if count > 0 => {
+                        this.selected_index = if this.selected_index == 0 {
+                            count - 1
+                        } else {
+                            this.selected_index - 1
+                        };
+                        this.reveal_selected = true;
+                        cx.notify();
                     }
-                    "enter" => {
-                        this.select_action(cx);
-                    }
-                    "up" => {
-                        if count > 0 {
-                            this.selected_index = if this.selected_index == 0 {
-                                count - 1
-                            } else {
-                                this.selected_index - 1
-                            };
-                            this.reveal_selected = true;
-                            cx.notify();
-                        }
-                    }
-                    "down" => {
-                        if count > 0 {
-                            this.selected_index = (this.selected_index + 1) % count;
-                            this.reveal_selected = true;
-                            cx.notify();
-                        }
+                    "down" if count > 0 => {
+                        this.selected_index = (this.selected_index + 1) % count;
+                        this.reveal_selected = true;
+                        cx.notify();
                     }
                     _ => {}
                 }
@@ -643,7 +684,7 @@ impl Render for CommandPalette {
                         .child(
                             svg()
                                 .path("phosphor/magnifying-glass.svg")
-                                .size(px(15.0))
+                                .size(ui_icon_px(theme, 15.0))
                                 .flex_shrink_0()
                                 .text_color(theme.muted_foreground.opacity(0.72)),
                         )
@@ -666,5 +707,93 @@ impl Render for CommandPalette {
             .size_full()
             .child(backdrop)
             .child(card)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use super::{
+        CommandPalette, PALETTE_ACTIONS, PaletteDismissed, PaletteSelect, palette_results_height,
+    };
+    use gpui::TestAppContext;
+
+    #[test]
+    fn results_have_a_definite_height_without_exceeding_the_viewport() {
+        assert_eq!(palette_results_height(40, 900.0, 60.0), 360.0);
+        assert_eq!(palette_results_height(1, 900.0, 60.0), 56.0);
+        assert_eq!(palette_results_height(0, 900.0, 60.0), 74.0);
+        assert_eq!(palette_results_height(40, 240.0, 20.0), 132.0);
+    }
+
+    #[gpui::test]
+    fn search_matches_category_and_action_id(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (palette, cx) = cx.add_window_view(CommandPalette::new);
+
+        palette.update(cx, |palette, _| {
+            palette.query_text = "privacy".into();
+            let matches = palette.filtered_actions();
+            assert_eq!(matches.len(), 1);
+            let action = matches[0];
+            assert_eq!(action.id, "clear-restored-terminal-history");
+            let action_id = action.id;
+
+            palette.query_text = "clear-restored-terminal-history".into();
+            assert_eq!(palette.filtered_actions()[0].id, action_id);
+        });
+    }
+
+    #[gpui::test]
+    fn keyboard_wraps_and_confirm_dispatches_once(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let selected = Rc::new(RefCell::new(Vec::new()));
+        let selected_for_event = selected.clone();
+        let (palette, cx) = cx.add_window_view(|window, cx| {
+            let mut palette = CommandPalette::new(window, cx);
+            palette.show(window, cx);
+            palette
+        });
+        cx.update(|_, cx| {
+            cx.subscribe(&palette, move |_, event: &PaletteSelect, _| {
+                selected_for_event
+                    .borrow_mut()
+                    .push(event.action_id.clone());
+            })
+            .detach();
+        });
+
+        cx.simulate_keystrokes("up enter enter");
+        cx.update(|_, cx| {
+            let expected = PALETTE_ACTIONS.last().unwrap().id;
+            assert_eq!(selected.borrow().as_slice(), &[expected]);
+            assert!(!palette.read(cx).visible);
+        });
+    }
+
+    #[gpui::test]
+    fn escape_dismisses_immediately_with_nonempty_query(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let dismissed = Rc::new(RefCell::new(0));
+        let dismissed_for_event = dismissed.clone();
+        let (palette, cx) = cx.add_window_view(|window, cx| {
+            let mut palette = CommandPalette::new(window, cx);
+            palette.show(window, cx);
+            palette
+        });
+        cx.update(|_, cx| {
+            cx.subscribe(&palette, move |_, _: &PaletteDismissed, _| {
+                *dismissed_for_event.borrow_mut() += 1;
+            })
+            .detach();
+        });
+
+        cx.simulate_input("settings");
+        cx.simulate_keystrokes("escape escape");
+        cx.update(|_, cx| {
+            assert!(!palette.read(cx).visible);
+            assert_eq!(*dismissed.borrow(), 1);
+        });
     }
 }

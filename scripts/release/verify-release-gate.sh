@@ -36,6 +36,7 @@ require_line() {
 
 tag="${1:?usage: verify-release-gate.sh <tag> <gh-pages-dir>}"
 pages_dir="${2:?usage: verify-release-gate.sh <tag> <gh-pages-dir>}"
+appcast_dir="${3:-$pages_dir/appcast}"
 repo="${GH_REPO:-${GITHUB_REPOSITORY:-}}"
 [[ -n "$repo" ]] || fail "GH_REPO or GITHUB_REPOSITORY is required"
 
@@ -68,8 +69,8 @@ required_assets=(
 
 log "checking release assets for $tag"
 release_json="$(gh release view "$tag" --json isDraft,assets)"
-is_draft="$(jq -r '.isDraft' <<<"$release_json")"
-[[ "$is_draft" == "true" ]] || fail "$tag is not a draft; refusing to run final gate"
+# Recovery after promotion must still validate the payload before publishing
+# feeds. A public release is not a reason to skip or reject those checks.
 
 for asset in "${required_assets[@]}"; do
   size="$(jq -r --arg name "$asset" '.assets[] | select(.name == $name) | .size' <<<"$release_json" | head -1)"
@@ -165,19 +166,19 @@ marketing_version="${version%%[-+]*}"
 
 log "checking appcasts for $channel"
 require_appcast \
-  "$pages_dir/appcast/${channel}-macos-arm64.xml" \
+  "$appcast_dir/${channel}-macos-arm64.xml" \
   "${mac_prefix}-${version}-macos-arm64.dmg" \
   "$marketing_version"
 require_appcast \
-  "$pages_dir/appcast/${channel}-macos-x86_64.xml" \
+  "$appcast_dir/${channel}-macos-x86_64.xml" \
   "${mac_prefix}-${version}-macos-x86_64.dmg" \
   "$marketing_version"
 require_appcast \
-  "$pages_dir/appcast/${channel}-linux-x86_64.xml" \
+  "$appcast_dir/${channel}-linux-x86_64.xml" \
   "con-${version}-linux-x86_64.tar.gz" \
   "$version"
 require_appcast \
-  "$pages_dir/appcast/${channel}-windows-x86_64.xml" \
+  "$appcast_dir/${channel}-windows-x86_64.xml" \
   "con-${version}-windows-x86_64.zip" \
   "$version"
 

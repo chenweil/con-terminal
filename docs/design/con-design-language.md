@@ -2,6 +2,9 @@
 
 ## Purpose
 
+Write the product name as `con` in user-facing labels and prose. Preserve
+third-party names, existing theme identifiers, file paths and code symbols.
+
 This document defines the design principles that should govern every prototype and implementation decision for **con**.
 
 It is the shortest version of the brief: what the product should feel like, what visual habits it should follow, and what it should avoid.
@@ -65,6 +68,30 @@ The goal is not to imitate any one reference. The goal is to produce a design la
 
 con is light-first (Flexoki Light default) but must excel in both themes.
 
+### Settings Layout
+
+- Navigation has its own quiet foreground-derived fill and a single 1px semantic
+  divider from the scrolling form. Selected navigation uses a neutral fill and
+  solid text, not an accent-colored marker.
+- Page headings, group headings and field labels share the same text inset.
+  Groups have a low-opacity neutral fill; indentation alone must not convey
+  hierarchy. Avoid nested containers for otherwise equivalent settings.
+- Input fields, selects and sliders share a trailing column (44% of the row's
+  inner width). Switches align to the trailing edge. Below 600px, labels and
+  controls stack and controls use the available width. Font-family selectors
+  retain a full-width layout and a wrapping selected-name readout.
+- Keep one content measure across sections, capped at 840px, and use rem-based
+  text insets so larger UI fonts preserve alignment. Headings use weight, not
+  extra indentation, to distinguish groups from fields.
+- These are shared GPUI layout rules, not changes to platform title bars,
+  native Settings close ownership, configuration saving or preview behavior.
+- App Icon and Agent Avatar use the same image-choice geometry and neutral
+  selected/hover fills. A selected check occupies a separate corner slot rather
+  than shifting the name. Image frames preserve aspect ratio; labels have room
+  for two lines. Icon-family headings do not add another text inset. Both
+  pickers use the size/scale-aware PNG preview cache instead of uploading the
+  full source image for a small thumbnail.
+
 ### Light Mode (Default) - Apple Style
 
 - **Base**: Pure white `#ffffff`
@@ -89,6 +116,41 @@ con is light-first (Flexoki Light default) but must excel in both themes.
 
 ### Key Rules
 
+- On transparent tab chrome, use solid foreground/muted foreground theme tokens
+  for readable titles and identity icons. Do not further fade those glyphs with
+  alpha; retain translucency on the surface instead.
+- Horizontal tabs share a lightly tinted tray. The selected inset surface
+  groups its identity icon and name, while resting tabs stay flat. Reveal close
+  in the same leading slot on hover without shifting the title. See
+  `docs/design/compact-tab-strip.md` for geometry and interaction constraints.
+- Apply the same rule throughout sidebar navigation, file trees and search,
+  including disclosure arrows, secondary paths and result line numbers.
+- The titlebar and sidebars share translucent chrome. The macOS bottom input
+  card uses the terminal's background color and opacity, with chrome only around
+  its perimeter. Its reserved height follows the same spring sample as its
+  reveal, so the native terminal expands during hiding rather than afterward.
+  The inset canvas and input card provide depth without shadows;
+  expanded vertical navigation takes ownership of the caption controls.
+  A single tab without sidebars keeps the original flush layout. See
+  `docs/design/workspace-depth.md` for geometry and native clipping. Other
+  platforms keep their flush panel layout and quiet foreground-derived fill
+  for terminal-facing 1px edges. On macOS, the canvas gutter replaces sidebar
+  rules; there is no rule beneath the titlebar. Decorative edges remain separate from
+  native presentation synchronization and transient seam covers. Window Chrome
+  controls this shared material; Terminal Glass controls terminal surfaces
+  independently. Do not use terminal opacity for some auxiliary regions and
+  UI opacity for others.
+- Show each tab once. Expanded vertical tabs use the full sidebar width, with
+  Files, Search and New Tab in a compact toolbar above the list. Compact tabs
+  live in the icon rail. Retain compact tab navigation beside Files/Search panels.
+- Title-bar action buttons share a 22px square, 6px rounding and centered
+  vertical placement within the current title-bar height. Use component Button
+  controls; neutral translucent fills distinguish open, hover and press states.
+  Open panels use solid foreground icons over a persistent neutral fill;
+  closed panels use quiet solid ink rather than accent-colored state markers.
+  Pointer activation must not
+  steal terminal focus or bubble into native title-bar dragging. Keep native
+  Windows/Linux caption buttons separate from this action row.
 - **No shadows** - Use opacity-based fills for elevation
 - **No borders by default** - Only for strong semantic separation
 - **Opacity-based system** - All neutrals derived from white/black with opacity
@@ -140,6 +202,70 @@ It should feel like the best place to do terminal-native work in the AI era.
 ---
 
 ## Core Principles
+
+### Vertical Tab Navigation
+
+- Compact tabs retain a 40px interaction target inside the 44px rail. Their
+  visible selection fill is a centered 32px square with 10px rounding, leaving
+  breathing room without making click or drag targets smaller.
+- Expanded navigation has no permanent left tool column and no redundant
+  "Tabs / count" heading. The mode control's tooltip includes the tab count.
+  Four 28px toolbar targets stay usable at the minimum 184px sidebar width.
+- Compact/expanded geometry shares the existing sidebar spring. Tool icons
+  move from the rail into the toolbar, and tab identities move up into the
+  full-width list. Mount one identity and one status marker per row, not two
+  overlaid navigators. Preserve the compact endpoint geometry so settling does
+  not jump. Respect Reduce Motion and retain outgoing rows during reversals.
+- Use the same cached bitmap identity catalog as horizontal tabs for built-in
+  terminal, code, file, remote, monitor and reader tabs. Keep third-party agent
+  logos intact. Compact busy tabs retain the icon inside a 24px animated ring;
+  expanded tabs use the same three-bar loader as horizontal tabs in the 16px
+  leading identity slot. Determinate compact progress retains the same ring
+  placement without spinning. Loading must not move the title or close control.
+  Attention, errors and completion retain the shared semantic status glyphs.
+- Selection is a low-opacity foreground fill, not a nearly opaque panel or
+  an accent stripe. Custom tab colors retain their existing semantics. Text
+  and SVG foregrounds remain solid to avoid rough edges on translucent chrome.
+- Expanded rows use a single-line 32px baseline with UI-font-aware growth.
+  System-font titles align with 16px identity icons. Keep the full directory
+  and program-status detail in the hover tooltip rather than repeating a
+  second line under every tab.
+- Expanded selection is a thin, borderless capsule inset 3px from the 32px
+  hit target. Give selection enough fill contrast to read in both themes,
+  without adding an outline or a second card around the row.
+  Centre the identity and the trailing close target vertically, including
+  at larger UI font sizes. Reserve only one trailing action slot so long
+  titles do not lose width to invisible controls. Use the same identity assets
+  in the sidebar drag preview.
+- Expanded tooltips and compact hover cards share one continuous rounded surface,
+  with a very slight neutral light falloff, no header slab, borders or shadows.
+  A single-pane detail groups the full name, application logo and graphical
+  state, followed by its explanation and working directory. A multi-pane card
+  shows one compact, spatially ordered row per physical pane: application icon,
+  meaningful task/context or application/folder name, its own state and directory.
+  Include editors by filename and parent directory. Do not substitute a pane
+  count or only the aggregate winner for this overview. Do not dump raw commands
+  or internal pane/surface numbers into it. Keep the stack on the tab itself.
+  Known activity uses the shared retained painter instead of prose status;
+  completion remains a notification dot and determinate progress retains its
+  percentage. Idle rows need no status glyph. Preserve exact accessibility labels.
+  Open cards follow every pane's retained facts, including non-winning changes;
+  use one retained activity layer for all rows and bound long lists by scrolling.
+  Paths wrap; prose uses the system font and paths use the mono font.
+  Keep timestamps and group headers out of default rows unless they represent
+  a feature with reliable source data and persistence semantics.
+- Close uses a hover-only component button with a small circular fill and thin
+  cross. Keep rename available through double-click and the context menu, and
+  preserve the existing tooltip,
+  keyboard, middle-click and drag-reorder behavior. Do not add animation or
+  terminal-state reads to style-only navigation updates.
+- Initialize horizontal-strip motion from both the restored tab count and
+  orientation, using the same visibility rule as later updates. Vertical tabs
+  must not leave an empty horizontal tray behind on cold startup. Keep the
+  horizontal multi-tab exit animation and pane-to-tab drag preview independent.
+- Set the UI font on tab navigation containers, not only their text labels:
+  deferred context menus inherit their trigger's text style. Keep directory
+  metadata and code explicitly monospace.
 
 ### 1. Terminal First
 
@@ -447,3 +573,32 @@ Used for context, categories, entities, filters.
 - Metadata row: 11px, very muted
 - Tags inline below description
 - Right-aligned actions (ratings, timestamps)
+
+## Command Bar Controls
+
+The bottom input bar retains its 44-point minimum height and shared density
+scaling. Mode, pane scope, and submission controls align on the same 28-point
+row. Input typography, multiline growth, completion overlays, and panel motion
+are independent of control styling.
+
+Skill completion in the command bar and inline agent input uses the same
+bounded component list. Keep names and one-line summaries in fixed-height rows;
+full descriptions belong in tooltips rather than expanding the menu. Keyboard
+selection must reveal the selected row, pointer selection must retain editor
+focus, and choosing a skill inserts text without submitting it. Publish newly
+scanned catalogs to both editors directly. Fit the borderless popup to the
+available viewport and keep its scroll area separate from its anchored frame.
+The scrollbar stays in the fixed frame; wheel and thumb dragging must both work
+without propagating into the underlying editor or choosing a candidate. A hidden
+editor must not leave its completion popup visible.
+
+Use quiet neutral fills for the mode and pane-target controls. Mode icons keep
+their semantic color; pane-target labels use the UI font and solid theme-derived
+ink rather than translucent glyphs. Both controls use component buttons and
+restore input focus after activation. Pane scope uses a bounded 96-point width
+at default density; long names truncate, with the full label and shortcut in
+the tooltip. Test its content bounds as well as the outer button's bounds.
+
+The circular submit control is the primary action: a neutral foreground fill
+with an inverse icon when input is ready, and a quiet disabled fill when empty.
+Changing modes must not move the text or change the submission hit target.

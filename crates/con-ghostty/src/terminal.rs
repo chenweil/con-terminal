@@ -12,7 +12,6 @@
 
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
-use std::io::Write;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -23,10 +22,16 @@ use std::time::Instant;
 use dispatch::Queue;
 use parking_lot::Mutex;
 
-use crate::ffi;
+use crate::program_events::{self, ProgramStatusEvent};
+use crate::{
+    CLIPBOARD_WRITE_LIMIT_BYTES, ClipboardWritePolicy, TERMINAL_PROGRESS_TIMEOUT, TerminalProgress,
+    clipboard_write_policy, ffi,
+};
 
 const DEFAULT_GHOSTTY_FONT_FAMILY: &str = "Ioskeley Mono";
-const CON_SHELL_INTEGRATION_FEATURES: &str = "no-cursor,ssh-env,ssh-terminfo";
+// Con does not ship Ghostty's `+ssh-cache` CLI helper. Do not advertise
+// `ssh-terminfo` until Con has an equivalent cache implementation.
+const CON_SHELL_INTEGRATION_FEATURES: &str = "no-cursor,ssh-env";
 
 fn sanitize_font_family_for_ghostty(font_family: &str) -> &str {
     let trimmed = font_family.trim();
@@ -46,6 +51,20 @@ pub struct TerminalColors {
     pub foreground: [u8; 3],
     pub background: [u8; 3],
     pub palette: [[u8; 3]; 16],
+}
+
+/// Effective values read back from Ghostty after parsing, includes, host
+/// policy overrides, and finalization have all run.
+#[derive(Debug, Clone)]
+pub struct NativeAppearance {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub palette: [[u8; 3]; 256],
+    pub font_size: f32,
+    pub background_opacity: f64,
+    /// Ghostty's i16 C representation: a nonnegative radius, or a negative
+    /// sentinel for a native-app Liquid Glass material.
+    pub background_blur: i16,
 }
 
 impl TerminalColors {
@@ -70,7 +89,9 @@ impl TerminalColors {
 #[derive(Debug, Clone, Default)]
 pub struct GhosttyConfigPatch {
     pub colors: Option<TerminalColors>,
+    pub shell: Option<String>,
     pub font_family: Option<String>,
+    pub font_fallback: Option<Vec<String>>,
     pub font_size: Option<f32>,
     pub background_opacity: Option<f32>,
     pub background_opacity_cells: Option<bool>,
@@ -81,6 +102,7 @@ pub struct GhosttyConfigPatch {
     pub background_image_position: Option<String>,
     pub background_image_fit: Option<String>,
     pub background_image_repeat: Option<bool>,
+    pub clipboard_write: Option<bool>,
 }
 
 impl GhosttyConfigPatch {
@@ -88,8 +110,14 @@ impl GhosttyConfigPatch {
         if let Some(colors) = &patch.colors {
             self.colors = Some(colors.clone());
         }
+        if let Some(shell) = &patch.shell {
+            self.shell = Some(shell.clone());
+        }
         if let Some(font_family) = &patch.font_family {
             self.font_family = Some(font_family.clone());
+        }
+        if let Some(font_fallback) = &patch.font_fallback {
+            self.font_fallback = Some(font_fallback.clone());
         }
         if let Some(font_size) = patch.font_size {
             self.font_size = Some(font_size);
@@ -121,17 +149,55 @@ impl GhosttyConfigPatch {
         if let Some(background_image_repeat) = patch.background_image_repeat {
             self.background_image_repeat = Some(background_image_repeat);
         }
+        if let Some(clipboard_write) = patch.clipboard_write {
+            self.clipboard_write = Some(clipboard_write);
+        }
     }
 
-    fn to_config_string(&self) -> String {
+    fn to_config_string(&self, include_host_policy: bool) -> Result<String, String> {
+        fn quoted(value: &str, field: &str) -> Result<String, String> {
+            if value.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+                return Err(format!("{field} contains a forbidden control character"));
+            }
+            // Ghostty's config lexer treats quoted values literally; unlike Rust's
+            // Debug formatter it does not interpret backslash escape sequences.
+            Ok(format!("\"{value}\""))
+        }
         let mut s = String::with_capacity(512);
         if let Some(colors) = &self.colors {
             colors.append_config(&mut s);
         }
+        if let Some(shell) = &self.shell {
+            s.push_str(&format!("command = {}\n", quoted(shell, "command")?));
+        }
         if let Some(font_family) = &self.font_family {
             let font_family = sanitize_font_family_for_ghostty(font_family);
             s.push_str("font-family = \"\"\n");
-            s.push_str(&format!("font-family = {:?}\n", font_family));
+            s.push_str(&format!(
+                "font-family = {}\n",
+                quoted(font_family, "font family")?
+            ));
+            let primary_is_bundled = font_family.eq_ignore_ascii_case(DEFAULT_GHOSTTY_FONT_FAMILY);
+            if let Some(font_fallback) = &self.font_fallback {
+                for family in font_fallback {
+                    let family = sanitize_font_family_for_ghostty(family);
+                    if family.eq_ignore_ascii_case(DEFAULT_GHOSTTY_FONT_FAMILY) {
+                        continue;
+                    }
+                    if !family.eq_ignore_ascii_case(font_family) {
+                        s.push_str(&format!(
+                            "font-family = {}\n",
+                            quoted(family, "font fallback")?
+                        ));
+                    }
+                }
+            }
+            if !primary_is_bundled {
+                s.push_str(&format!(
+                    "font-family = {}\n",
+                    quoted(DEFAULT_GHOSTTY_FONT_FAMILY, "bundled font")?
+                ));
+            }
         }
         if let Some(font_size) = self.font_size {
             s.push_str(&format!("font-size = {:.2}\n", font_size));
@@ -153,19 +219,57 @@ impl GhosttyConfigPatch {
         }
         if let Some(cursor_style) = &self.cursor_style {
             s.push_str(&format!("cursor-style = {}\n", cursor_style));
-            s.push_str("cursor-color = cell-foreground\n");
-            s.push_str("cursor-text = cell-background\n");
         }
-        // Disable ghostty shell-integration cursor override so con's
-        // cursor-style setting is respected. Ghostty's integration
-        // unconditionally forces a bar cursor at prompts otherwise.
-        // Enable ssh-env and ssh-terminfo so Ghostty's shell integration
-        // auto-installs xterm-ghostty terminfo on remote SSH hosts.
-        s.push_str("shell-integration-features = ");
-        s.push_str(CON_SHELL_INTEGRATION_FEATURES);
-        s.push('\n');
+        if !include_host_policy && let Some(enabled) = self.clipboard_write {
+            s.push_str(if enabled {
+                "clipboard-write = allow\n"
+            } else {
+                "clipboard-write = deny\n"
+            });
+        }
+        if include_host_policy {
+            // Disable ghostty shell-integration cursor override so con's
+            // cursor-style setting is respected. Ghostty's integration
+            // unconditionally forces a bar cursor at prompts otherwise.
+            // Keep ssh-env compatibility. ssh-terminfo is intentionally omitted:
+            // Ghostty's shell integration would invoke a missing
+            // `ghostty +ssh-cache` helper from Con's app bundle.
+            s.push_str("shell-integration-features = ");
+            s.push_str(CON_SHELL_INTEGRATION_FEATURES);
+            s.push('\n');
+            // Plain links already display their target as terminal text. Restrict
+            // host-side previews to OSC 8, whose visible label can differ from the
+            // producer-controlled URI and therefore needs an explicit preview.
+            s.push_str("link-previews = osc8\n");
+            // Ghostty routes its own copy-on-select through the same
+            // `write_clipboard` callback as OSC 52, and `write_clipboard_callback`
+            // gates that callback by the clipboard-write setting. A user gesture
+            // must not depend on that setting, so `ghostty_view.rs` copies the
+            // selection on left release and Ghostty's variant stays off. Middle
+            // clicks are never forwarded to Ghostty (the host view only wires
+            // left/right), so pin `ignore` rather than inherit a default that
+            // Ghostty 1.4 (ghostty-org/ghostty#12604) already flipped once.
+            s.push_str("copy-on-select = none\n");
+            s.push_str("middle-click-action = ignore\n");
+            // No clipboard-read permission UI exists yet. Reject application reads
+            // before accessing NSPasteboard; user-initiated paste is independent.
+            s.push_str("clipboard-read = deny\n");
+            // `true` is the host default, not permission to upgrade an authored deny.
+            // Only an explicit host denial is policy and must be emitted last.
+            if self.clipboard_write == Some(false) {
+                s.push_str("clipboard-write = deny\n");
+                s.push_str("clipboard-write-limit-bytes = 0\n");
+            } else {
+                s.push_str(&format!(
+                    "clipboard-write-limit-bytes = {CLIPBOARD_WRITE_LIMIT_BYTES}\n"
+                ));
+            }
+        }
         if let Some(background_image) = &self.background_image {
-            s.push_str(&format!("background-image = {:?}\n", background_image));
+            s.push_str(&format!(
+                "background-image = {}\n",
+                quoted(background_image, "background image")?
+            ));
             if let Some(background_image_opacity) = self.background_image_opacity {
                 s.push_str(&format!(
                     "background-image-opacity = {:.2}\n",
@@ -191,36 +295,225 @@ impl GhosttyConfigPatch {
                 ));
             }
         }
-        s
-    }
-
-    fn write_config_file(&self) -> Result<std::path::PathBuf, String> {
-        let dir = std::env::temp_dir().join("con-ghostty");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {}", e))?;
-        let path = dir.join("runtime.conf");
-        let mut f = std::fs::File::create(&path).map_err(|e| format!("create: {}", e))?;
-        f.write_all(self.to_config_string().as_bytes())
-            .map_err(|e| format!("write: {}", e))?;
-        Ok(path)
+        Ok(s)
     }
 }
 
-fn build_ghostty_config(patch: &GhosttyConfigPatch) -> Result<ffi::ghostty_config_t, String> {
+#[derive(Debug, Clone)]
+struct NativeConfigSource {
+    text: String,
+    base_dir: PathBuf,
+}
+
+struct OwnedGhosttyConfig(ffi::ghostty_config_t);
+
+impl Drop for OwnedGhosttyConfig {
+    fn drop(&mut self) {
+        unsafe { ffi::ghostty_config_free(self.0) }
+    }
+}
+
+struct PrivateConfigFile(PathBuf);
+
+impl PrivateConfigFile {
+    fn create(base_dir: &Path, text: &str) -> Result<Self, String> {
+        if !base_dir.is_absolute() {
+            return Err("native Ghostty config base directory must be absolute".into());
+        }
+        if !base_dir.is_dir() {
+            return Err(format!(
+                "native Ghostty config base directory does not exist: {}",
+                base_dir.display()
+            ));
+        }
+        for attempt in 0..32u32 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = base_dir.join(format!(
+                ".con-ghostty-{}-{nonce}-{attempt}.conf",
+                std::process::id()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(error) = file.write_all(text.as_bytes()) {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(format!(
+                            "write native Ghostty config in {}: {error}",
+                            base_dir.display()
+                        ));
+                    }
+                    return Ok(Self(path));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "create private native Ghostty config in {}: {error}",
+                        base_dir.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "could not allocate private native Ghostty config in {}",
+            base_dir.display()
+        ))
+    }
+}
+
+impl Drop for PrivateConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn build_ghostty_config(
+    defaults: &GhosttyConfigPatch,
+    source: Option<&NativeConfigSource>,
+    overrides: &GhosttyConfigPatch,
+) -> Result<OwnedGhosttyConfig, String> {
     let config = unsafe { ffi::ghostty_config_new() };
     if config.is_null() {
         return Err("ghostty_config_new returned null".into());
     }
-
-    // Always load Con's runtime config, even when no appearance patch fields
-    // are present. Some terminal behavior is part of Con's product default
-    // rather than a user patch, most notably shell integration features.
-    let path = patch.write_config_file()?;
-    let path_str = path.to_str().ok_or("non-UTF8 path")?;
-    let cpath = CString::new(path_str).map_err(|e| format!("CString: {}", e))?;
-    unsafe { ffi::ghostty_config_load_file(config, cpath.as_ptr()) };
-
+    let owned = OwnedGhosttyConfig(config);
+    let mut generated_paths = Vec::new();
+    let mut load =
+        |text: &str, dir: &Path, recursive: bool, label: &'static str| -> Result<(), String> {
+            if text.is_empty() {
+                return Ok(());
+            }
+            let file = PrivateConfigFile::create(dir, text)?;
+            let path = file
+                .0
+                .to_str()
+                .ok_or("native Ghostty config path is not UTF-8")?;
+            let cpath =
+                CString::new(path).map_err(|e| format!("native Ghostty config path: {e}"))?;
+            unsafe { ffi::ghostty_config_load_file(config, cpath.as_ptr()) };
+            if recursive {
+                unsafe { ffi::ghostty_config_load_recursive_files(config) };
+            }
+            generated_paths.push((path.to_owned(), label));
+            Ok(())
+        };
+    let runtime_dir = source
+        .map(|s| s.base_dir.as_path())
+        .unwrap_or_else(|| Path::new("/tmp"));
+    // Con's constructor values are fallbacks. Native source is then replayed,
+    // explicit runtime overrides follow it, and immutable host policy is last.
+    // Let alternate-screen programs carry their edge colors into fractional
+    // grid padding. Load as a default, never override an explicit native choice.
+    let defaults_text = format!(
+        "window-padding-color = extend\n{}",
+        defaults.to_config_string(false)?
+    );
+    load(&defaults_text, runtime_dir, false, "generated defaults")?;
+    if let Some(source) = source {
+        load(
+            &source.text,
+            &source.base_dir,
+            true,
+            "generated native configuration",
+        )?;
+    }
+    load(
+        &overrides.to_config_string(false)?,
+        runtime_dir,
+        false,
+        "generated runtime overrides",
+    )?;
+    let mut policy = GhosttyConfigPatch::default().to_config_string(true)?;
+    if source.is_some() && overrides.font_family.is_none() {
+        // Native font choices do not pass through the portable patch builder,
+        // which otherwise appends Con's bundled Nerd Font itself.
+        policy.push_str(&format!("font-family = {DEFAULT_GHOSTTY_FONT_FAMILY}\n"));
+    }
+    load(&policy, runtime_dir, false, "generated host policy")?;
     unsafe { ffi::ghostty_config_finalize(config) };
-    Ok(config)
+    let count = unsafe { ffi::ghostty_config_diagnostics_count(config) };
+    if count != 0 {
+        let mut error = format!("Ghostty configuration rejected with {count} diagnostic(s)");
+        for index in 0..count {
+            let diagnostic = unsafe { ffi::ghostty_config_get_diagnostic(config, index) };
+            // SAFETY: valid indices return NUL-terminated strings owned by
+            // `config`. Copy before `owned` drops; never free them separately.
+            let message = unsafe { CStr::from_ptr(diagnostic.message) }.to_string_lossy();
+            error.push('\n');
+            // Replace only the location prefix of our private files. Included
+            // paths and message contents retain their upstream provenance.
+            if let Some((label, location)) = generated_paths.iter().find_map(|(path, label)| {
+                message
+                    .strip_prefix(path)
+                    .filter(|rest| rest.starts_with(':'))
+                    .map(|rest| (*label, rest))
+            }) {
+                error.push_str(label);
+                error.push_str(location);
+            } else {
+                error.push_str(&message);
+            }
+        }
+        return Err(error);
+    }
+    Ok(owned)
+}
+
+/// Validate native Ghostty configuration without creating an app or shell.
+/// Relative includes and theme paths are resolved from `base_dir`.
+pub fn validate_native_config(
+    text: impl Into<String>,
+    base_dir: impl AsRef<Path>,
+) -> Result<NativeAppearance, String> {
+    ensure_ghostty_init()?;
+    let source = NativeConfigSource {
+        text: text.into(),
+        base_dir: base_dir.as_ref().to_path_buf(),
+    };
+    let config = build_ghostty_config(
+        &GhosttyConfigPatch::default(),
+        Some(&source),
+        &GhosttyConfigPatch::default(),
+    )?;
+    effective_appearance(config.0)
+}
+
+fn effective_appearance(config: ffi::ghostty_config_t) -> Result<NativeAppearance, String> {
+    unsafe fn get<T: Default>(config: ffi::ghostty_config_t, key: &str) -> Result<T, String> {
+        let mut value = T::default();
+        if unsafe {
+            ffi::ghostty_config_get(
+                config,
+                (&mut value as *mut T).cast(),
+                key.as_ptr().cast(),
+                key.len(),
+            )
+        } {
+            Ok(value)
+        } else {
+            Err(format!("Ghostty config does not expose {key}"))
+        }
+    }
+    let foreground: ffi::ghostty_config_color_s = unsafe { get(config, "foreground")? };
+    let background: ffi::ghostty_config_color_s = unsafe { get(config, "background")? };
+    let palette: ffi::ghostty_config_palette_s = unsafe { get(config, "palette")? };
+    Ok(NativeAppearance {
+        foreground: [foreground.r, foreground.g, foreground.b],
+        background: [background.r, background.g, background.b],
+        palette: palette.colors.map(|color| [color.r, color.g, color.b]),
+        font_size: unsafe { get(config, "font-size")? },
+        background_opacity: unsafe { get(config, "background-opacity")? },
+        background_blur: unsafe { get(config, "background-blur")? },
+    })
 }
 
 fn normalize_cursor_style(style: &str) -> &'static str {
@@ -267,7 +560,16 @@ pub enum GhosttySplitDirection {
 pub enum GhosttySurfaceEvent {
     SplitRequest(GhosttySplitDirection),
     OpenUrl(String),
+    /// An OSC 8 hyperlink was clicked. The URL is terminal-authored and must
+    /// be validated before it is opened.
+    OpenOsc8Url(String),
+    /// The OSC 8 hyperlink under the pointer changed (`None` = no link).
+    Osc8LinkHoverChanged(Option<String>),
     PwdChanged(String),
+    StartSearch(String),
+    EndSearch,
+    SearchTotal(Option<usize>),
+    SearchSelected(Option<usize>),
 }
 
 /// Terminal state received via ghostty action callbacks.
@@ -276,6 +578,9 @@ pub struct TerminalState {
     pub title: Option<String>,
     pub pwd: Option<String>,
     pub needs_render: bool,
+    pub bell_pending: bool,
+    pub progress: Option<TerminalProgress>,
+    pub progress_updated_at: Option<Instant>,
     pub child_exited: bool,
     /// Last exit code from COMMAND_FINISHED (persists across commands).
     pub last_exit_code: Option<i32>,
@@ -295,10 +600,22 @@ pub struct TerminalState {
     pub last_command_finished_input_generation: u64,
     /// Surface handle — stored so clipboard callbacks can complete requests.
     pub surface: ffi::ghostty_surface_t,
+    clipboard_write_policy: Arc<ClipboardWritePolicy>,
+    /// The pinned paste API invokes confirmation synchronously. A denied
+    /// request must not acknowledge a completed program's notification.
+    paste_denied: bool,
     /// Pending host-side events emitted by Ghostty actions for this surface.
     pub pending_events: VecDeque<GhosttySurfaceEvent>,
+    /// OSC 8 URI under the pointer. Ghostty reports it on every mouse move
+    /// while hovering; this lets us emit an event only when it changes.
+    hovered_osc8_link_url: Option<String>,
     /// Latest viewport scrollbar state emitted by Ghostty.
     pub scrollbar: Option<GhosttyScrollbar>,
+    /// Coalesced pointer updates, consumed on the UI thread. These are not
+    /// queued events: only the final shape/visibility in a tick matters.
+    pub mouse_shape: Option<i32>,
+    pub mouse_visible: Option<bool>,
+    program_events: program_events::ProgramStatusBuffer,
 }
 
 const MAX_COMMAND_HISTORY: usize = 20;
@@ -309,6 +626,9 @@ impl Default for TerminalState {
             title: None,
             pwd: None,
             needs_render: false,
+            bell_pending: false,
+            progress: None,
+            progress_updated_at: None,
             child_exited: false,
             last_exit_code: None,
             last_command_duration: None,
@@ -318,9 +638,30 @@ impl Default for TerminalState {
             input_generation: 0,
             last_command_finished_input_generation: 0,
             surface: std::ptr::null_mut(),
+            clipboard_write_policy: Arc::new(ClipboardWritePolicy::new(false)),
             pending_events: VecDeque::new(),
+            paste_denied: false,
+            hovered_osc8_link_url: None,
             scrollbar: None,
+            mouse_shape: None,
+            program_events: program_events::ProgramStatusBuffer::default(),
+            mouse_visible: None,
         }
+    }
+}
+
+impl TerminalState {
+    /// Records the OSC 8 link under the pointer and queues a hover event if
+    /// it differs from the previous one.
+    fn set_hovered_osc8_link(&mut self, url: Option<&str>) {
+        if self.hovered_osc8_link_url.as_deref() == url {
+            return;
+        }
+        self.hovered_osc8_link_url = url.map(str::to_owned);
+        self.pending_events
+            .push_back(GhosttySurfaceEvent::Osc8LinkHoverChanged(
+                self.hovered_osc8_link_url.clone(),
+            ));
     }
 }
 
@@ -440,7 +781,10 @@ pub struct GhosttyApp {
     app: ffi::ghostty_app_t,
     // Box prevents the runtime_config from being moved while ghostty holds a pointer.
     _runtime_config: Box<ffi::ghostty_runtime_config_s>,
-    appearance: Mutex<GhosttyConfigPatch>,
+    defaults: GhosttyConfigPatch,
+    overrides: Mutex<GhosttyConfigPatch>,
+    native_source: Mutex<Option<NativeConfigSource>>,
+    effective_appearance: Arc<Mutex<Option<NativeAppearance>>>,
     wake_handle: Arc<GhosttyWakeHandle>,
 }
 
@@ -448,6 +792,8 @@ struct GhosttyWakeHandle {
     app: AtomicPtr<c_void>,
     tick_scheduled: AtomicBool,
     generation: AtomicU64,
+    clipboard_write_policy: Arc<ClipboardWritePolicy>,
+    effective_appearance: Arc<Mutex<Option<NativeAppearance>>>,
 }
 
 impl Default for GhosttyWakeHandle {
@@ -456,15 +802,28 @@ impl Default for GhosttyWakeHandle {
             app: AtomicPtr::new(std::ptr::null_mut()),
             tick_scheduled: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            clipboard_write_policy: Arc::new(ClipboardWritePolicy::new(false)),
+            effective_appearance: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 impl GhosttyApp {
+    /// Validate native Ghostty configuration without creating an app or shell.
+    pub fn validate_native_config(
+        text: impl Into<String>,
+        base_dir: impl AsRef<Path>,
+    ) -> Result<NativeAppearance, String> {
+        validate_native_config(text, base_dir)
+    }
+
     /// Create a new ghostty app with the given terminal colors.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         colors: Option<&TerminalColors>,
+        shell: Option<&str>,
         font_family: Option<&str>,
+        font_fallback: Option<&[String]>,
         font_size: Option<f32>,
         background_opacity: Option<f32>,
         background_blur: Option<bool>,
@@ -474,12 +833,15 @@ impl GhosttyApp {
         background_image_position: Option<&str>,
         background_image_fit: Option<&str>,
         background_image_repeat: Option<bool>,
+        clipboard_write_enabled: bool,
     ) -> Result<Self, String> {
         ensure_ghostty_init()?;
 
         let appearance = GhosttyConfigPatch {
             colors: colors.cloned(),
+            shell: shell.map(ToOwned::to_owned),
             font_family: font_family.map(ToOwned::to_owned),
+            font_fallback: font_fallback.map(ToOwned::to_owned),
             font_size,
             background_opacity,
             background_opacity_cells: background_opacity.map(|opacity| opacity < 0.999),
@@ -492,10 +854,16 @@ impl GhosttyApp {
             background_image_position: background_image_position.map(ToOwned::to_owned),
             background_image_fit: background_image_fit.map(ToOwned::to_owned),
             background_image_repeat,
+            clipboard_write: Some(clipboard_write_enabled),
         };
-        let config = build_ghostty_config(&appearance)?;
+        let config = build_ghostty_config(&appearance, None, &GhosttyConfigPatch::default())?;
+        let effective_appearance = Arc::new(Mutex::new(Some(effective_appearance(config.0)?)));
 
-        let wake_handle = Arc::new(GhosttyWakeHandle::default());
+        let wake_handle = Arc::new(GhosttyWakeHandle {
+            clipboard_write_policy: clipboard_write_policy(clipboard_write_enabled),
+            effective_appearance: Arc::clone(&effective_appearance),
+            ..GhosttyWakeHandle::default()
+        });
         let runtime_config = Box::new(ffi::ghostty_runtime_config_s {
             userdata: Arc::as_ptr(&wake_handle) as *mut c_void,
             supports_selection_clipboard: false,
@@ -506,12 +874,11 @@ impl GhosttyApp {
             confirm_read_clipboard_cb: Some(confirm_read_clipboard_callback),
             write_clipboard_cb: Some(write_clipboard_callback),
             close_surface_cb: Some(close_surface_callback),
+            program_status: true,
+            program_status_cb: Some(program_status_callback),
         });
 
-        let app = unsafe { ffi::ghostty_app_new(&*runtime_config as *const _, config) };
-
-        // Ghostty clones the config — we must free the original.
-        unsafe { ffi::ghostty_config_free(config) };
+        let app = unsafe { ffi::ghostty_app_new(&*runtime_config as *const _, config.0) };
 
         if app.is_null() {
             return Err("ghostty_app_new returned null".into());
@@ -523,7 +890,10 @@ impl GhosttyApp {
         Ok(Self {
             app,
             _runtime_config: runtime_config,
-            appearance: Mutex::new(appearance),
+            defaults: appearance,
+            overrides: Mutex::new(GhosttyConfigPatch::default()),
+            native_source: Mutex::new(None),
+            effective_appearance,
             wake_handle,
         })
     }
@@ -544,34 +914,33 @@ impl GhosttyApp {
     /// Current configured terminal background, used by the embedding UI for
     /// short-lived native-view layout mattes before Ghostty has painted.
     pub fn background_rgb(&self) -> Option<[u8; 3]> {
-        self.appearance
+        self.effective_appearance
             .lock()
-            .colors
             .as_ref()
-            .map(|colors| colors.background)
-    }
-
-    /// Current configured terminal foreground color.
-    pub fn foreground_rgb(&self) -> Option<[u8; 3]> {
-        self.appearance
-            .lock()
-            .colors
-            .as_ref()
-            .map(|colors| colors.foreground)
+            .map(|a| a.background)
     }
 
     /// Current configured terminal background opacity. This lets the macOS
     /// embedding layer keep short-lived AppKit backing mattes visually aligned
     /// with Ghostty's own transparent terminal background.
     pub fn background_opacity(&self) -> Option<f32> {
-        self.appearance.lock().background_opacity
+        self.effective_appearance
+            .lock()
+            .as_ref()
+            .map(|a| a.background_opacity as f32)
+    }
+
+    pub fn native_appearance(&self) -> Option<NativeAppearance> {
+        self.effective_appearance.lock().clone()
     }
 
     /// Update the app's terminal colors at runtime.
     pub fn update_colors(&self, colors: &TerminalColors) -> Result<(), String> {
         self.update_config(&GhosttyConfigPatch {
             colors: Some(colors.clone()),
+            shell: None,
             font_family: None,
+            font_fallback: None,
             font_size: None,
             background_opacity: None,
             background_opacity_cells: None,
@@ -582,13 +951,16 @@ impl GhosttyApp {
             background_image_position: None,
             background_image_fit: None,
             background_image_repeat: None,
+            clipboard_write: None,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_appearance(
         &self,
         colors: &TerminalColors,
         font_family: &str,
+        font_fallback: &[String],
         font_size: f32,
         background_opacity: f32,
         background_blur: bool,
@@ -601,7 +973,9 @@ impl GhosttyApp {
     ) -> Result<(), String> {
         self.update_config(&GhosttyConfigPatch {
             colors: Some(colors.clone()),
+            shell: None,
             font_family: Some(font_family.to_string()),
+            font_fallback: Some(font_fallback.to_vec()),
             font_size: Some(font_size),
             background_opacity: Some(background_opacity),
             background_opacity_cells: Some(background_opacity < 0.999),
@@ -612,21 +986,65 @@ impl GhosttyApp {
             background_image_position: background_image_position.map(ToOwned::to_owned),
             background_image_fit: background_image_fit.map(ToOwned::to_owned),
             background_image_repeat: background_image.map(|_| background_image_repeat),
+            clipboard_write: None,
         })
     }
 
     pub fn update_config(&self, patch: &GhosttyConfigPatch) -> Result<(), String> {
-        let merged = {
-            let mut appearance = self.appearance.lock();
-            appearance.merge(patch);
-            appearance.clone()
-        };
-        let config = build_ghostty_config(&merged)?;
+        let mut overrides = self.overrides.lock();
+        let mut merged = overrides.clone();
+        merged.merge(patch);
+        let source = self.native_source.lock();
+        let config = build_ghostty_config(&self.defaults, source.as_ref(), &merged)?;
+        let effective = effective_appearance(config.0)?;
+        *self.effective_appearance.lock() = Some(effective);
         unsafe {
-            ffi::ghostty_app_update_config(self.app, config);
-            ffi::ghostty_config_free(config);
+            ffi::ghostty_app_update_config(self.app, config.0);
         }
+        *overrides = merged;
         Ok(())
+    }
+
+    /// Parse and apply native Ghostty configuration text. `base_dir` must be
+    /// the original absolute source directory so relative `config-file`,
+    /// theme, font, and image paths retain native Ghostty semantics.
+    pub fn apply_native_config(
+        &self,
+        text: impl Into<String>,
+        base_dir: impl AsRef<Path>,
+    ) -> Result<NativeAppearance, String> {
+        let source = NativeConfigSource {
+            text: text.into(),
+            base_dir: base_dir.as_ref().to_path_buf(),
+        };
+        // A full native reload starts a new authored snapshot. Runtime patches
+        // belong to the prior snapshot and are deliberately reset.
+        let config = build_ghostty_config(
+            &self.defaults,
+            Some(&source),
+            &GhosttyConfigPatch::default(),
+        )?;
+        let effective = effective_appearance(config.0)?;
+        if effective.background_blur < 0
+            && self
+                .effective_appearance
+                .lock()
+                .as_ref()
+                .is_none_or(|previous| previous.background_blur != effective.background_blur)
+        {
+            log::warn!(
+                "Liquid Glass background-blur is not supported by Con; using unblurred \
+                 transparency. Use a numeric background-blur for window blur."
+            );
+        }
+        *self.effective_appearance.lock() = Some(effective.clone());
+        unsafe { ffi::ghostty_app_update_config(self.app, config.0) };
+        // Ghostty checks the effective native clipboard-write policy before
+        // invoking the callback. Do not retain a stale constructor denial.
+        self.wake_handle.clipboard_write_policy.set_enabled(true);
+        *self.overrides.lock() = GhosttyConfigPatch::default();
+        *self.native_source.lock() = Some(source);
+        Ok(self.native_appearance().unwrap_or(effective))
     }
 
     /// Set the global color scheme.
@@ -637,6 +1055,20 @@ impl GhosttyApp {
             ffi::ghostty_color_scheme_e::GHOSTTY_COLOR_SCHEME_LIGHT
         };
         unsafe { ffi::ghostty_app_set_color_scheme(self.app, scheme) }
+    }
+
+    pub fn set_clipboard_write_enabled(&self, enabled: bool) -> Result<(), String> {
+        if !enabled {
+            self.wake_handle.clipboard_write_policy.set_enabled(false);
+        }
+        self.update_config(&GhosttyConfigPatch {
+            clipboard_write: Some(enabled),
+            ..Default::default()
+        })?;
+        if enabled {
+            self.wake_handle.clipboard_write_policy.set_enabled(true);
+        }
+        Ok(())
     }
 
     /// Create a new terminal surface. The `nsview` must be a valid NSView pointer
@@ -653,8 +1085,14 @@ impl GhosttyApp {
         font_size: Option<f32>,
     ) -> Result<GhosttyTerminal, String> {
         // Per-surface state — stored as surface userdata so callbacks can
-        // update the correct terminal's state.
-        let state: StateRef = Arc::new(Mutex::new(TerminalState::default()));
+        // update the correct terminal's state. TerminalState carries a raw
+        // `ghostty_surface_t`, so it is !Send/!Sync by construction; this Arc
+        // only lives as Ghostty's surface userdata.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let state: StateRef = Arc::new(Mutex::new(TerminalState {
+            clipboard_write_policy: self.wake_handle.clipboard_write_policy.clone(),
+            ..TerminalState::default()
+        }));
         let surface_userdata = Box::into_raw(Box::new(state.clone())) as *mut c_void;
 
         let mut config = unsafe { ffi::ghostty_surface_config_new() };
@@ -696,6 +1134,7 @@ impl GhosttyApp {
             surface,
             state,
             userdata_ptr: surface_userdata,
+            tty_name: Mutex::new(None),
         })
     }
 
@@ -739,12 +1178,25 @@ pub struct GhosttyTerminal {
     /// Raw pointer to the Box<StateRef> we allocated for surface userdata.
     /// Must be recovered and freed when the terminal is dropped.
     userdata_ptr: *mut c_void,
+    tty_name: Mutex<Option<String>>,
 }
 
 impl GhosttyTerminal {
+    pub const SUPPORTS_FOREGROUND_PROCESS_GROUP_ID: bool = true;
+    pub const SUPPORTS_TTY_NAME: bool = true;
+
     fn mark_input_observed(&self) {
         let mut state = self.state.lock();
         state.input_generation = state.input_generation.saturating_add(1);
+    }
+
+    fn note_program_key(&self) {
+        let mut state = self.state.lock();
+        program_events::reduce(&mut state.program_events, ProgramStatusEvent::Key);
+    }
+
+    pub fn take_program_events(&self) -> Vec<ProgramStatusEvent> {
+        self.state.lock().program_events.take()
     }
 
     /// Trigger a draw (ghostty renders into its Metal layer).
@@ -789,9 +1241,9 @@ impl GhosttyTerminal {
         unsafe { ffi::ghostty_surface_set_focus(self.surface, focused) }
     }
 
-    /// Set occlusion state (hidden behind other windows).
-    pub fn set_occlusion(&self, occluded: bool) {
-        unsafe { ffi::ghostty_surface_set_occlusion(self.surface, occluded) }
+    /// Tell the renderer whether the native surface is currently visible.
+    pub fn set_visible(&self, visible: bool) {
+        unsafe { ffi::ghostty_surface_set_occlusion(self.surface, visible) }
     }
 
     /// Set color scheme (light/dark).
@@ -804,6 +1256,10 @@ impl GhosttyTerminal {
         unsafe { ffi::ghostty_surface_set_color_scheme(self.surface, scheme) }
     }
 
+    pub fn set_clipboard_write_enabled(&self, _enabled: bool) -> Result<(), String> {
+        Ok(())
+    }
+
     pub fn perform_binding_action(&self, action: &str) -> Result<bool, String> {
         let action = CString::new(action).map_err(|e| format!("CString: {}", e))?;
         Ok(unsafe {
@@ -813,6 +1269,22 @@ impl GhosttyTerminal {
                 action.as_bytes().len(),
             )
         })
+    }
+
+    pub fn search(&self, needle: &str) -> Result<bool, String> {
+        self.perform_binding_action(&format!("search:{needle}"))
+    }
+
+    pub fn navigate_search_next(&self) -> Result<bool, String> {
+        self.perform_binding_action("navigate_search:next")
+    }
+
+    pub fn navigate_search_previous(&self) -> Result<bool, String> {
+        self.perform_binding_action("navigate_search:previous")
+    }
+
+    pub fn end_search(&self) -> Result<bool, String> {
+        self.perform_binding_action("end_search")
     }
 
     pub fn clear_screen_and_scrollback(&self) -> Result<(), String> {
@@ -843,19 +1315,20 @@ impl GhosttyTerminal {
     }
 
     pub fn update_config(&self, patch: &GhosttyConfigPatch) -> Result<(), String> {
-        let config = build_ghostty_config(patch)?;
+        let config = build_ghostty_config(&GhosttyConfigPatch::default(), None, patch)?;
         unsafe {
-            ffi::ghostty_surface_update_config(self.surface, config);
-            ffi::ghostty_config_free(config);
+            ffi::ghostty_surface_update_config(self.surface, config.0);
         }
         self.refresh();
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_appearance(
         &self,
         colors: &TerminalColors,
         font_family: &str,
+        font_fallback: &[String],
         font_size: f32,
         background_opacity: f32,
         background_blur: bool,
@@ -868,7 +1341,9 @@ impl GhosttyTerminal {
     ) -> Result<(), String> {
         self.update_config(&GhosttyConfigPatch {
             colors: Some(colors.clone()),
+            shell: None,
             font_family: Some(font_family.to_string()),
+            font_fallback: Some(font_fallback.to_vec()),
             font_size: Some(font_size),
             background_opacity: Some(background_opacity),
             background_opacity_cells: Some(background_opacity < 0.999),
@@ -879,6 +1354,7 @@ impl GhosttyTerminal {
             background_image_position: background_image_position.map(ToOwned::to_owned),
             background_image_fit: background_image_fit.map(ToOwned::to_owned),
             background_image_repeat: background_image.map(|_| background_image_repeat),
+            clipboard_write: None,
         })?;
         self.refresh();
         Ok(())
@@ -886,8 +1362,17 @@ impl GhosttyTerminal {
 
     /// Send a key event to the terminal. Returns true if ghostty consumed it.
     pub fn send_key(&self, key: ffi::ghostty_input_key_s) -> bool {
+        self.send_key_with_origin(key, true)
+    }
+
+    fn send_key_with_origin(&self, key: ffi::ghostty_input_key_s, user_input: bool) -> bool {
         self.mark_input_observed();
-        unsafe { ffi::ghostty_surface_key(self.surface, key) }
+        let action = key.action;
+        let consumed = unsafe { ffi::ghostty_surface_key(self.surface, key) };
+        if program_key_acknowledges(user_input, consumed, action) {
+            self.note_program_key();
+        }
+        consumed
     }
 
     /// Send UTF-8 text input to the terminal (for composed/IME text).
@@ -899,10 +1384,44 @@ impl GhosttyTerminal {
         self.mark_input_observed();
         if let Ok(cstr) = CString::new(text) {
             let len = cstr.as_bytes().len(); // excludes NUL, matches original text
+            if len == 0 {
+                return;
+            }
             unsafe { ffi::ghostty_surface_text(self.surface, cstr.as_ptr(), len) }
+            self.note_program_key();
         }
         // If text contains NUL bytes, we silently drop it — this matches
         // terminal semantics where NUL in text input is meaningless.
+    }
+
+    /// Paste user clipboard/drop text through Ghostty's paste protection.
+    /// IME commits and explicit control-plane writes use their existing paths.
+    pub fn paste_text(&self, text: &str) {
+        let Ok(text) = CString::new(text) else {
+            return;
+        };
+        if text.as_bytes().is_empty() {
+            return;
+        }
+        self.mark_input_observed();
+        self.state.lock().paste_denied = false;
+        // Ghostty copies the NUL-terminated input before returning; its
+        // confirmation callback is synchronous and fails closed below.
+        unsafe {
+            ffi::ghostty_surface_paste_text(self.surface, text.as_ptr(), text.as_bytes().len());
+        }
+        let denied = self.state.lock().paste_denied;
+        if !denied {
+            self.note_program_key();
+        }
+    }
+
+    pub fn set_preedit(&self, text: Option<&str>) {
+        let text = text.filter(|text| !text.is_empty());
+        let (ptr, len) = text.map_or((std::ptr::null(), 0), |text| {
+            (text.as_ptr().cast(), text.len())
+        });
+        unsafe { ffi::ghostty_surface_preedit(self.surface, ptr, len) }
     }
 
     pub fn ime_point(&self) -> ImePoint {
@@ -947,17 +1466,17 @@ impl GhosttyTerminal {
             if let Some(key_event) = char_to_key_event(ch) {
                 // Flush any pending printable text before sending a control char
                 if !pending_text.is_empty() {
-                    self.send_text_as_key_event(&pending_text);
+                    self.send_text_as_key_event_with_origin(&pending_text, false);
                     pending_text.clear();
                 }
-                self.send_key(key_event);
+                self.send_key_with_origin(key_event, false);
             } else {
                 pending_text.push(ch);
             }
         }
 
         if !pending_text.is_empty() {
-            self.send_text_as_key_event(&pending_text);
+            self.send_text_as_key_event_with_origin(&pending_text, false);
         }
     }
 
@@ -967,6 +1486,10 @@ impl GhosttyTerminal {
     /// paste wrapping in mode 2004), this sends via `ghostty_surface_key` with the
     /// `text` field set. Ghostty writes the UTF-8 directly to the PTY.
     pub fn send_text_as_key_event(&self, text: &str) {
+        self.send_text_as_key_event_with_origin(text, true);
+    }
+
+    fn send_text_as_key_event_with_origin(&self, text: &str, user_input: bool) {
         if let Ok(cstr) = CString::new(text) {
             let key_event = ffi::ghostty_input_key_s {
                 action: ffi::ghostty_input_action_e::GHOSTTY_ACTION_PRESS,
@@ -977,8 +1500,13 @@ impl GhosttyTerminal {
                 unshifted_codepoint: 0,
                 composing: false,
             };
-            self.send_key(key_event);
+            self.send_key_with_origin(key_event, user_input);
         }
+    }
+
+    /// Whether the child application is currently receiving mouse reports.
+    pub fn mouse_captured(&self) -> bool {
+        unsafe { ffi::ghostty_surface_mouse_captured(self.surface) }
     }
 
     /// Send a mouse button event.
@@ -1023,9 +1551,56 @@ impl GhosttyTerminal {
         self.state.lock().pwd.clone()
     }
 
+    /// Foreground process-group ID for the surface PTY.
+    pub fn foreground_process_group_id(&self) -> Option<u64> {
+        if !self.is_alive() {
+            return None;
+        }
+
+        let process_group_id = unsafe { ffi::ghostty_surface_foreground_pid(self.surface) };
+        (process_group_id != 0).then_some(process_group_id)
+    }
+
+    pub fn tty_name(&self) -> Option<String> {
+        let mut tty_name = self.tty_name.lock();
+        if let Some(name) = tty_name.as_ref() {
+            return Some(name.clone());
+        }
+
+        let raw = unsafe { ffi::ghostty_surface_tty_name(self.surface) };
+        let name = if raw.ptr.is_null() || raw.len == 0 {
+            None
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(raw.ptr.cast::<u8>(), raw.len) };
+            std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+        };
+        unsafe { ffi::ghostty_string_free(raw) };
+
+        let name = name?;
+        Some(tty_name.insert(name).clone())
+    }
+
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        let mut state = self.state.lock();
+        let progress = state.progress?;
+        if state
+            .progress_updated_at
+            .is_some_and(|updated_at| updated_at.elapsed() < TERMINAL_PROGRESS_TIMEOUT)
+        {
+            return Some(progress);
+        }
+        state.progress = None;
+        state.progress_updated_at = None;
+        None
+    }
+
     /// Whether the child process has exited.
     pub fn is_alive(&self) -> bool {
         !unsafe { ffi::ghostty_surface_process_exited(self.surface) }
+    }
+
+    pub fn prompt_state(&self) -> crate::TerminalPromptState {
+        crate::TerminalPromptState::default()
     }
 
     /// Take the command-finished signal (if any). Consuming — returns None on second call.
@@ -1236,6 +1811,14 @@ impl GhosttyTerminal {
         r
     }
 
+    /// Consume one or more bells coalesced since the previous drain.
+    pub fn take_bell(&self) -> bool {
+        let mut state = self.state.lock();
+        let pending = state.bell_pending;
+        state.bell_pending = false;
+        pending
+    }
+
     /// Access the per-surface state.
     pub fn state(&self) -> &StateRef {
         &self.state
@@ -1247,8 +1830,7 @@ impl GhosttyTerminal {
     }
 
     pub fn take_pending_events(&self) -> Vec<GhosttySurfaceEvent> {
-        let mut state = self.state.lock();
-        state.pending_events.drain(..).collect()
+        self.state.lock().pending_events.drain(..).collect()
     }
 }
 
@@ -1271,7 +1853,7 @@ unsafe impl Sync for GhosttyTerminal {}
 
 // ── Public types ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceSize {
     pub columns: u16,
     pub rows: u16,
@@ -1385,26 +1967,129 @@ unsafe extern "C" fn wakeup_callback(userdata: *mut c_void) {
     });
 }
 
-fn mark_child_exited_state(state: &StateRef) {
+fn mark_child_exited_state(state: &Mutex<TerminalState>) {
     let mut s = state.lock();
     s.child_exited = true;
     s.needs_render = true;
     s.is_busy = false;
     s.last_command_finished_input_generation = s.input_generation;
+    program_events::reduce(&mut s.program_events, ProgramStatusEvent::ProcessExit);
 }
 
 unsafe extern "C" fn action_callback(
-    _app: ffi::ghostty_app_t,
+    app: ffi::ghostty_app_t,
     target: ffi::ghostty_target_s,
     action: ffi::ghostty_action_s,
 ) -> bool {
     unsafe {
+        if action.tag == ffi::ghostty_action_tag_e::GHOSTTY_ACTION_CONFIG_CHANGE
+            && target.tag == ffi::ghostty_target_tag_e::GHOSTTY_TARGET_APP
+        {
+            let userdata = ffi::ghostty_app_userdata(app).cast::<GhosttyWakeHandle>();
+            if userdata.is_null() {
+                return false;
+            }
+            let config = action.action.config_change.config;
+            let Ok(appearance) = effective_appearance(config) else {
+                return false;
+            };
+            *(*userdata).effective_appearance.lock() = Some(appearance);
+            return true;
+        }
         let state = match resolve_surface_state(&target) {
             Some(s) => s,
             None => return false,
         };
 
+        handle_surface_action(&state, action)
+    }
+}
+
+unsafe fn copy_program_status_string(
+    value: ffi::ghostty_action_program_status_string_s,
+    limit: usize,
+) -> Option<String> {
+    if value.len > limit || (value.len != 0 && value.ptr.is_null()) {
+        return None;
+    }
+    if value.len == 0 {
+        return Some(String::new());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(value.ptr, value.len) };
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+fn program_key_acknowledges(
+    user_input: bool,
+    consumed: bool,
+    action: ffi::ghostty_input_action_e,
+) -> bool {
+    user_input
+        && consumed
+        && matches!(
+            action,
+            ffi::ghostty_input_action_e::GHOSTTY_ACTION_PRESS
+                | ffi::ghostty_input_action_e::GHOSTTY_ACTION_REPEAT
+        )
+}
+
+/// Ghostty invokes this while surface IO is alive, with borrowed parser data.
+/// Only retained Rust state is touched; in particular, do not resolve a Ghostty
+/// surface, enter GPUI, or call back into Ghostty from its IO thread.
+unsafe extern "C" fn program_status_callback(
+    app_userdata: *mut c_void,
+    surface_userdata: *mut c_void,
+    event: i32,
+    report: *const ffi::ghostty_action_program_status_s,
+) {
+    if surface_userdata.is_null() {
+        return;
+    }
+    let tag = match event {
+        0 => ffi::ghostty_action_tag_e::GHOSTTY_ACTION_PROGRAM_STATUS,
+        1 => ffi::ghostty_action_tag_e::GHOSTTY_ACTION_SHELL_PROMPT,
+        2 => ffi::ghostty_action_tag_e::GHOSTTY_ACTION_FULL_RESET,
+        _ => return,
+    };
+    let state = unsafe { &*surface_userdata.cast::<StateRef>() };
+    let pending = state.lock().program_events.is_pending();
+    let accepted = unsafe {
+        handle_surface_action(
+            state,
+            ffi::ghostty_action_s {
+                tag,
+                action: ffi::ghostty_action_u {
+                    program_status: report,
+                },
+            },
+        )
+    };
+    if accepted && !pending && state.lock().program_events.is_pending() {
+        unsafe { wakeup_callback(app_userdata) };
+    }
+}
+
+/// Decode surface actions separately from target resolution. Pointer actions
+/// only update state; the host applies them on its UI thread.
+unsafe fn handle_surface_action(
+    state: &Mutex<TerminalState>,
+    action: ffi::ghostty_action_s,
+) -> bool {
+    unsafe {
         match action.tag {
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_MOUSE_SHAPE => {
+                state.lock().mouse_shape = Some(action.action.mouse_shape);
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_MOUSE_VISIBILITY => {
+                let visible = match action.action.mouse_visibility {
+                    0 => true,  // GHOSTTY_MOUSE_VISIBLE
+                    1 => false, // GHOSTTY_MOUSE_HIDDEN
+                    _ => return false,
+                };
+                state.lock().mouse_visible = Some(visible);
+                true
+            }
             ffi::ghostty_action_tag_e::GHOSTTY_ACTION_SET_TITLE => {
                 let title_ptr = action.action.set_title.title;
                 if !title_ptr.is_null() {
@@ -1440,6 +2125,10 @@ unsafe extern "C" fn action_callback(
                 });
                 true
             }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_DESKTOP_NOTIFICATION => {
+                let notification = action.action.desktop_notification;
+                con_ghostty_show_desktop_notification(notification.title, notification.body)
+            }
             ffi::ghostty_action_tag_e::GHOSTTY_ACTION_NEW_SPLIT => {
                 let direction = match action.action.new_split {
                     ffi::ghostty_action_split_direction_e::GHOSTTY_SPLIT_DIRECTION_RIGHT => {
@@ -1469,10 +2158,31 @@ unsafe extern "C" fn action_callback(
 
                 let bytes = std::slice::from_raw_parts(open_url.url as *const u8, open_url.len);
                 let url = String::from_utf8_lossy(bytes).into_owned();
-                state
-                    .lock()
-                    .pending_events
-                    .push_back(GhosttySurfaceEvent::OpenUrl(url));
+                let event = if open_url.kind == ffi::GHOSTTY_ACTION_OPEN_URL_KIND_OSC8 {
+                    GhosttySurfaceEvent::OpenOsc8Url(url)
+                } else {
+                    GhosttySurfaceEvent::OpenUrl(url)
+                };
+                state.lock().pending_events.push_back(event);
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_MOUSE_OVER_LINK => {
+                // Ghostty sends an empty URL when the pointer leaves a link.
+                let mouse_over_link = action.action.mouse_over_link;
+                if mouse_over_link.len == 0 {
+                    state.lock().set_hovered_osc8_link(None);
+                    return true;
+                }
+                if mouse_over_link.url.is_null() {
+                    return false;
+                }
+
+                let bytes = std::slice::from_raw_parts(
+                    mouse_over_link.url as *const u8,
+                    mouse_over_link.len,
+                );
+                let url = String::from_utf8_lossy(bytes);
+                state.lock().set_hovered_osc8_link(Some(&url));
                 true
             }
             ffi::ghostty_action_tag_e::GHOSTTY_ACTION_COMMAND_FINISHED => {
@@ -1502,8 +2212,48 @@ unsafe extern "C" fn action_callback(
                 });
                 true
             }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_START_SEARCH => {
+                let needle_ptr = action.action.start_search.needle;
+                let needle = if needle_ptr.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(needle_ptr).to_string_lossy().into_owned()
+                };
+                state
+                    .lock()
+                    .pending_events
+                    .push_back(GhosttySurfaceEvent::StartSearch(needle));
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_END_SEARCH => {
+                state
+                    .lock()
+                    .pending_events
+                    .push_back(GhosttySurfaceEvent::EndSearch);
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_SEARCH_TOTAL => {
+                let total = action.action.search_total.total;
+                state
+                    .lock()
+                    .pending_events
+                    .push_back(GhosttySurfaceEvent::SearchTotal(
+                        (total >= 0).then_some(total as usize),
+                    ));
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_SEARCH_SELECTED => {
+                let selected = action.action.search_selected.selected;
+                state
+                    .lock()
+                    .pending_events
+                    .push_back(GhosttySurfaceEvent::SearchSelected(
+                        (selected >= 0).then_some(selected as usize),
+                    ));
+                true
+            }
             ffi::ghostty_action_tag_e::GHOSTTY_ACTION_SHOW_CHILD_EXITED => {
-                mark_child_exited_state(&state);
+                mark_child_exited_state(state);
                 true
             }
             ffi::ghostty_action_tag_e::GHOSTTY_ACTION_COLOR_CHANGE => {
@@ -1511,13 +2261,61 @@ unsafe extern "C" fn action_callback(
                 true
             }
             ffi::ghostty_action_tag_e::GHOSTTY_ACTION_RING_BELL => {
-                // macOS system beep
-                #[cfg(target_os = "macos")]
+                state.lock().bell_pending = true;
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_PROGRAM_STATUS => {
+                let report = action.action.program_status;
+                if report.is_null() {
+                    return false;
+                }
+                if report.cast::<usize>().read_unaligned()
+                    < std::mem::size_of::<ffi::ghostty_action_program_status_s>()
                 {
-                    unsafe extern "C" {
-                        fn NSBeep();
-                    }
-                    NSBeep();
+                    return false;
+                }
+                let report = &*report;
+                let (Some(id), Some(app), Some(title), Some(message)) = (
+                    copy_program_status_string(report.id, 128),
+                    copy_program_status_string(report.app, 32),
+                    copy_program_status_string(report.title, 192),
+                    copy_program_status_string(report.message, 2048),
+                ) else {
+                    return false;
+                };
+                let mut state = state.lock();
+                program_events::reduce(
+                    &mut state.program_events,
+                    ProgramStatusEvent::Report {
+                        state: report.state,
+                        kind: report.kind,
+                        progress: report.progress,
+                        id,
+                        app,
+                        title,
+                        message,
+                    },
+                );
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_SHELL_PROMPT => {
+                let mut state = state.lock();
+                program_events::reduce(&mut state.program_events, ProgramStatusEvent::Prompt);
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_FULL_RESET => {
+                let mut state = state.lock();
+                program_events::reduce(&mut state.program_events, ProgramStatusEvent::FullReset);
+                true
+            }
+            ffi::ghostty_action_tag_e::GHOSTTY_ACTION_PROGRESS_REPORT => {
+                let report = action.action.progress_report;
+                if let Some(progress) =
+                    TerminalProgress::from_ghostty_report(report.state, report.progress)
+                {
+                    let mut state = state.lock();
+                    state.progress = progress;
+                    state.progress_updated_at = progress.map(|_| Instant::now());
                 }
                 true
             }
@@ -1526,21 +2324,36 @@ unsafe extern "C" fn action_callback(
     }
 }
 
+unsafe extern "C" {
+    fn con_ghostty_show_desktop_notification(
+        title: *const std::os::raw::c_char,
+        body: *const std::os::raw::c_char,
+    ) -> bool;
+}
+
 /// Clipboard read — ghostty wants to paste. Read from macOS pasteboard and complete the request.
 unsafe extern "C" fn read_clipboard_callback(
     userdata: *mut c_void,
-    _clipboard: ffi::ghostty_clipboard_e,
+    clipboard: ffi::ghostty_clipboard_e,
     request: *mut c_void,
-) -> bool {
+    mime_types: *const *const std::os::raw::c_char,
+    mime_types_len: usize,
+    needs_listing: bool,
+) -> ffi::ghostty_clipboard_read_result_e {
     unsafe {
-        if userdata.is_null() {
-            return false;
+        // macOS has no X11-style primary clipboard. Keep the pre-migration
+        // behavior that maps standard and selection requests to NSPasteboard.
+        if userdata.is_null()
+            || request.is_null()
+            || clipboard == ffi::ghostty_clipboard_e::GHOSTTY_CLIPBOARD_PRIMARY
+        {
+            return ffi::ghostty_clipboard_read_result_e::GHOSTTY_CLIPBOARD_READ_UNSUPPORTED;
         }
 
         let state = &*(userdata as *const StateRef);
         let surface = state.lock().surface;
         if surface.is_null() {
-            return false;
+            return ffi::ghostty_clipboard_read_result_e::GHOSTTY_CLIPBOARD_READ_UNSUPPORTED;
         }
 
         #[cfg(target_os = "macos")]
@@ -1548,61 +2361,119 @@ unsafe extern "C" fn read_clipboard_callback(
             use objc::runtime::Object;
             use objc::{class, msg_send, sel, sel_impl};
 
+            if mime_types_len > 0 && mime_types.is_null() {
+                return ffi::ghostty_clipboard_read_result_e::GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+            }
+            // MIME listings are used by Kitty OSC 5522 reads and paste events.
+            // Keep that protocol unavailable until its permission flow lands;
+            // otherwise an `ask` policy still exposes clipboard metadata for
+            // listing-only requests that upstream intentionally exempts from a
+            // content confirmation prompt.
+            if needs_listing {
+                return ffi::ghostty_clipboard_read_result_e::GHOSTTY_CLIPBOARD_READ_UNSUPPORTED;
+            }
+            let requested = if mime_types_len == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(mime_types, mime_types_len)
+            };
+            let wants_text = requested
+                .iter()
+                .copied()
+                .any(|mime| clipboard_c_mime_is_text(mime));
+            if !wants_text {
+                return ffi::ghostty_clipboard_read_result_e::GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+            }
+
             let pb: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
             // NSPasteboardTypeString = @"public.utf8-plain-text"
-            let type_str = CString::new("public.utf8-plain-text").unwrap();
-            let ns_type: *mut Object =
-                msg_send![class!(NSString), stringWithUTF8String: type_str.as_ptr()];
+            let ns_type: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c"public.utf8-plain-text".as_ptr()];
             let text: *mut Object = msg_send![pb, stringForType: ns_type];
-            if text.is_null() {
-                let empty = c"";
-                ffi::ghostty_surface_complete_clipboard_request(
-                    surface,
-                    empty.as_ptr(),
-                    request,
-                    false,
-                );
-                return true;
-            }
-            let utf8: *const std::os::raw::c_char = msg_send![text, UTF8String];
-            ffi::ghostty_surface_complete_clipboard_request(surface, utf8, request, false);
-            return true;
+            let (data, len) = if text.is_null() {
+                // A started OSC 52 read must complete even when the pasteboard
+                // has no text representation. Upstream serializes an empty
+                // completion as the protocol's empty clipboard response.
+                (c"".as_ptr(), 0)
+            } else {
+                let data: *const std::os::raw::c_char = msg_send![text, UTF8String];
+                if data.is_null() {
+                    return ffi::ghostty_clipboard_read_result_e::GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+                }
+                let len: usize = msg_send![text, lengthOfBytesUsingEncoding: 4usize];
+                (data, len)
+            };
+            let mime = c"text/plain";
+            let content = ffi::ghostty_clipboard_content_s {
+                mime: mime.as_ptr(),
+                data,
+                len,
+            };
+            let complete = ffi::ghostty_clipboard_complete_s {
+                contents: &content,
+                contents_len: 1,
+                available: std::ptr::null(),
+                available_len: 0,
+                confirmed: false,
+                remember: false,
+            };
+            ffi::ghostty_surface_complete_clipboard_request(surface, &complete, request);
+            ffi::ghostty_clipboard_read_result_e::GHOSTTY_CLIPBOARD_READ_STARTED
         }
 
         #[cfg(not(target_os = "macos"))]
-        false
+        ffi::ghostty_clipboard_read_result_e::GHOSTTY_CLIPBOARD_READ_UNSUPPORTED
     }
 }
 
-/// Clipboard confirmation — ghostty confirmed a clipboard read (e.g. OSC 52).
+/// Ghostty needs user approval; no permission UI exists, so fail closed.
 unsafe extern "C" fn confirm_read_clipboard_callback(
     userdata: *mut c_void,
-    text: *const std::os::raw::c_char,
+    _confirm: *const ffi::ghostty_clipboard_confirm_s,
     request: *mut c_void,
     _request_type: ffi::ghostty_clipboard_request_e,
 ) {
     unsafe {
-        if userdata.is_null() || text.is_null() {
+        if userdata.is_null() || request.is_null() {
             return;
         }
         let state = &*(userdata as *const StateRef);
-        let surface = state.lock().surface;
-        if !surface.is_null() {
-            ffi::ghostty_surface_complete_clipboard_request(surface, text, request, true);
+        let surface = {
+            let mut state = state.lock();
+            state.paste_denied = true;
+            state.surface
+        };
+        if surface.is_null() {
+            return;
         }
+
+        // This also rejects unsafe native pastes. Safe pastes complete without
+        // confirmation. Denial consumes the request without borrowing its data.
+        ffi::ghostty_surface_deny_clipboard_request(surface, request);
     }
 }
 
-/// Clipboard write — ghostty wants to copy (selection, OSC 52). Write to macOS pasteboard.
+/// Clipboard write — ghostty wants to copy plain text to the macOS pasteboard.
+///
+/// Ghostty also sends user-gesture copies (copy-on-select, `copy_to_clipboard`)
+/// through here as multi-item payloads; the gate below would drop them, which
+/// is why `to_config_string` keeps `copy-on-select = none`.
 unsafe extern "C" fn write_clipboard_callback(
-    _userdata: *mut c_void,
-    _clipboard: ffi::ghostty_clipboard_e,
+    userdata: *mut c_void,
+    clipboard: ffi::ghostty_clipboard_e,
     content: *const ffi::ghostty_clipboard_content_s,
     content_count: usize,
     _confirm: bool,
 ) {
     unsafe {
-        if content.is_null() || content_count == 0 {
+        if userdata.is_null()
+            || !(*(userdata as *const StateRef))
+                .lock()
+                .clipboard_write_policy
+                .is_enabled()
+            || clipboard != ffi::ghostty_clipboard_e::GHOSTTY_CLIPBOARD_STANDARD
+            || content_count > 1
+            || (content.is_null() && content_count > 0)
+        {
             return;
         }
 
@@ -1611,33 +2482,50 @@ unsafe extern "C" fn write_clipboard_callback(
             use objc::runtime::Object;
             use objc::{class, msg_send, sel, sel_impl};
 
-            let items = std::slice::from_raw_parts(content, content_count);
-
-            for item in items {
-                if item.data.is_null() {
-                    continue;
+            let (data, len) = if content_count == 0 {
+                (c"".as_ptr(), 0)
+            } else {
+                let item = &*content;
+                if !clipboard_c_mime_is_text(item.mime) {
+                    return;
                 }
-                let text = CStr::from_ptr(item.data).to_string_lossy();
-                if text.is_empty() {
-                    continue;
+                if item.len > CLIPBOARD_WRITE_LIMIT_BYTES || (item.data.is_null() && item.len > 0) {
+                    return;
                 }
+                (
+                    if item.len == 0 {
+                        c"".as_ptr()
+                    } else {
+                        item.data
+                    },
+                    item.len,
+                )
+            };
 
-                let pb: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
-                let _: () = msg_send![pb, clearContents];
-
-                let cstr = CString::new(text.as_ref()).unwrap_or_default();
-                let ns_str: *mut Object =
-                    msg_send![class!(NSString), stringWithUTF8String: cstr.as_ptr()];
-
-                // NSPasteboardTypeString = @"public.utf8-plain-text"
-                let type_cstr = CString::new("public.utf8-plain-text").unwrap();
-                let ns_type: *mut Object =
-                    msg_send![class!(NSString), stringWithUTF8String: type_cstr.as_ptr()];
-                let _success: bool = msg_send![pb, setString: ns_str forType: ns_type];
+            let ns_str: *mut Object = msg_send![
+                class!(NSString),
+                stringWithBytes: data
+                length: len
+                encoding: 4usize
+            ];
+            if ns_str.is_null() {
                 return;
             }
+
+            // NSPasteboardTypeString = @"public.utf8-plain-text"
+            let ns_type: *mut Object = msg_send![class!(NSString), stringWithUTF8String: c"public.utf8-plain-text".as_ptr()];
+            let pb: *mut Object = msg_send![class!(NSPasteboard), generalPasteboard];
+            let _: () = msg_send![pb, clearContents];
+            let _success: bool = msg_send![pb, setString: ns_str forType: ns_type];
         }
     }
+}
+
+unsafe fn clipboard_c_mime_is_text(mime: *const std::os::raw::c_char) -> bool {
+    if mime.is_null() {
+        return false;
+    }
+    crate::clipboard_mime_is_text(unsafe { CStr::from_ptr(mime) }.to_bytes())
 }
 
 unsafe extern "C" fn close_surface_callback(userdata: *mut c_void, _process_alive: bool) {
@@ -1651,14 +2539,132 @@ unsafe extern "C" fn close_surface_callback(userdata: *mut c_void, _process_aliv
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn program_status_callback_text_is_bounded_and_strict_utf8() {
+        let bytes = "中文".as_bytes();
+        let value = super::ffi::ghostty_action_program_status_string_s {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        };
+        assert_eq!(
+            unsafe { super::copy_program_status_string(value, 6) }.as_deref(),
+            Some("中文")
+        );
+        assert!(unsafe { super::copy_program_status_string(value, 5) }.is_none());
+        let invalid = [0xff];
+        let value = super::ffi::ghostty_action_program_status_string_s {
+            ptr: invalid.as_ptr(),
+            len: 1,
+        };
+        assert!(unsafe { super::copy_program_status_string(value, 6) }.is_none());
+        let value = super::ffi::ghostty_action_program_status_string_s {
+            ptr: std::ptr::null(),
+            len: 1,
+        };
+        assert!(unsafe { super::copy_program_status_string(value, 6) }.is_none());
+    }
     use std::sync::Arc;
 
     use parking_lot::Mutex;
 
     use super::{
-        GhosttyConfigPatch, TerminalColors, TerminalState,
+        GhosttyConfigPatch, GhosttySurfaceEvent, NativeConfigSource, TerminalColors, TerminalState,
+        build_ghostty_config, effective_appearance, ensure_ghostty_init,
         installed_app_ghostty_resources_dir_for_exe, mark_child_exited_state,
     };
+
+    #[test]
+    fn only_accepted_user_key_presses_acknowledge_program_completion() {
+        use super::ffi::ghostty_input_action_e::*;
+        for action in [
+            GHOSTTY_ACTION_PRESS,
+            GHOSTTY_ACTION_REPEAT,
+            GHOSTTY_ACTION_RELEASE,
+        ] {
+            assert!(!super::program_key_acknowledges(false, true, action));
+            assert!(!super::program_key_acknowledges(true, false, action));
+        }
+        assert!(super::program_key_acknowledges(
+            true,
+            true,
+            GHOSTTY_ACTION_PRESS
+        ));
+        assert!(super::program_key_acknowledges(
+            true,
+            true,
+            GHOSTTY_ACTION_REPEAT
+        ));
+        assert!(!super::program_key_acknowledges(
+            true,
+            true,
+            GHOSTTY_ACTION_RELEASE
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn program_status_io_ingress_is_bounded_and_keeps_clear_reset_barriers() {
+        use super::ffi;
+        use crate::ProgramStatusEvent;
+        let state: super::StateRef = Arc::new(Mutex::new(TerminalState::default()));
+        // The production surface owns this box until Ghostty joins its IO
+        // thread. This fixture uses the same lifetime: join before freeing.
+        let userdata = Box::into_raw(Box::new(state.clone())) as usize;
+        std::thread::spawn(move || {
+            let text = |s: &'static str| ffi::ghostty_action_program_status_string_s {
+                ptr: s.as_ptr(),
+                len: s.len(),
+            };
+            let mut report = ffi::ghostty_action_program_status_s {
+                size: std::mem::size_of::<ffi::ghostty_action_program_status_s>(),
+                state: 1,
+                kind: 0,
+                progress: 40,
+                id: text("build"),
+                app: text("cargo"),
+                title: text("编译"),
+                message: text("Waiting for tests"),
+            };
+            for _ in 0..4096 {
+                unsafe {
+                    super::program_status_callback(
+                        std::ptr::null_mut(),
+                        userdata as *mut _,
+                        0,
+                        &report,
+                    );
+                }
+            }
+            report.state = 5;
+            unsafe {
+                super::program_status_callback(
+                    std::ptr::null_mut(),
+                    userdata as *mut _,
+                    0,
+                    &report,
+                );
+            }
+        })
+        .join()
+        .unwrap();
+        let events = state.lock().program_events.take();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if status.protocol_seen() && status.records().is_empty())
+        );
+        unsafe {
+            super::program_status_callback(
+                std::ptr::null_mut(),
+                userdata as *mut _,
+                2,
+                std::ptr::null(),
+            );
+            drop(Box::from_raw(userdata as *mut super::StateRef));
+        }
+        let events = state.lock().program_events.take();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if !status.protocol_seen() && status.records().is_empty())
+        );
+    }
 
     fn sample_colors(seed: u8) -> TerminalColors {
         TerminalColors {
@@ -1673,7 +2679,9 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::arc_with_non_send_sync)] // Match the UI-thread-only production API.
     fn mark_child_exited_state_clears_busy_and_marks_input_finished() {
+        use crate::ProgramStatusEvent;
         let state = Arc::new(Mutex::new(TerminalState {
             is_busy: true,
             input_generation: 7,
@@ -1681,13 +2689,92 @@ mod tests {
             ..TerminalState::default()
         }));
 
+        crate::program_events::reduce(
+            &mut state.lock().program_events,
+            ProgramStatusEvent::Report {
+                state: 1,
+                kind: 0,
+                progress: -1,
+                id: "running".into(),
+                app: String::new(),
+                title: String::new(),
+                message: String::new(),
+            },
+        );
         mark_child_exited_state(&state);
 
-        let state = state.lock();
+        let mut state = state.lock();
         assert!(state.child_exited);
         assert!(state.needs_render);
         assert!(!state.is_busy);
         assert_eq!(state.last_command_finished_input_generation, 7);
+        let events = state.program_events.take();
+        assert!(
+            matches!(&events[..], [ProgramStatusEvent::Snapshot(status)] if status.records().is_empty() && status.protocol_seen())
+        );
+    }
+
+    #[test]
+    fn osc8_hover_only_queues_an_event_when_the_link_changes() {
+        let mut state = TerminalState::default();
+
+        // Ghostty repeats MOUSE_OVER_LINK on every pointer move over a link.
+        state.set_hovered_osc8_link(Some("https://one.example"));
+        state.set_hovered_osc8_link(Some("https://one.example"));
+        state.set_hovered_osc8_link(None);
+        state.set_hovered_osc8_link(None);
+
+        assert_eq!(
+            state.pending_events.drain(..).collect::<Vec<_>>(),
+            vec![
+                GhosttySurfaceEvent::Osc8LinkHoverChanged(Some("https://one.example".into())),
+                GhosttySurfaceEvent::Osc8LinkHoverChanged(None),
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_actions_coalesce_without_crossing_surfaces_or_losing_shape() {
+        use crate::ffi::{ghostty_action_s, ghostty_action_tag_e::*, ghostty_action_u};
+        let state = Mutex::new(TerminalState::default());
+        let other = Mutex::new(TerminalState::default());
+        for (tag, value) in [
+            (GHOSTTY_ACTION_MOUSE_SHAPE, 3),
+            (GHOSTTY_ACTION_MOUSE_VISIBILITY, 1),
+            (GHOSTTY_ACTION_MOUSE_SHAPE, 8),
+            (GHOSTTY_ACTION_MOUSE_VISIBILITY, 0),
+        ] {
+            // Both payloads are C integers at offset zero in the action union.
+            assert!(unsafe {
+                super::handle_surface_action(
+                    &state,
+                    ghostty_action_s {
+                        tag,
+                        action: ghostty_action_u { mouse_shape: value },
+                    },
+                )
+            });
+            if tag == GHOSTTY_ACTION_MOUSE_VISIBILITY {
+                assert_eq!(state.lock().mouse_visible, Some(value == 0));
+            }
+        }
+        assert!(!unsafe {
+            super::handle_surface_action(
+                &state,
+                ghostty_action_s {
+                    tag: GHOSTTY_ACTION_MOUSE_VISIBILITY,
+                    action: ghostty_action_u {
+                        mouse_visibility: 2,
+                    },
+                },
+            )
+        });
+        let state = state.lock();
+        assert_eq!(state.mouse_shape, Some(8));
+        assert_eq!(state.mouse_visible, Some(true));
+        assert!(state.pending_events.is_empty());
+        assert_eq!(other.lock().mouse_shape, None);
+        assert_eq!(other.lock().mouse_visible, None);
     }
 
     #[test]
@@ -1749,16 +2836,381 @@ mod tests {
             ..Default::default()
         };
 
-        let config = patch.to_config_string();
+        let config = patch.to_config_string(true).unwrap();
         assert!(config.contains("font-family = \"Ioskeley Mono\""));
         assert!(!config.contains(".ZedMono"));
     }
 
     #[test]
-    fn ghostty_config_always_includes_con_shell_integration_features() {
-        let config = GhosttyConfigPatch::default().to_config_string();
+    fn ghostty_config_includes_configured_shell_command() {
+        let patch = GhosttyConfigPatch {
+            shell: Some("/opt/homebrew/bin/fish -l".to_string()),
+            ..Default::default()
+        };
 
-        assert!(config.contains("shell-integration-features = no-cursor,ssh-env,ssh-terminfo"));
+        assert!(
+            patch
+                .to_config_string(true)
+                .unwrap()
+                .contains("command = \"/opt/homebrew/bin/fish -l\"")
+        );
+    }
+
+    #[test]
+    fn ghostty_config_preserves_fallback_order_and_appends_bundled_font() {
+        let patch = GhosttyConfigPatch {
+            font_family: Some("JetBrains Mono".to_string()),
+            font_fallback: Some(vec![
+                "Sarasa Mono SC".to_string(),
+                "Ioskeley Mono".to_string(),
+                "Segoe UI Emoji".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let font_lines = patch
+            .to_config_string(true)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("font-family ="))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            font_lines,
+            vec![
+                "font-family = \"\"",
+                "font-family = \"JetBrains Mono\"",
+                "font-family = \"Sarasa Mono SC\"",
+                "font-family = \"Segoe UI Emoji\"",
+                "font-family = \"Ioskeley Mono\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_patch_merge_can_clear_font_fallbacks() {
+        let mut patch = GhosttyConfigPatch {
+            font_fallback: Some(vec!["Sarasa Mono SC".to_string()]),
+            ..Default::default()
+        };
+        patch.merge(&GhosttyConfigPatch {
+            font_fallback: Some(Vec::new()),
+            ..Default::default()
+        });
+        assert_eq!(patch.font_fallback, Some(Vec::new()));
+    }
+
+    #[test]
+    fn ghostty_config_always_includes_con_shell_integration_features() {
+        let config = GhosttyConfigPatch::default()
+            .to_config_string(true)
+            .unwrap();
+
+        assert!(config.contains("shell-integration-features = no-cursor,ssh-env\n"));
+        assert!(!config.contains("ssh-terminfo"));
+    }
+
+    #[test]
+    fn ghostty_config_only_previews_osc8_links() {
+        let config = GhosttyConfigPatch::default()
+            .to_config_string(true)
+            .unwrap();
+
+        assert!(config.contains("link-previews = osc8\n"));
+    }
+
+    #[test]
+    fn ghostty_config_pins_clipboard_routing() {
+        let config = GhosttyConfigPatch::default()
+            .to_config_string(true)
+            .unwrap();
+
+        assert!(config.contains("copy-on-select = none\n"));
+        assert!(config.contains("middle-click-action = ignore\n"));
+    }
+
+    #[test]
+    fn ghostty_config_denies_reads_independently_of_writes() {
+        for clipboard_write in [None, Some(false), Some(true)] {
+            let config = GhosttyConfigPatch {
+                clipboard_write,
+                ..Default::default()
+            }
+            .to_config_string(true)
+            .unwrap();
+            assert!(config.contains("clipboard-read = deny\n"));
+        }
+    }
+
+    #[test]
+    fn ghostty_config_gates_kitty_clipboard_writes() {
+        let disabled = GhosttyConfigPatch {
+            clipboard_write: Some(false),
+            ..Default::default()
+        }
+        .to_config_string(true)
+        .unwrap();
+
+        assert!(disabled.contains("clipboard-write = deny\n"));
+        assert!(disabled.contains("clipboard-write-limit-bytes = 0\n"));
+        for clipboard_write in [None, Some(true)] {
+            let enabled = GhosttyConfigPatch {
+                clipboard_write,
+                ..Default::default()
+            }
+            .to_config_string(true)
+            .unwrap();
+            assert!(!enabled.contains("clipboard-write = allow\n"));
+            assert!(enabled.contains("clipboard-write-limit-bytes = 1048576\n"));
+        }
+    }
+
+    #[test]
+    fn native_config_loads_relative_include_and_reports_effective_appearance() {
+        ensure_ghostty_init().unwrap();
+        let (_cleanup, root) = temp_test_dir("con-ghostty-native-config-test");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("colors.conf"),
+            "foreground = 123456\nbackground = abcdef\npalette = 1=010203\n",
+        )
+        .unwrap();
+        let source = NativeConfigSource {
+            text: "config-file = colors.conf\nfont-size = 17\nbackground-opacity = 0.75\n".into(),
+            base_dir: root,
+        };
+
+        let defaults = GhosttyConfigPatch {
+            colors: Some(sample_colors(0x80)),
+            font_size: Some(11.0),
+            background_opacity: Some(0.25),
+            cursor_style: Some("bar".into()),
+            ..Default::default()
+        };
+        let config =
+            build_ghostty_config(&defaults, Some(&source), &GhosttyConfigPatch::default()).unwrap();
+        let effective = effective_appearance(config.0).unwrap();
+
+        assert_eq!(effective.foreground, [0x12, 0x34, 0x56]);
+        assert_eq!(effective.background, [0xab, 0xcd, 0xef]);
+        assert_eq!(effective.palette[1], [1, 2, 3]);
+        assert_eq!(effective.font_size, 17.0);
+        assert_eq!(effective.background_opacity, 0.75);
+
+        // Runtime patches win for the current snapshot, but a subsequent full
+        // native reload receives an empty override patch and restores source.
+        let explicit = GhosttyConfigPatch {
+            font_size: Some(23.0),
+            background_opacity: Some(0.5),
+            ..Default::default()
+        };
+        let patched = build_ghostty_config(&defaults, Some(&source), &explicit).unwrap();
+        let patched = effective_appearance(patched.0).unwrap();
+        assert_eq!(patched.font_size, 23.0);
+        assert_eq!(patched.background_opacity, 0.5);
+
+        let reloaded =
+            build_ghostty_config(&defaults, Some(&source), &GhosttyConfigPatch::default()).unwrap();
+        let reloaded = effective_appearance(reloaded.0).unwrap();
+        assert_eq!(reloaded.font_size, 17.0);
+        assert_eq!(reloaded.background_opacity, 0.75);
+        assert_eq!(reloaded.foreground, [0x12, 0x34, 0x56]);
+    }
+
+    #[test]
+    fn native_blur_resolves_includes_aliases_and_glass_materials() {
+        let (_cleanup, root) = temp_test_dir("con-native-blur-test");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("blur.conf"), "background-blur = 37\n").unwrap();
+        for (text, expected) in [
+            ("background-blur = false\n", 0),
+            ("config-file = blur.conf\n", 37),
+            ("background-blur = macos-glass-regular\n", -1),
+            ("background-blur = macos-glass-clear\n", -2),
+            (
+                "background-blur = macos-glass-regular\nbackground-blur-radius = 70\n",
+                70,
+            ),
+        ] {
+            let effective = super::validate_native_config(text, &root).unwrap();
+            assert_eq!(effective.background_blur, expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn native_config_diagnostics_report_all_errors() {
+        let (_cleanup, root) = temp_test_dir("con-native-diagnostics-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let error = super::validate_native_config(
+            "# Keep source line numbers\nnot-a-real-option = true\ncursor-style = invalid-style\n",
+            &root,
+        )
+        .unwrap_err();
+        let lines: Vec<_> = error.lines().collect();
+        assert_eq!(lines.len(), 3, "{error}");
+        assert_eq!(
+            lines[0],
+            "Ghostty configuration rejected with 2 diagnostic(s)"
+        );
+        assert!(
+            lines[1] == "generated native configuration:2:not-a-real-option: unknown field",
+            "{error}"
+        );
+        assert!(
+            lines[2].starts_with(
+                "generated native configuration:3:cursor-style: invalid value \"invalid-style\""
+            ),
+            "{error}"
+        );
+        // Diagnostics own their text after the native config and its temporary
+        // source file are dropped, without leaving private config files behind.
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn native_config_diagnostics_preserve_include_locations_and_load_errors() {
+        let (_cleanup, root) = temp_test_dir("con-native-include-diagnostics-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let include = root.join("样式.conf");
+        std::fs::write(&include, "# Included config\nnot-an-option = true\n").unwrap();
+        let error = super::validate_native_config("config-file = 样式.conf\n", &root).unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "{}:2:not-an-option: unknown field",
+                include.display()
+            )),
+            "{error}"
+        );
+
+        let error =
+            super::validate_native_config("config-file = missing.conf\n", &root).unwrap_err();
+        assert!(error.contains("error opening config-file"), "{error}");
+        assert!(
+            error.contains("missing.conf: error.FileNotFound"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn native_config_diagnostics_identify_generated_patch_layers() {
+        ensure_ghostty_init().unwrap();
+        let invalid = GhosttyConfigPatch {
+            cursor_style: Some("invalid-style".into()),
+            ..Default::default()
+        };
+        let empty = GhosttyConfigPatch::default();
+        for (defaults, overrides, label) in [
+            (&invalid, &empty, "generated defaults:"),
+            (&empty, &invalid, "generated runtime overrides:"),
+        ] {
+            let error = build_ghostty_config(defaults, None, overrides)
+                .err()
+                .expect("invalid patch must be rejected");
+            let detail = error.lines().nth(1).expect("diagnostic detail");
+            assert!(detail.starts_with(label), "{error}");
+            assert!(detail.contains(":cursor-style: invalid value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn native_command_quotes_are_literal_and_newlines_are_rejected() {
+        ensure_ghostty_init().unwrap();
+        let (_cleanup, root) = temp_test_dir("con-native-quote-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let patch = GhosttyConfigPatch {
+            shell: Some(r#"/bin/sh -c "printf hello""#.into()),
+            ..Default::default()
+        };
+        let text = patch.to_config_string(false).unwrap();
+        assert!(text.contains(r#"command = "/bin/sh -c "printf hello"""#));
+        super::validate_native_config(text, &root).unwrap();
+        let patch = GhosttyConfigPatch {
+            shell: Some("/bin/sh\ncommand = injected".into()),
+            ..Default::default()
+        };
+        assert!(patch.to_config_string(false).is_err());
+    }
+
+    #[test]
+    fn native_padding_color_extends_by_default_and_preserves_user_choices() {
+        ensure_ghostty_init().unwrap();
+        let (_cleanup, root) = temp_test_dir("con-padding-color-test");
+        std::fs::create_dir_all(&root).unwrap();
+        for (text, expected) in [
+            ("", "extend"),
+            ("window-padding-color = background\n", "background"),
+            ("window-padding-color = extend-always\n", "extend-always"),
+        ] {
+            let source = NativeConfigSource {
+                text: text.into(),
+                base_dir: root.clone(),
+            };
+            let config = build_ghostty_config(
+                &GhosttyConfigPatch::default(),
+                Some(&source),
+                &GhosttyConfigPatch::default(),
+            )
+            .unwrap();
+            let mut value: *const std::os::raw::c_char = std::ptr::null();
+            let key = "window-padding-color";
+            assert!(unsafe {
+                crate::ffi::ghostty_config_get(
+                    config.0,
+                    (&mut value as *mut *const std::os::raw::c_char).cast(),
+                    key.as_ptr().cast(),
+                    key.len(),
+                )
+            });
+            assert!(!value.is_null());
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr(value) }.to_str().unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn native_clipboard_policy_overrides_defaults_and_runtime_patch_overrides_native() {
+        ensure_ghostty_init().unwrap();
+        let (_cleanup, root) = temp_test_dir("con-clipboard-policy-test");
+        std::fs::create_dir_all(&root).unwrap();
+        for (default, native, runtime, expected) in [
+            (false, "allow", None, "allow"),
+            (true, "deny", None, "deny"),
+            (false, "deny", Some(true), "allow"),
+        ] {
+            let source = NativeConfigSource {
+                text: format!("clipboard-write = {native}\n"),
+                base_dir: root.clone(),
+            };
+            let config = build_ghostty_config(
+                &GhosttyConfigPatch {
+                    clipboard_write: Some(default),
+                    ..Default::default()
+                },
+                Some(&source),
+                &GhosttyConfigPatch {
+                    clipboard_write: runtime,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut value: *const std::os::raw::c_char = std::ptr::null();
+            let key = "clipboard-write";
+            assert!(unsafe {
+                crate::ffi::ghostty_config_get(
+                    config.0,
+                    (&mut value as *mut *const std::os::raw::c_char).cast(),
+                    key.as_ptr().cast(),
+                    key.len(),
+                )
+            });
+            assert!(!value.is_null());
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr(value) }.to_str().unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

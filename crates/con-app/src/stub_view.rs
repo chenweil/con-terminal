@@ -13,24 +13,29 @@
 
 use std::sync::Arc;
 
-use con_ghostty::{GhosttyApp, GhosttySplitDirection, GhosttyTerminal};
+use con_ghostty::{GhosttyApp, GhosttySplitDirection, GhosttyTerminal, TerminalProgress};
 use gpui::*;
 use gpui_component::ActiveTheme;
 
 actions!(ghostty, [ConsumeTab, ConsumeTabPrev]);
 
-#[allow(dead_code)]
-pub struct GhosttyTitleChanged(pub Option<String>);
+pub struct GhosttyTitleChanged {
+    pub content_changed: bool,
+}
+pub struct GhosttyBell;
 pub struct GhosttyProcessExited;
 pub struct GhosttyFocusChanged;
 pub struct GhosttySplitRequested(pub GhosttySplitDirection);
 pub struct GhosttyCwdChanged(pub Option<String>);
+pub struct GhosttyProgressChanged;
 
 impl EventEmitter<GhosttyTitleChanged> for GhosttyView {}
+impl EventEmitter<GhosttyBell> for GhosttyView {}
 impl EventEmitter<GhosttyProcessExited> for GhosttyView {}
 impl EventEmitter<GhosttyFocusChanged> for GhosttyView {}
 impl EventEmitter<GhosttySplitRequested> for GhosttyView {}
 impl EventEmitter<GhosttyCwdChanged> for GhosttyView {}
+impl EventEmitter<GhosttyProgressChanged> for GhosttyView {}
 
 /// Placeholder terminal view. Holds the shared `GhosttyApp` handle so the
 /// field shape matches the macOS view, but never creates a real surface.
@@ -40,6 +45,7 @@ pub struct GhosttyView {
     terminal: Option<Arc<GhosttyTerminal>>,
     focus_handle: FocusHandle,
     initial_cwd: Option<String>,
+    pub(crate) terminal_title: con_core::terminal_title::TerminalTitle,
     #[allow(dead_code)]
     initial_font_size: f32,
 }
@@ -63,6 +69,7 @@ impl GhosttyView {
             terminal: None,
             focus_handle: cx.focus_handle(),
             initial_cwd: cwd,
+            terminal_title: Default::default(),
             initial_font_size: font_size,
         }
     }
@@ -81,6 +88,10 @@ impl GhosttyView {
         self.initial_cwd.clone()
     }
 
+    pub fn progress(&self) -> Option<TerminalProgress> {
+        None
+    }
+
     pub fn is_alive(&self) -> bool {
         false
     }
@@ -94,7 +105,9 @@ impl GhosttyView {
         None
     }
 
-    pub fn shutdown_surface(&mut self) {}
+    pub fn release_mouse_selection(&mut self, _cx: &mut Context<Self>) {}
+
+    pub fn shutdown_surface(&mut self, _window: Option<&mut Window>, _cx: &mut App) {}
 
     pub fn set_surface_focus_state(&mut self, _focused: bool) {}
 

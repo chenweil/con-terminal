@@ -1,9 +1,94 @@
+use super::tab_presentation::editor_tab_title;
 use super::*;
+use crate::editor_tab_actions::reusable_editor_tab_index;
+use crate::file_tree_view::OpenFileInEditorTab;
+
+fn ready_ui_events<T>(receive: impl FnMut() -> Option<T>) -> impl Iterator<Item = T> {
+    std::iter::from_fn(receive).take(64)
+}
+
+fn horizontal_tab_strip_target(orientation: TabsOrientation, tab_count: usize) -> f32 {
+    if orientation == TabsOrientation::Horizontal && tab_count > 1 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+#[cfg(test)]
+mod event_fairness_tests {
+    use super::ready_ui_events;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn continuously_ready_producer_cannot_extend_the_ui_turn() {
+        let mut produced = 0;
+        let received: Vec<_> = ready_ui_events(|| {
+            produced += 1;
+            Some(produced)
+        })
+        .collect();
+        assert_eq!(received.len(), 64);
+        assert_eq!(produced, 64);
+        assert_eq!(received[0], 1);
+        assert_eq!(received[63], 64);
+    }
+
+    #[test]
+    fn bounded_turns_preserve_order_and_leave_backlog_in_the_queue() {
+        let mut queue: VecDeque<_> = (0..150).collect();
+        let first: Vec<_> = ready_ui_events(|| queue.pop_front()).collect();
+        assert_eq!(first, (0..64).collect::<Vec<_>>());
+        assert_eq!(queue.len(), 86);
+        let second: Vec<_> = ready_ui_events(|| queue.pop_front()).collect();
+        assert_eq!(second, (64..128).collect::<Vec<_>>());
+        let last: Vec<_> = ready_ui_events(|| queue.pop_front()).collect();
+        assert_eq!(last, (128..150).collect::<Vec<_>>());
+        assert!(ready_ui_events(|| queue.pop_front()).next().is_none());
+    }
+}
+
+#[cfg(test)]
+mod tab_strip_restore_tests {
+    use super::{MotionValue, TabsOrientation, horizontal_tab_strip_target};
+
+    #[test]
+    fn restored_vertical_tabs_never_start_an_empty_horizontal_tray() {
+        for count in [0, 1, 2, 12] {
+            let motion = MotionValue::new(horizontal_tab_strip_target(
+                TabsOrientation::Vertical,
+                count,
+            ));
+            assert_eq!(motion.current(), 0.0);
+            assert!(!motion.is_animating());
+        }
+        assert_eq!(
+            horizontal_tab_strip_target(TabsOrientation::Horizontal, 1),
+            0.0
+        );
+        assert_eq!(
+            horizontal_tab_strip_target(TabsOrientation::Horizontal, 2),
+            1.0
+        );
+    }
+}
 
 impl ConWorkspace {
+    #[cfg(target_os = "macos")]
     pub fn from_session(
         config: Config,
         session: Session,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::from_session_with_initial_terminal(config, session, None, None, window, cx)
+    }
+
+    pub fn from_session_with_initial_terminal(
+        config: Config,
+        session: Session,
+        initial_working_directory: Option<std::path::PathBuf>,
+        initial_command: Option<crate::startup_args::TerminalCommand>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -28,6 +113,8 @@ impl ConWorkspace {
             s
         });
         let terminal_font_family = sanitize_terminal_font_family(&config.terminal.font_family);
+        let terminal_font_fallback =
+            sanitize_terminal_font_fallback(&config.terminal.font_fallback, &terminal_font_family);
         let ui_font_family = config.appearance.ui_font_family.clone();
         let ui_font_size = config.appearance.ui_font_size;
         let font_size = config.terminal.font_size;
@@ -39,7 +126,6 @@ impl ConWorkspace {
         let tab_accent_inactive_hover_alpha = config.appearance.tab_accent_inactive_hover_alpha;
         let effective_ui_opacity = Self::effective_ui_opacity(ui_opacity);
         sidebar.update(cx, |s, cx| {
-            s.set_ui_opacity(effective_ui_opacity, cx);
             s.set_tab_accent_alphas(
                 tab_accent_inactive_alpha,
                 tab_accent_inactive_hover_alpha,
@@ -52,13 +138,41 @@ impl ConWorkspace {
         let background_image_position = config.appearance.background_image_position.clone();
         let background_image_fit = config.appearance.background_image_fit.clone();
         let background_image_repeat = config.appearance.background_image_repeat;
-        let terminal_theme = TerminalTheme::by_name(&config.terminal.theme).unwrap_or_default();
+        let terminal_theme = TerminalTheme::by_name(&config.terminal.theme).unwrap_or_else(|| {
+            log::warn!(
+                "Configured terminal theme {:?} was not found; using fallback",
+                config.terminal.theme
+            );
+            TerminalTheme::default()
+        });
         let colors = theme_to_ghostty_colors(&terminal_theme);
         let ghostty_app = con_ghostty::GhosttyApp::new(
-            Some(&colors),
-            Some(&terminal_font_family),
-            Some(font_size),
-            Some(terminal_opacity),
+            if cfg!(target_os = "macos") {
+                None
+            } else {
+                Some(&colors)
+            },
+            config.terminal.shell.as_deref(),
+            if cfg!(target_os = "macos") {
+                None
+            } else {
+                Some(&terminal_font_family)
+            },
+            if cfg!(target_os = "macos") {
+                None
+            } else {
+                Some(&terminal_font_fallback)
+            },
+            if cfg!(target_os = "macos") {
+                Some(TerminalConfig::default().font_size)
+            } else {
+                Some(font_size)
+            },
+            if cfg!(target_os = "macos") {
+                Some(AppearanceConfig::default().terminal_opacity)
+            } else {
+                Some(terminal_opacity)
+            },
             Some(terminal_blur),
             Some(&terminal_cursor_style),
             background_image.as_deref(),
@@ -66,9 +180,35 @@ impl ConWorkspace {
             Some(&background_image_position),
             Some(&background_image_fit),
             Some(background_image_repeat),
+            config.terminal.clipboard_write,
         )
         .map(std::sync::Arc::new)
         .unwrap_or_else(|e| panic!("Fatal: failed to initialize Ghostty: {}", e));
+        #[cfg(target_os = "macos")]
+        let (terminal_theme, font_size, terminal_opacity) = {
+            let native_text = native_config_for_app(&config).unwrap_or_else(|error| {
+                panic!("Fatal: failed to render native Ghostty configuration: {error}")
+            });
+            let base_dir = native_config_base_dir(&config).unwrap_or_else(|error| {
+                panic!("Fatal: failed to prepare native Ghostty configuration: {error}")
+            });
+            let effective = ghostty_app
+                .apply_native_config(native_text, &base_dir)
+                .unwrap_or_else(|error| {
+                    panic!("Fatal: invalid native Ghostty configuration: {error}")
+                });
+            let terminal_theme = native_appearance_theme(
+                config.terminal.theme.clone(),
+                effective.foreground,
+                effective.background,
+                &effective.palette,
+            );
+            (
+                terminal_theme,
+                effective.font_size,
+                effective.background_opacity as f32,
+            )
+        };
         let harness = AgentHarness::new(&config).unwrap_or_else(|e| {
             log::error!(
                 "Failed to create agent harness: {}. Agent features disabled.",
@@ -105,6 +245,9 @@ impl ConWorkspace {
         }
 
         let restore_terminal_text = config.appearance.restore_terminal_text;
+        let handoff_menu_entry_enabled = config.experimental.handoff;
+        let initial_working_directory = RefCell::new(initial_working_directory);
+        let initial_command = RefCell::new(initial_command);
         let make_terminal = |cwd: Option<&str>,
                              restored_screen_text: Option<&[String]>,
                              force_restored_screen_text: bool,
@@ -116,11 +259,16 @@ impl ConWorkspace {
             } else {
                 None
             };
+            let working_directory = initial_working_directory.borrow_mut().take();
+            let command = initial_command.borrow_mut().take();
             make_ghostty_terminal(
                 &ghostty_app,
                 cwd,
                 restored_screen_text,
+                working_directory,
+                command,
                 font_size,
+                handoff_menu_entry_enabled,
                 window,
                 cx,
             )
@@ -183,6 +331,7 @@ impl ConWorkspace {
                     user_label: tab_state.user_label.clone(),
                     ai_label: None,
                     ai_icon: None,
+                    agent_cli: None,
                     color: tab_state.color,
                     summary_id: i as u64,
                     summary_epoch: 0,
@@ -208,6 +357,7 @@ impl ConWorkspace {
                 user_label: None,
                 ai_label: None,
                 ai_icon: None,
+                agent_cli: None,
                 color: None,
                 summary_id: 0,
                 summary_epoch: 0,
@@ -229,23 +379,30 @@ impl ConWorkspace {
                 .iter()
                 .enumerate()
                 .map(|(i, tab)| {
+                    let is_editor_only = tab.pane_tree.pane_terminals().is_empty();
                     let presentation = smart_tab_presentation(
                         tab.user_label.as_deref(),
                         tab.ai_label.as_deref(),
                         tab.ai_icon.map(|k| k.svg_path()),
+                        tab.agent_cli,
                         None,
                         Some(tab.title.as_str()),
                         None,
                         i,
+                        is_editor_only,
                     );
-                    let pane_count = tab.pane_tree.pane_terminals().len();
+                    let pane_count = tab.pane_tree.pane_count();
                     SessionEntry {
                         id: tab.summary_id,
                         name: presentation.name,
                         subtitle: presentation.subtitle,
                         is_ssh: presentation.is_ssh,
                         needs_attention: false,
+                        status: None,
+                        status_detail: None,
                         icon: presentation.icon,
+                        pane_icons: Vec::new(),
+                        pane_details: Vec::new(),
                         has_user_label: tab.user_label.is_some(),
                         pane_count,
                         color: tab.color,
@@ -270,7 +427,7 @@ impl ConWorkspace {
             std::mem::replace(&mut tabs[active_tab].panel_state, PanelState::new());
         let agent_panel = cx.new(|cx| {
             let mut panel = AgentPanel::with_state(initial_panel_state, window, cx);
-            panel.set_auto_approve(config.agent.auto_approve_tools);
+            panel.set_auto_approve(config.agent.auto_approve_tools, cx);
             panel
         });
         let input_bar = cx.new(|cx| InputBar::new(window, cx));
@@ -285,12 +442,15 @@ impl ConWorkspace {
             .take(80)
             .cloned()
             .collect::<Vec<_>>();
-        agent_panel.update(cx, |panel, _cx| {
-            panel.set_ui_opacity(effective_ui_opacity);
-            panel.set_recent_inputs(initial_recent_inputs.clone());
+        agent_panel.update(cx, |panel, cx| {
+            panel.set_ui_opacity(effective_ui_opacity, cx);
+            panel.set_assistant_avatar_asset(
+                con_core::config::agent_avatar_asset(&config.appearance.agent_avatar),
+                cx,
+            );
+            panel.set_recent_inputs(initial_recent_inputs.clone(), cx);
         });
         input_bar.update(cx, |bar, cx| {
-            bar.set_ui_opacity(effective_ui_opacity);
             bar.set_recent_commands(initial_recent_inputs, cx);
         });
         sidebar.update(cx, |s, cx| s.set_ui_opacity(effective_ui_opacity, cx));
@@ -349,6 +509,15 @@ impl ConWorkspace {
             .detach();
         cx.subscribe_in(&agent_panel, window, Self::on_rerun_from_message)
             .detach();
+        let mut panel_activity = agent_panel.read(cx).state().activity();
+        cx.observe(&agent_panel, move |workspace, panel, cx| {
+            let activity = panel.read(cx).state().activity();
+            if activity != panel_activity {
+                panel_activity = activity;
+                workspace.refresh_cached_tab_presentation(cx);
+            }
+        })
+        .detach();
         cx.subscribe_in(&sidebar, window, Self::on_sidebar_select)
             .detach();
         cx.subscribe_in(&sidebar, window, Self::on_sidebar_new_session)
@@ -376,6 +545,10 @@ impl ConWorkspace {
         })
         .detach();
         cx.observe_window_activation(window, Self::on_window_activation_changed)
+            .detach();
+        // Child animations dirty rendered ancestors too, but do not notify this
+        // entity's observers. Only workspace notifications invalidate these inputs.
+        cx.observe_self(|this, _| this.chrome_preparation_dirty = true)
             .detach();
 
         // Activity bar: sync file/search drawer state back to workspace on click.
@@ -428,7 +601,13 @@ impl ConWorkspace {
             &file_tree_entity,
             window,
             |this, _tree, event: &OpenFile, window, cx| {
-                this.open_path_in_active_editor(event.path.clone(), window, cx);
+                this.open_path_in_active_editor_with_mode(
+                    event.path.clone(),
+                    None,
+                    !event.keep_open,
+                    window,
+                    cx,
+                );
             },
         )
         .detach();
@@ -439,6 +618,26 @@ impl ConWorkspace {
                 this.open_path_in_active_editor(event.path.clone(), window, cx);
             },
         )
+        .detach();
+
+        // File tree: open file in a dedicated editor tab when user clicks "open in editor tab" button.
+        cx.subscribe_in(
+            &file_tree_entity,
+            window,
+            |this, _tree, event: &OpenFileInEditorTab, window, cx| {
+                this.open_path_in_editor_tab(event.path.clone(), window, cx);
+            },
+        )
+        .detach();
+
+        // Restart must save sessions and release native surfaces in every window,
+        // just like Quit. GPUI's platform restart bypasses our Quit action.
+        let workspace_handle = cx.weak_entity();
+        App::on_app_restart(cx, move |cx| {
+            let _ = workspace_handle.update(cx, |workspace, cx| {
+                workspace.prepare_app_exit(cx);
+            });
+        })
         .detach();
 
         let workspace_handle = cx.weak_entity();
@@ -521,7 +720,9 @@ impl ConWorkspace {
             // Backstop interval for the AI-summary trigger below.
             // See the comment on `last_summary_poll` use site.
             let summary_poll_interval = std::time::Duration::from_secs(3);
+            let agent_cli_poll_interval = std::time::Duration::from_millis(300);
             let mut last_summary_poll = std::time::Instant::now();
+            let mut last_agent_cli_refresh: Option<std::time::Instant> = None;
             loop {
                 let mut got_event = false;
 
@@ -530,8 +731,11 @@ impl ConWorkspace {
                     for tab_idx in 0..workspace.tabs.len() {
                         let is_active = tab_idx == workspace.active_tab;
 
-                        // Agent events
-                        while let Ok(event) = workspace.tabs[tab_idx].session.events().try_recv() {
+                        // Bound each producer's turn so a streaming backlog cannot
+                        // monopolize AppKit/GPUI input dispatch. Leave queued events
+                        // intact and preserve their order for the next turn.
+                        let events = workspace.tabs[tab_idx].session.events().clone();
+                        for event in ready_ui_events(|| events.try_recv().ok()) {
                             got_event = true;
                             let suppress_event =
                                 workspace.handle_pending_control_agent_event(tab_idx, &event);
@@ -590,35 +794,44 @@ impl ConWorkspace {
                             workspace.spawn_skill_scan_job(job);
                         }
                         if applied {
+                            workspace.sync_skill_catalog(cx);
                             cx.notify();
                         }
                     }
 
                     if workspace.pump_ghostty_views(cx) {
                         got_event = true;
-                        // Output flowed — ask the AI summarizer to
-                        // re-check. The engine's per-tab 5 s budget
-                        // and context-hash dedupe keep this from
-                        // firing more than once per real change.
-                        workspace.request_tab_summaries(cx);
+                        let now = std::time::Instant::now();
+                        if should_refresh_agent_cli(
+                            last_agent_cli_refresh,
+                            now,
+                            agent_cli_poll_interval,
+                        ) {
+                            workspace.refresh_agent_cli_detection(cx);
+                            last_agent_cli_refresh = Some(now);
+                        }
                         cx.notify();
-                    } else if last_summary_poll.elapsed() >= summary_poll_interval {
-                        // Backstop for the pump-driven trigger
-                        // above. `pump_ghostty_views` only fires
-                        // while output is actively streaming, so a
-                        // tab whose context drifted while it sat
-                        // idle (user navigated away and back)
-                        // would never re-summarize. The engine's
-                        // per-tab cache + 5 s success budget keep
-                        // repeated calls cheap.
+                    }
+                    if last_summary_poll.elapsed() >= summary_poll_interval {
+                        // Title frames and metadata wakes are not terminal
+                        // content changes. Summary screen reads have their own
+                        // bounded cadence, never the presentation/animation rate.
                         workspace.request_tab_summaries(cx);
                         last_summary_poll = std::time::Instant::now();
+                    }
+                    let now = std::time::Instant::now();
+                    if should_refresh_agent_cli(last_agent_cli_refresh, now, Duration::from_secs(1))
+                    {
+                        workspace.refresh_agent_cli_detection(cx);
+                        last_agent_cli_refresh = Some(now);
                     }
                 })
                 .ok();
 
-                if !got_event {
-                    // Idle tick. The previous 16ms cap meant a PTY
+                {
+                    // Yield even while busy: an always-ready agent/PTY producer
+                    // must not keep this foreground task running without await.
+                    // The previous 16ms cap meant a PTY
                     // chunk arriving 1ms after the loop entered the
                     // sleep had to wait the full 15ms before any
                     // GPUI repaint was even scheduled — visible as
@@ -635,7 +848,11 @@ impl ConWorkspace {
                     // (typically 60 Hz) so this doesn't actually
                     // double the paint work.
                     cx.background_executor()
-                        .timer(std::time::Duration::from_millis(8))
+                        .timer(std::time::Duration::from_millis(if got_event {
+                            4
+                        } else {
+                            8
+                        }))
                         .await;
                 }
             }
@@ -663,7 +880,8 @@ impl ConWorkspace {
             }
         }
 
-        let has_multiple_tabs = tabs.len() > 1;
+        let initial_tab_strip_target =
+            horizontal_tab_strip_target(config.appearance.tabs_orientation, tabs.len());
         let last_ghostty_wake_generation = ghostty_app.wake_generation();
         let next_tab_summary_id_init = tabs.len() as u64;
 
@@ -671,9 +889,14 @@ impl ConWorkspace {
             config: config.clone(),
             sidebar,
             tabs,
+            terminal_presentation: Default::default(),
+            tab_activity: cx.new(|cx| crate::tab_activity::TabActivity::new(window, cx)),
+            chrome_preparation_dirty: true,
             active_tab,
+            last_editor_tab_id: None,
             is_quick_terminal: false,
             terminal_font_family,
+            terminal_font_fallback,
             ui_font_family,
             ui_font_size,
             font_size,
@@ -681,6 +904,7 @@ impl ConWorkspace {
             terminal_opacity,
             terminal_blur,
             ui_opacity,
+            app_icon: sanitize_app_icon(&config.appearance.app_icon),
             tab_accent_inactive_alpha,
             tab_accent_inactive_hover_alpha,
             background_image,
@@ -694,6 +918,7 @@ impl ConWorkspace {
             settings_window: None,
             settings_window_panel: None,
             command_palette,
+            handoff_window: None,
             model_registry,
             harness,
             shell_suggestion_engine,
@@ -701,13 +926,29 @@ impl ConWorkspace {
             global_input_history,
             pane_scope_picker_open: false,
             agent_panel_open,
-            agent_panel_motion: MotionValue::new(if agent_panel_open { 1.0 } else { 0.0 }),
+            agent_panel_motion: SidebarMotion::new(if agent_panel_open { 1.0 } else { 0.0 }),
+            #[cfg(target_os = "macos")]
+            caption_dock: frame::CaptionLayout::new(0.0),
+            #[cfg(target_os = "macos")]
+            canvas_depth_progress: 0.0,
+            #[cfg(target_os = "macos")]
+            native_caption_height: CAPTION_HEIGHT,
+            #[cfg(target_os = "macos")]
+            canvas_surround: frame::CanvasSurround::default(),
+            left_panel_motion: SidebarMotion::new(if session.left_panel_open.unwrap_or(true) {
+                1.0
+            } else {
+                0.0
+            }),
             agent_panel_width,
-            tab_strip_motion: MotionValue::new(if has_multiple_tabs { 1.0 } else { 0.0 }),
+            tab_strip_motion: MotionValue::new(initial_tab_strip_target),
+            tab_slot_motion: Default::default(),
             input_bar_visible: session.input_bar_visible,
-            input_bar_motion: MotionValue::new(if session.input_bar_visible { 1.0 } else { 0.0 }),
+            input_bar_motion: SidebarMotion::new(if session.input_bar_visible { 1.0 } else { 0.0 }),
             modal_was_open: false,
             ghostty_hidden: false,
+            #[cfg(target_os = "macos")]
+            native_tab_handoff_pending: false,
             agent_panel_drag: None,
             sidebar_drag: None,
             terminal_theme,
@@ -718,15 +959,7 @@ impl ConWorkspace {
             #[cfg(target_os = "macos")]
             agent_panel_snap_guard_until: None,
             #[cfg(target_os = "macos")]
-            input_bar_snap_guard_until: None,
-            #[cfg(target_os = "macos")]
-            top_chrome_snap_guard_until: None,
-            #[cfg(target_os = "macos")]
             agent_panel_release_cover_until: None,
-            #[cfg(target_os = "macos")]
-            input_bar_release_cover_until: None,
-            #[cfg(target_os = "macos")]
-            top_chrome_release_cover_until: None,
             #[cfg(target_os = "linux")]
             linux_window_shape_signature: None,
             pending_create_pane_requests: Vec::new(),
@@ -762,6 +995,9 @@ impl ConWorkspace {
             pane_title_drag: None,
             pane_content_bounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tab_strip_tab_bounds: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            horizontal_tab_scroll: gpui::ScrollHandle::new(),
+            horizontal_tab_reveal_key: Default::default(),
+            horizontal_tab_edges: Default::default(),
             pane_title_drag_tab_bounds: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             hide_pane_title_bar: config.appearance.hide_pane_title_bar,
 
@@ -777,6 +1013,13 @@ impl ConWorkspace {
             search_view: search_view_entity,
             workspace_focus: cx.focus_handle(),
         };
+
+        #[cfg(target_os = "macos")]
+        {
+            workspace.sync_native_color_scheme(window, cx);
+            cx.observe_window_appearance(window, Self::sync_native_color_scheme)
+                .detach();
+        }
 
         if let Some(cwd) = workspace
             .try_active_terminal()
@@ -795,12 +1038,62 @@ impl ConWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TerminalPane {
-        make_ghostty_terminal(&self.ghostty_app, cwd, None, self.font_size, window, cx)
+        make_ghostty_terminal(
+            &self.ghostty_app,
+            cwd,
+            None,
+            None,
+            None,
+            self.font_size,
+            self.config.experimental.handoff,
+            window,
+            cx,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn on_terminal_file_requested(
+        &mut self,
+        source: &Entity<GhosttyView>,
+        link: &crate::terminal_file_link::TerminalFileLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Ignore stale/background events rather than opening in an unrelated tab.
+        if self.tabs.get(self.active_tab).is_some_and(|tab| {
+            tab.pane_tree
+                .pane_id_for_entity(source.entity_id())
+                .is_some()
+        }) {
+            self.open_path_at_in_active_editor(link.path.clone(), link.position, window, cx);
+        }
     }
 
     pub(super) fn open_path_in_active_editor(
         &mut self,
         path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_path_in_active_editor_with_mode(path, None, true, window, cx);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn open_path_at_in_active_editor(
+        &mut self,
+        path: PathBuf,
+        position: Option<(usize, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_path_in_active_editor_with_mode(path, position, false, window, cx);
+    }
+
+    fn open_path_in_active_editor_with_mode(
+        &mut self,
+        path: PathBuf,
+        position: Option<(usize, usize)>,
+        temporary: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -860,15 +1153,108 @@ impl ConWorkspace {
         self.tabs[active_tab].pane_tree.focus_pane(pane_id);
         let editor_focus = editor_view.read(cx).focus_handle(cx).clone();
         editor_view.update(cx, |editor: &mut EditorView, cx| {
-            editor.open_file(path.clone(), cx);
+            if temporary {
+                editor.open_temporary_file(path.clone(), cx);
+            } else {
+                editor.open_file_at(path.clone(), position, cx);
+            }
         });
         editor_focus.focus(window, cx);
         self.sync_file_tree_from_active_focus(cx);
+        self.sync_sidebar(cx);
         cx.notify();
     }
 
+    /// Create a new EditorView with font_size and subscribe to ActiveFileChanged and EditorEmptied events.
+    pub(super) fn create_editor_view_subscribed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<EditorView> {
+        let editor_font_size = self.font_size;
+        let editor_view = cx.new(|cx| EditorView::new_with_font_size(editor_font_size, cx));
+        cx.subscribe_in(
+            &editor_view,
+            window,
+            |this, editor, _event: &ActiveFileChanged, _window, cx| {
+                if let Some(tab_index) = this
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.pane_tree.pane_id_for_editor_view(editor).is_some())
+                {
+                    let active_file = editor.read(cx).active_path().map(Path::to_path_buf);
+                    this.tabs[tab_index].title = editor_tab_title(active_file.as_deref());
+                    this.sync_sidebar(cx);
+                    this.save_session(cx);
+                }
+                this.sync_file_tree_from_active_focus(cx);
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &editor_view,
+            window,
+            |this, editor, _event: &EditorEmptied, window, cx| {
+                let Some((tab_index, pane_id)) =
+                    this.tabs.iter().enumerate().find_map(|(tab_index, tab)| {
+                        tab.pane_tree
+                            .pane_id_for_editor_view(editor)
+                            .map(|pane_id| (tab_index, pane_id))
+                    })
+                else {
+                    return;
+                };
+                if !this.close_pane_in_tab(tab_index, pane_id, window, cx) {
+                    this.close_tab_by_index(tab_index, window, cx);
+                }
+            },
+        )
+        .detach();
+        editor_view
+    }
+
+    /// Open a path in an editor tab, reusing existing editor tabs or creating a new one.
+    pub(super) fn open_path_in_editor_tab(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_ids: Vec<u64> = self.tabs.iter().map(|tab| tab.summary_id).collect();
+        let is_editor_tab: Vec<bool> = self
+            .tabs
+            .iter()
+            .map(|tab| tab.pane_tree.pane_terminals().is_empty())
+            .collect();
+
+        let active_tab = self.active_tab;
+        if let Some(idx) = reusable_editor_tab_index(
+            &tab_ids,
+            &is_editor_tab,
+            active_tab,
+            self.last_editor_tab_id,
+        ) {
+            self.activate_tab(idx, window, cx);
+            let pane_id = self.tabs[idx].pane_tree.find_editor_pane().unwrap();
+            self.tabs[idx].pane_tree.focus_pane(pane_id);
+            let editor_view = self.tabs[idx]
+                .pane_tree
+                .editor_view_for_pane(pane_id)
+                .unwrap();
+            let editor_focus = editor_view.read(cx).focus_handle(cx).clone();
+            editor_view.update(cx, |editor: &mut EditorView, cx| {
+                editor.open_file(path.clone(), cx);
+            });
+            editor_focus.focus(window, cx);
+            self.sync_file_tree_from_active_focus(cx);
+            self.save_session(cx);
+        } else {
+            self.new_editor_tab(path, window, cx);
+        }
+    }
+
     pub(super) fn horizontal_tabs_visible(&self) -> bool {
-        !self.vertical_tabs_enabled() && self.tabs.len() > 1
+        horizontal_tab_strip_target(self.config.appearance.tabs_orientation, self.tabs.len()) > 0.5
     }
 
     pub(super) fn vertical_tabs_enabled(&self) -> bool {
@@ -876,11 +1262,8 @@ impl ConWorkspace {
     }
 
     pub(super) fn sync_tab_strip_motion(&mut self) -> bool {
-        let target = if self.horizontal_tabs_visible() {
-            1.0
-        } else {
-            0.0
-        };
+        let target =
+            horizontal_tab_strip_target(self.config.appearance.tabs_orientation, self.tabs.len());
         let changed = (self.tab_strip_motion.current() - target).abs() > 0.001;
         self.tab_strip_motion.set_target(
             target,
@@ -889,7 +1272,17 @@ impl ConWorkspace {
         changed
     }
 
+    #[cfg(target_os = "macos")]
+    pub(super) fn caption_row_height(&self) -> f32 {
+        frame::caption_row_height(!self.vertical_tabs_enabled(), self.canvas_depth_progress)
+    }
+
     pub(super) fn current_top_bar_height(&self) -> f32 {
+        #[cfg(target_os = "macos")]
+        {
+            self.caption_row_height() * self.caption_dock.header
+        }
+        #[cfg(not(target_os = "macos"))]
         if self.tab_strip_motion.is_animating() || self.horizontal_tabs_visible() {
             TOP_BAR_TABS_HEIGHT
         } else {
@@ -987,6 +1380,25 @@ impl ConWorkspace {
     pub(super) fn sync_active_tab_native_view_visibility(&self, cx: &App) {
         if self.has_active_tab() {
             self.sync_tab_native_view_visibility(self.active_tab, true, cx);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn commit_native_tab_handoff(&mut self, cx: &App) {
+        if !std::mem::take(&mut self.native_tab_handoff_pending) {
+            return;
+        }
+        // The incoming pane tree has completed native layout in this prepaint
+        // pass. Retire all other tabs before paint, not one frame later.
+        for (index, _) in self.tabs.iter().enumerate() {
+            if index != self.active_tab {
+                self.sync_tab_native_view_visibility(index, false, cx);
+            }
+        }
+        if !self.ghostty_hidden && !self.is_modal_open(cx) {
+            self.sync_active_tab_native_view_visibility(cx);
+        } else {
+            self.sync_tab_native_view_visibility(self.active_tab, false, cx);
         }
     }
 
@@ -1110,6 +1522,22 @@ impl ConWorkspace {
         self.spawn_skill_scan_job(job);
     }
 
+    /// Catalog arrival updates both editors immediately, independent of cached
+    /// chrome preparation and without requiring another input edit.
+    pub(super) fn sync_skill_catalog(&mut self, cx: &mut Context<Self>) {
+        let entries: Vec<_> = self
+            .harness
+            .skill_summaries()
+            .into_iter()
+            .map(|(name, description)| crate::input_bar::SkillEntry { name, description })
+            .collect();
+        self.input_bar
+            .update(cx, |bar, cx| bar.set_skills(entries.clone(), cx));
+        self.agent_panel
+            .update(cx, |panel, cx| panel.set_skills(entries, cx));
+        self.chrome_preparation_dirty = true;
+    }
+
     pub(super) fn spawn_skill_scan_job(&self, job: SkillScanJob) {
         let failed_result = job.failed_result();
         let tx = self.skill_scan_tx.clone();
@@ -1147,16 +1575,16 @@ impl ConWorkspace {
                     changed |= terminal.drain_surface_state_with_native_scroll(false, cx);
                 }
             }
-            if let Some(started) = started {
-                if changed {
-                    log::info!(
-                        target: "con::perf",
-                        "pump_ghostty_views generation_unchanged terminals={} drains={} changed=1 elapsed_ms={:.3}",
-                        terminal_count,
-                        drain_count,
-                        started.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
+            if let Some(started) = started
+                && changed
+            {
+                log::info!(
+                    target: "con::perf",
+                    "pump_ghostty_views generation_unchanged terminals={} drains={} changed=1 elapsed_ms={:.3}",
+                    terminal_count,
+                    drain_count,
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
             }
             return changed;
         }
@@ -1261,7 +1689,7 @@ impl ConWorkspace {
         cx.defer(move |cx| {
             let result = window_handle.update(cx, |_root, window, cx| {
                 if let Some(workspace) = workspace_handle.upgrade() {
-                    let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.update(cx, |workspace, cx| {
                         workspace.flush_pending_window_control_requests(window, cx);
                         workspace.flush_pending_create_pane_requests(window, cx);
                         workspace.flush_pending_surface_control_requests(window, cx);
@@ -1285,7 +1713,7 @@ impl ConWorkspace {
         cx.defer(move |cx| {
             let result = window_handle.update(cx, |_root, window, cx| {
                 if let Some(workspace) = workspace_handle.upgrade() {
-                    let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.update(cx, |workspace, cx| {
                         if !workspace.has_active_tab() {
                             return;
                         }

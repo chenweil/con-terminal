@@ -12,17 +12,25 @@
 #![allow(unexpected_cfgs)]
 
 mod agent_panel;
+mod app_icon;
 mod assets;
 mod chat_markdown;
 #[cfg(target_os = "macos")]
 mod cli_shim;
 mod command_palette;
+mod config_recovery;
+mod file_icons;
+#[cfg(target_os = "macos")]
+mod first_run;
 #[cfg(target_os = "macos")]
 mod global_hotkey;
 #[cfg(target_os = "macos")]
 mod macos_windowing;
 #[cfg(target_os = "macos")]
 mod quick_terminal;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+mod terminal_find;
+mod terminal_identity;
 
 // The terminal-view module is selected per platform:
 //   macOS   -> ghostty_view.rs (libghostty + child NSView)
@@ -53,23 +61,37 @@ mod ghostty_view;
 mod ghostty_view;
 
 mod activity_bar;
+mod editor_browser;
 mod editor_buffer;
 mod editor_lsp;
+mod editor_preview;
 mod editor_syntax;
+mod editor_tab_actions;
 mod editor_view;
 mod file_tree_view;
 mod input_bar;
+mod input_chrome;
 mod keycaps;
 mod model_registry;
 mod motion;
+mod mouse_sequence;
 mod pane_tree;
+mod process_name;
+mod provider_icons;
+mod reduced_motion;
 mod settings_panel;
 mod sidebar;
 mod sidebar_search_view;
+mod skill_picker;
+mod startup_args;
+mod tab_activity;
 mod tab_colors;
 mod tab_context_menu;
 mod terminal_context_menu;
 mod terminal_env;
+#[cfg(any(target_os = "macos", test))]
+mod terminal_file_link;
+mod terminal_geometry;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod terminal_ime;
 mod terminal_keys;
@@ -77,7 +99,10 @@ mod terminal_links;
 mod terminal_pane;
 mod terminal_paste;
 mod terminal_restore;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod terminal_scrollbar;
 mod terminal_shortcuts;
+mod terminal_url;
 mod theme;
 mod ui_scale;
 mod updater;
@@ -95,6 +120,8 @@ use gpui_component::ActiveTheme;
 #[cfg(target_os = "macos")]
 use gpui_component::link::Link;
 use workspace::ConWorkspace;
+
+use crate::startup_args::StartupArgs;
 
 actions!(
     con,
@@ -141,11 +168,14 @@ actions!(
         RenameSurface,
         CloseSurface,
         FocusInput,
+        AskAi,
+        HandoffAgent,
         CycleInputMode,
         TogglePaneScopePicker,
         ToggleLeftPanel,
         FocusFiles,
         SearchFiles,
+        FindInTerminal,
         CheckForUpdates,
         EditorMoveLeft,
         EditorMoveRight,
@@ -165,6 +195,7 @@ actions!(
         EditorDeleteForward,
         EditorInsertNewline,
         EditorSave,
+        EditorTogglePreview,
         HideApp,
         HideOtherApps,
         ShowAllApps,
@@ -177,30 +208,6 @@ actions!(
         Minimize
     ]
 );
-
-/// Set the macOS dock icon at runtime (for `cargo run` — bundled apps use Info.plist).
-#[cfg(target_os = "macos")]
-fn set_dock_icon() {
-    use cocoa::appkit::{NSApp, NSApplication, NSImage};
-    use cocoa::base::nil;
-    use cocoa::foundation::NSData;
-    use objc::rc::autoreleasepool;
-
-    const ICON_PNG: &[u8] = include_bytes!("../../../assets/Con-macOS-Dark-256x256@2x.png");
-
-    autoreleasepool(|| unsafe {
-        let data = NSData::dataWithBytes_length_(
-            nil,
-            ICON_PNG.as_ptr() as *const std::ffi::c_void,
-            ICON_PNG.len() as u64,
-        );
-        let icon = NSImage::initWithData_(NSImage::alloc(nil), data);
-        NSApp().setApplicationIconImage_(icon);
-    });
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_dock_icon() {}
 
 #[cfg(target_os = "linux")]
 fn linux_uses_client_side_decorations() -> bool {
@@ -478,27 +485,6 @@ fn apply_linux_x11_shape(
     })
 }
 
-#[cfg(target_os = "macos")]
-fn should_use_macos_window_glass_backdrop(blur: bool, effective_opacity: f32) -> bool {
-    blur && effective_opacity < 0.999
-}
-
-#[cfg(target_os = "macos")]
-pub fn set_macos_window_glass_backdrop(window: &mut Window, blur: bool, effective_opacity: f32) {
-    if !supports_transparent_main_window() {
-        window.set_background_appearance(WindowBackgroundAppearance::Opaque);
-        return;
-    }
-
-    window.set_background_appearance(
-        if should_use_macos_window_glass_backdrop(blur, effective_opacity) {
-            WindowBackgroundAppearance::Blurred
-        } else {
-            WindowBackgroundAppearance::Transparent
-        },
-    );
-}
-
 #[cfg(target_os = "windows")]
 fn set_windows_backdrop(window: &mut Window, blur: bool) -> Option<()> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -564,10 +550,10 @@ fn set_windows_backdrop(window: &mut Window, blur: bool) -> Option<()> {
 // and any remaining targets still fall back to `stub_view.rs`. See the
 // platform docs under `docs/impl/`.
 
-fn default_window_options(config: &con_core::Config, cx: &mut App) -> WindowOptions {
+fn default_window_options(cx: &mut App) -> WindowOptions {
     let transparent = supports_transparent_main_window();
     let window_decorations = default_window_decorations();
-    let window_background = default_window_background(config, transparent);
+    let window_background = default_window_background(transparent);
 
     WindowOptions {
         window_bounds: Some(default_workspace_window_bounds(cx)),
@@ -612,8 +598,8 @@ fn quick_terminal_bounds(cx: &mut App) -> WindowBounds {
 }
 
 #[cfg(target_os = "macos")]
-fn quick_terminal_options(config: &con_core::Config, cx: &mut App) -> WindowOptions {
-    let mut options = default_window_options(config, cx);
+fn quick_terminal_options(cx: &mut App) -> WindowOptions {
+    let mut options = default_window_options(cx);
     options.window_bounds = Some(quick_terminal_bounds(cx));
     // Avoid a transient GPUI titlebar before the AppKit trampoline
     // normalizes the window to borderless.
@@ -621,39 +607,14 @@ fn quick_terminal_options(config: &con_core::Config, cx: &mut App) -> WindowOpti
     options
 }
 
-fn default_window_background(
-    config: &con_core::Config,
-    transparent: bool,
-) -> WindowBackgroundAppearance {
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let _ = config;
-
+fn default_window_background(transparent: bool) -> WindowBackgroundAppearance {
     if !transparent {
         return WindowBackgroundAppearance::Opaque;
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let effective_opacity =
-            ConWorkspace::effective_terminal_opacity(config.appearance.terminal_opacity);
-        if should_use_macos_window_glass_backdrop(
-            config.appearance.terminal_blur,
-            effective_opacity,
-        ) {
-            return WindowBackgroundAppearance::Blurred;
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let _ = config;
-        WindowBackgroundAppearance::Transparent
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        WindowBackgroundAppearance::Transparent
-    }
+    // macOS blur is applied once to the NSWindow from Ghostty's effective
+    // configuration. GPUI's NSVisualEffectView would add a second material.
+    WindowBackgroundAppearance::Transparent
 }
 
 fn default_workspace_window_bounds(cx: &mut App) -> WindowBounds {
@@ -713,7 +674,13 @@ fn default_titlebar_options(transparent: bool) -> Option<TitlebarOptions> {
     Some(TitlebarOptions {
         title: Some("con".into()),
         appears_transparent: transparent,
-        ..Default::default()
+        // Centre the native buttons in con's caption row, like its controls.
+        #[cfg(target_os = "macos")]
+        traffic_light_position: settings_panel::traffic_light_position(gpui::px(
+            workspace::CAPTION_HEIGHT,
+        )),
+        #[cfg(not(target_os = "macos"))]
+        traffic_light_position: None,
     })
 }
 
@@ -739,12 +706,56 @@ pub(crate) fn open_con_window(
     exit_on_error: bool,
     cx: &mut App,
 ) {
-    let window_options = default_window_options(&config, cx);
+    open_con_window_with_startup(config, session, exit_on_error, None, cx);
+}
+
+fn open_con_window_with_startup(
+    config: con_core::Config,
+    session: Session,
+    exit_on_error: bool,
+    startup: Option<StartupArgs>,
+    cx: &mut App,
+) {
+    #[cfg(target_os = "macos")]
+    if first_run::pending(cx) {
+        cx.activate(true);
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    let mut window_options = default_window_options(cx);
+    #[cfg(not(target_os = "linux"))]
+    let window_options = default_window_options(cx);
+    #[cfg(target_os = "linux")]
+    if let Some(startup) = startup.as_ref() {
+        if let Some(app_id) = startup.app_id.as_ref() {
+            window_options.app_id = Some(app_id.clone());
+        }
+        if let Some(title) = startup.title.as_ref()
+            && let Some(titlebar) = window_options.titlebar.as_mut()
+        {
+            titlebar.title = Some(title.clone().into());
+        }
+    }
     cx.spawn(async move |cx| {
         if let Err(err) = cx.open_window(window_options, |window, cx| {
             let restored_session = session.clone();
-            let view = cx
-                .new(|cx| ConWorkspace::from_session(config.clone(), restored_session, window, cx));
+            let command = startup.as_ref().and_then(|startup| startup.command.clone());
+            #[cfg(target_os = "linux")]
+            let working_directory = startup
+                .as_ref()
+                .and_then(startup_initial_terminal_directory);
+            #[cfg(not(target_os = "linux"))]
+            let working_directory = None;
+            let view = cx.new(|cx| {
+                ConWorkspace::from_session_with_initial_terminal(
+                    config.clone(),
+                    restored_session,
+                    working_directory,
+                    command,
+                    window,
+                    cx,
+                )
+            });
             #[cfg(target_os = "windows")]
             let mica_applied = apply_windows_backdrop(window, config.appearance.terminal_blur);
 
@@ -787,7 +798,12 @@ pub(crate) fn open_con_window(
 pub(crate) fn open_quick_terminal(config: con_core::Config, session: Session, cx: &mut App) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    let window_options = quick_terminal_options(&config, cx);
+    if first_run::pending(cx) {
+        quick_terminal::opening_failed();
+        cx.activate(true);
+        return;
+    }
+    let window_options = quick_terminal_options(cx);
     cx.spawn(async move |cx| {
         if let Err(err) = cx.open_window(window_options, |window, cx| {
             let restored_session = session.clone();
@@ -830,7 +846,21 @@ pub(crate) fn fresh_window_session_with_history_for_cwd(
 ) -> Session {
     let persisted = Session::load().unwrap_or_default();
     let persisted_history = GlobalHistoryState::load().unwrap_or_default();
-    let mut session = Session::default();
+    fresh_window_session_from_persisted(persisted, persisted_history, cwd)
+}
+
+fn fresh_window_session_from_persisted(
+    persisted: Session,
+    persisted_history: GlobalHistoryState,
+    cwd: Option<std::path::PathBuf>,
+) -> Session {
+    // Fresh terminals should still respect the user's last chrome visibility.
+    let mut session = Session {
+        agent_panel_open: persisted.agent_panel_open,
+        input_bar_visible: persisted.input_bar_visible,
+        left_panel_open: persisted.left_panel_open,
+        ..Session::default()
+    };
 
     session.global_shell_history = if persisted_history.global_shell_history.is_empty() {
         persisted.global_shell_history
@@ -866,17 +896,30 @@ pub(crate) fn fresh_window_session_with_history_for_cwd(
             .collect()
     };
 
-    if let Some(cwd) = cwd {
-        let cwd = cwd.to_string_lossy().to_string();
-        if let Some(tab) = session.tabs.first_mut() {
-            tab.cwd = Some(cwd.clone());
-            if let Some(pane) = tab.panes.first_mut() {
-                pane.cwd = Some(cwd);
-            }
+    if let Some(cwd) = cwd.and_then(|cwd| cwd.into_os_string().into_string().ok())
+        && let Some(tab) = session.tabs.first_mut()
+    {
+        tab.cwd = Some(cwd.clone());
+        if let Some(pane) = tab.panes.first_mut() {
+            pane.cwd = Some(cwd);
         }
     }
 
     session
+}
+
+#[cfg(target_os = "linux")]
+fn startup_initial_terminal_directory(startup: &StartupArgs) -> Option<std::path::PathBuf> {
+    if let Some(cwd) = startup.working_directory.as_ref() {
+        return Some(cwd.clone());
+    }
+
+    let workspace = startup.workspace.as_ref()?;
+    if workspace.is_dir() && !WorkspaceLayout::existing_path_for_root(workspace).exists() {
+        Some(workspace.clone())
+    } else {
+        None
+    }
 }
 
 fn fallback_cwd_for_workspace_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -897,7 +940,7 @@ fn workspace_path_error_session(path: &std::path::Path, err: &anyhow::Error) -> 
     let mut session =
         fresh_window_session_with_history_for_cwd(fallback_cwd_for_workspace_path(path));
     let screen_text = vec![
-        "Con could not open the requested workspace profile.".to_string(),
+        "con could not open the requested workspace profile.".to_string(),
         format!("Path: {}", path.display()),
         format!("Reason: {err}"),
         "Opened a fresh shell instead. Fix the profile and run con <path> again.".to_string(),
@@ -932,11 +975,22 @@ fn workspace_path_error_session(path: &std::path::Path, err: &anyhow::Error) -> 
     session
 }
 
-fn startup_path_argument() -> Option<std::path::PathBuf> {
-    std::env::args_os().skip(1).find_map(|arg| {
-        let text = arg.to_string_lossy();
-        (!text.starts_with('-')).then(|| std::path::PathBuf::from(arg))
-    })
+fn startup_arguments() -> Result<StartupArgs, String> {
+    #[cfg(target_os = "linux")]
+    {
+        StartupArgs::parse_env()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(StartupArgs {
+            workspace: std::env::args_os().skip(1).find_map(|arg| {
+                let text = arg.to_string_lossy();
+                (!text.starts_with('-')).then(|| std::path::PathBuf::from(arg))
+            }),
+            ..StartupArgs::default()
+        })
+    }
 }
 
 pub(crate) fn session_from_workspace_layout_path(
@@ -954,7 +1008,7 @@ pub(crate) fn session_from_workspace_layout_path(
     }
 
     if path.is_dir() {
-        let layout_path = WorkspaceLayout::default_path_for_root(&path);
+        let layout_path = WorkspaceLayout::existing_path_for_root(&path);
         if layout_path.exists() {
             return session_from_workspace_layout_file(layout_path);
         }
@@ -964,18 +1018,22 @@ pub(crate) fn session_from_workspace_layout_path(
     anyhow::bail!("workspace path does not exist: {}", path.display())
 }
 
-fn startup_session() -> Session {
-    if let Some(path) = startup_path_argument() {
-        match session_from_workspace_layout_path(&path) {
+fn startup_session(startup: &StartupArgs) -> Session {
+    if let Some(path) = startup.workspace.as_ref() {
+        match session_from_workspace_layout_path(path) {
             Ok(session) => {
                 log::info!("opening workspace path {}", path.display());
                 return session;
             }
             Err(err) => {
                 log::warn!("failed to open workspace path {}: {err}", path.display());
-                return workspace_path_error_session(&path, &err);
+                return workspace_path_error_session(path, &err);
             }
         }
+    }
+
+    if startup.command.is_some() || startup.working_directory.is_some() {
+        return fresh_window_session_with_history_for_cwd(startup.working_directory.clone());
     }
 
     if live_control_endpoint_exists() {
@@ -1085,6 +1143,44 @@ fn live_control_endpoint_exists() -> bool {
     false
 }
 
+fn has_open_windows(cx: &App) -> bool {
+    cx.window_stack()
+        .map(|windows| !windows.is_empty())
+        .unwrap_or(false)
+}
+
+/// Reload on-disk config and apply the saved Dock icon before opening a
+/// window. Used when the process is alive with no windows so an edited
+/// `app_icon` takes effect instead of the stale in-process saved id.
+fn open_window_from_disk(cx: &mut App) {
+    let Some(config) = load_config_for_new_window(cx) else {
+        return;
+    };
+    app_icon::apply_persisted(&config.appearance.app_icon);
+    app_icon::sync_window_icons(cx);
+    app_icon::sync_saved_file_icon(cx);
+    open_con_window(config, fresh_window_session_with_history(), false, cx);
+}
+
+fn load_validated_config() -> Result<con_core::Config, String> {
+    let config = con_core::Config::load().map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    ConWorkspace::validate_native_config_candidate(&config)?;
+    Ok(config)
+}
+
+fn load_config_for_new_window(cx: &mut App) -> Option<con_core::Config> {
+    match load_validated_config() {
+        Ok(config) => Some(config),
+        Err(error) => {
+            log::error!("Cannot open a window because the configuration is invalid: {error}");
+            eprintln!("con: invalid configuration (file was not modified): {error}");
+            config_recovery::open(error, false, cx);
+            None
+        }
+    }
+}
+
 pub(crate) fn toggle_global_summon(cx: &mut App) {
     let frontmost_window = cx
         .window_stack()
@@ -1097,8 +1193,7 @@ pub(crate) fn toggle_global_summon(cx: &mut App) {
     let app_is_active = cx.active_window().is_some();
 
     if !has_windows {
-        let config = con_core::Config::load().unwrap_or_default();
-        open_con_window(config, fresh_window_session_with_history(), false, cx);
+        open_window_from_disk(cx);
         cx.activate(true);
         return;
     }
@@ -1270,6 +1365,7 @@ struct AboutView {
     app_name: String,
     version: String,
     version_detail: String,
+    icon_asset: SharedString,
 }
 
 #[cfg(target_os = "macos")]
@@ -1278,12 +1374,13 @@ impl Render for AboutView {
         let theme = cx.theme();
         let repo_url = "https://github.com/nowledge-co/con-terminal";
         let detail_surface = theme.secondary_active.opacity(0.34);
-        let quiet_text = theme.foreground.opacity(0.64);
-        let muted_text = theme.foreground.opacity(0.48);
+        let quiet_text = theme.muted_foreground;
+        let muted_text = theme.muted_foreground;
 
         div()
             .size_full()
             .bg(theme.background)
+            .font_family(theme.font_family.clone())
             .px(px(28.0))
             .py(px(28.0))
             .child(
@@ -1296,7 +1393,7 @@ impl Render for AboutView {
                     .gap(px(14.0))
                     .child(
                         div().size(px(88.0)).p(px(2.0)).child(
-                            img("Con-macOS-Dark-256x256@2x.png")
+                            img(self.icon_asset.clone())
                                 .size_full()
                                 .object_fit(ObjectFit::Contain),
                         ),
@@ -1336,19 +1433,34 @@ impl Render for AboutView {
                             .child(format!("{} • {}", self.version, self.version_detail)),
                     )
                     .child(
-                        div().flex().flex_col().items_center().gap(px(6.0)).child(
-                            Link::new("about-repo")
-                                .href(repo_url)
-                                .text_size(px(12.5))
-                                .font_family(theme.mono_font_family.clone())
-                                .child(repo_url),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(16.0))
+                            .child(
+                                Link::new("about-website")
+                                    .href("https://con.nowledge.co")
+                                    .text_size(px(12.5))
+                                    .child("con.nowledge.co"),
+                            )
+                            .child(
+                                Link::new("about-repo")
+                                    .href(repo_url)
+                                    .text_size(px(12.5))
+                                    .child("GitHub"),
+                            ),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(3.0))
+                            .text_align(TextAlign::Center)
+                            .text_size(px(11.5))
                             .text_color(muted_text)
-                            .child("Copyright © 2026 Nowledge Labs, LLC"),
+                            .child("Copyright © 2026 Nowledge Labs, Inc.")
+                            .child("Built with the con community."),
                     ),
             )
     }
@@ -1370,12 +1482,14 @@ fn show_about_window(cx: &mut App) {
     let app_name = about_panel_name();
     let version = app_display_version();
     let version_detail = about_panel_version_detail();
+    let icon_asset = SharedString::from(app_icon::current_asset());
 
     if let Err(err) = cx.open_window(options, move |window, cx| {
         let about = cx.new(|_| AboutView {
             app_name: app_name.clone(),
             version: version.clone(),
             version_detail: version_detail.clone(),
+            icon_asset: icon_asset.clone(),
         });
         cx.new(|cx| gpui_component::Root::new(about, window, cx).bg(cx.theme().background))
     }) {
@@ -1389,6 +1503,7 @@ enum BindingScope {
     Global,
     Input,
     EditorView,
+    GhosttyTerminal,
 }
 
 impl BindingScope {
@@ -1397,6 +1512,7 @@ impl BindingScope {
             BindingScope::Global => None,
             BindingScope::Input => Some("Input"),
             BindingScope::EditorView => Some("EditorView"),
+            BindingScope::GhosttyTerminal => Some("GhosttyTerminal"),
         }
     }
 }
@@ -1463,6 +1579,8 @@ impl BindingSpec {
 
 const GLOBAL_SCOPES: &[BindingScope] = &[BindingScope::Global];
 const EDITOR_SCOPES: &[BindingScope] = &[BindingScope::EditorView];
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+const GHOSTTY_TERMINAL_SCOPES: &[BindingScope] = &[BindingScope::GhosttyTerminal];
 #[cfg_attr(not(test), allow(dead_code))]
 const APP_OVERRIDE_SCOPES: &[BindingScope] = &[
     BindingScope::Global,
@@ -1526,6 +1644,7 @@ fn configurable_app_binding_specs(kb: &KeybindingConfig) -> Vec<BindingSpec> {
     push_global::<RenameSurface>(&mut specs, &kb.rename_surface);
     push_global::<CloseSurface>(&mut specs, &kb.close_surface);
     push_global::<FocusInput>(&mut specs, &kb.focus_input);
+    push_global::<AskAi>(&mut specs, &kb.ask_ai);
     push_global::<CycleInputMode>(&mut specs, &kb.cycle_input_mode);
     push_global::<ToggleInputBar>(&mut specs, &kb.toggle_input_bar);
     push_global::<TogglePaneScopePicker>(&mut specs, &kb.toggle_pane_scope);
@@ -1535,6 +1654,8 @@ fn configurable_app_binding_specs(kb: &KeybindingConfig) -> Vec<BindingSpec> {
     // app navigation, so bind them explicitly in those focused contexts too.
     push_app_override::<FocusFiles>(&mut specs, &kb.focus_files);
     push_app_override::<SearchFiles>(&mut specs, &kb.search_files);
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    push_scoped::<FindInTerminal>(&mut specs, &kb.find_in_terminal, GHOSTTY_TERMINAL_SCOPES);
     push_global::<CollapseSidebar>(&mut specs, &kb.collapse_sidebar);
 
     specs
@@ -1596,6 +1717,7 @@ fn editor_binding_specs() -> Vec<BindingSpec> {
     push_editor::<EditorDeleteForward>(&mut specs, "delete");
     push_editor::<EditorInsertNewline>(&mut specs, "enter");
     push_editor::<EditorSave>(&mut specs, "secondary-s");
+    push_editor::<EditorTogglePreview>(&mut specs, "secondary-shift-v");
     push_editor::<SelectAll>(&mut specs, "secondary-a");
     push_editor::<Copy>(&mut specs, "secondary-c");
     push_editor::<Cut>(&mut specs, "secondary-x");
@@ -1645,9 +1767,7 @@ fn validated_file_sidebar_shortcut(label: &str, binding: &str) -> Option<String>
     }
 
     let mut strokes = trimmed.split_whitespace();
-    let Some(stroke) = strokes.next() else {
-        return None;
-    };
+    let stroke = strokes.next()?;
     if strokes.next().is_some() || Keystroke::parse(stroke).is_err() {
         log::warn!("{label}: expected a single parseable shortcut, ignoring {binding:?}");
         return None;
@@ -1748,7 +1868,7 @@ pub(crate) fn fixed_app_keybinding_shortcuts() -> Vec<(&'static str, &'static st
     let shortcuts = {
         let mut shortcuts = shortcuts;
         shortcuts.extend([
-            ("Hide Con", "cmd-h"),
+            ("Hide con", "cmd-h"),
             ("Hide Other Apps", "cmd-alt-h"),
             ("Show All Apps", "cmd-alt-shift-h"),
             ("Next Window", "cmd-`"),
@@ -1861,12 +1981,12 @@ fn payload_as_str(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep existing production item ordering.
 mod tests {
     use super::{
-        BindingSpec, EditorDeleteBackward, EditorInsertNewline, EditorMoveLineEnd,
-        FileSidebarShortcutBindings, FocusFiles, FocusInput, NewTab, SearchFiles, SelectTab1,
-        ToggleAgentPanel, Undo, binding_specs, command_palette, keystroke_matches_single_binding,
-        push_app_override,
+        BindingSpec, EditorDeleteBackward, EditorInsertNewline, FileSidebarShortcutBindings,
+        FindInTerminal, FocusFiles, FocusInput, NewTab, SearchFiles, SelectTab1, ToggleAgentPanel,
+        Undo, binding_specs, command_palette, keystroke_matches_single_binding, push_app_override,
     };
     use con_core::config::KeybindingConfig;
     use gpui::Keystroke;
@@ -1874,6 +1994,60 @@ mod tests {
 
     fn default_specs() -> Vec<BindingSpec> {
         binding_specs(&KeybindingConfig::default())
+    }
+
+    #[test]
+    fn fresh_window_preserves_chrome_visibility_without_restoring_tabs() {
+        for flags in 0..8 {
+            let input_visible = flags & 1 != 0;
+            let sidebar_visible = flags & 2 != 0;
+            let agent_visible = flags & 4 != 0;
+            let mut persisted = super::Session {
+                agent_panel_open: agent_visible,
+                input_bar_visible: input_visible,
+                left_panel_open: Some(sidebar_visible),
+                ..super::Session::default()
+            };
+            persisted.tabs[0].title = "Old terminal".into();
+            persisted.tabs.push(persisted.tabs[0].clone());
+            persisted.active_tab = 1;
+            persisted.input_history = vec!["old command".into()];
+            let history = super::GlobalHistoryState {
+                input_history: vec!["new command".into()],
+                ..Default::default()
+            };
+
+            let session = super::fresh_window_session_from_persisted(
+                persisted,
+                history,
+                Some(std::path::PathBuf::from("/tmp/project")),
+            );
+
+            assert_eq!(session.agent_panel_open, agent_visible);
+            assert_eq!(session.input_bar_visible, input_visible);
+            assert_eq!(session.left_panel_open, Some(sidebar_visible));
+            assert_eq!(session.tabs.len(), 1);
+            assert_eq!(session.active_tab, 0);
+            assert_eq!(session.tabs[0].title, "Terminal");
+            assert_eq!(session.tabs[0].cwd.as_deref(), Some("/tmp/project"));
+            assert_eq!(
+                session.tabs[0].panes[0].cwd.as_deref(),
+                Some("/tmp/project")
+            );
+            assert_eq!(session.input_history, vec!["new command"]);
+        }
+    }
+
+    #[test]
+    fn fresh_window_keeps_legacy_visibility_defaults() {
+        let session = super::fresh_window_session_from_persisted(
+            super::Session::default(),
+            super::GlobalHistoryState::default(),
+            None,
+        );
+        assert!(session.input_bar_visible);
+        assert!(!session.agent_panel_open);
+        assert_eq!(session.left_panel_open, None);
     }
 
     #[cfg(target_os = "linux")]
@@ -2032,6 +2206,17 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn terminal_find_shortcut_is_scoped_to_ghostty_terminal() {
+        let specs = default_specs();
+
+        assert_eq!(
+            scope_names(&specs_for_action::<FindInTerminal>(&specs)),
+            vec![Some("GhosttyTerminal")]
+        );
+    }
+
     #[test]
     fn file_sidebar_shortcut_matcher_accepts_configured_chords() {
         let focus_binding = if cfg!(target_os = "macos") {
@@ -2068,9 +2253,11 @@ mod tests {
 
     #[test]
     fn file_sidebar_shortcut_bindings_ignore_invalid_config_values() {
-        let mut kb = KeybindingConfig::default();
-        kb.focus_files = "secondary-k secondary-e".to_string();
-        kb.search_files = "not-a-valid binding".to_string();
+        let kb = KeybindingConfig {
+            focus_files: "secondary-k secondary-e".to_string(),
+            search_files: "not-a-valid binding".to_string(),
+            ..KeybindingConfig::default()
+        };
 
         let bindings = FileSidebarShortcutBindings::from_keybindings(&kb);
 
@@ -2081,21 +2268,24 @@ mod tests {
     #[test]
     fn editor_shortcuts_stay_editor_only() {
         let specs = default_specs();
-        for (name, scopes) in [
+        let cases = [
             (
                 "EditorInsertNewline",
                 scope_names(&specs_for_action::<EditorInsertNewline>(&specs)),
-            ),
-            (
-                "EditorMoveLineEnd",
-                scope_names(&specs_for_action::<EditorMoveLineEnd>(&specs)),
             ),
             (
                 "EditorDeleteBackward",
                 scope_names(&specs_for_action::<EditorDeleteBackward>(&specs)),
             ),
             ("Undo", scope_names(&specs_for_action::<Undo>(&specs))),
-        ] {
+            #[cfg(target_os = "macos")]
+            (
+                "EditorMoveLineEnd",
+                scope_names(&specs_for_action::<super::EditorMoveLineEnd>(&specs)),
+            ),
+        ];
+
+        for (name, scopes) in cases {
             assert_eq!(
                 scopes,
                 vec![Some("EditorView")],
@@ -2297,7 +2487,6 @@ fn install_seh_filter() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn inherit_shell_env() {
     use std::io::Read;
-    use std::process::Command;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
@@ -2305,7 +2494,7 @@ fn inherit_shell_env() {
     // -l : login shell — sources /etc/profile, ~/.zprofile, ~/.bash_profile …
     //      (no -i: avoids interactive-only rc noise and TTY hangs)
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    let mut child = match Command::new(&shell)
+    let mut child = match con_paths::host_command(&shell)
         .args(["-l", "-c", "env"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -2502,28 +2691,66 @@ fn main() {
     cli_shim::ensure_cli_shim();
     apply_linux_platform_override();
 
-    let config = con_core::Config::load().unwrap_or_default();
-    log::info!("config loaded");
+    let startup = match startup_arguments() {
+        Ok(startup) => startup,
+        Err(err) => {
+            eprintln!("con: {err}");
+            std::process::exit(2);
+        }
+    };
+
+    let config = load_validated_config();
+    if let Err(error) = &config {
+        eprintln!("con: invalid configuration (file was not modified): {error}");
+        log::error!("Cannot start with the current configuration: {error}");
+    } else {
+        log::info!("config loaded");
+    }
     // Apply [network] proxy config — overrides any shell-inherited env vars.
     // SAFETY: single-threaded at this point in startup; no other threads spawned yet.
-    unsafe { config.network.apply_to_env() };
+    if let Ok(config) = &config {
+        unsafe { config.network.apply_to_env() };
+    }
+
+    let quit_mode = if cfg!(target_os = "macos") {
+        QuitMode::Explicit
+    } else {
+        QuitMode::LastWindowClosed
+    };
 
     let app = gpui_platform::application()
-        .with_quit_mode(QuitMode::Explicit)
-        .with_assets(assets::ConAssets);
+        .with_quit_mode(quit_mode)
+        .with_assets(assets::ConAssets)
+        // Real HTTP client so markdown preview can fetch remote images;
+        // gpui's default NullHttpClient fails every request. reqwest picks
+        // up HTTP(S)_PROXY from the environment (see [network] proxy above).
+        .with_http_client(std::sync::Arc::new(
+            reqwest_client::ReqwestClient::user_agent(concat!("con/", env!("CARGO_PKG_VERSION")))
+                .unwrap_or_else(|_| reqwest_client::ReqwestClient::new()),
+        ));
     log::info!("gpui application created");
-    app.on_reopen(|cx| {
-        let has_windows = cx
-            .window_stack()
-            .map(|windows| !windows.is_empty())
-            .unwrap_or(false);
-        if has_windows {
+    let startup_error = config.as_ref().err().cloned();
+    app.on_reopen(move |cx| {
+        if has_open_windows(cx) {
             cx.activate(true);
             return;
         }
 
-        let config = con_core::Config::load().unwrap_or_default();
-        open_con_window(config, fresh_window_session_with_history(), false, cx);
+        if startup_error.is_some() {
+            match load_validated_config() {
+                Ok(_) => match config_recovery::restart() {
+                    Ok(()) => cx.quit(),
+                    Err(error) => config_recovery::open(
+                        format!("Settings are valid, but con could not restart: {error}"),
+                        true,
+                        cx,
+                    ),
+                },
+                Err(error) => config_recovery::open(error, true, cx),
+            }
+        } else {
+            open_window_from_disk(cx);
+        }
         cx.activate(true);
     });
     app.run(move |cx: &mut App| {
@@ -2531,11 +2758,31 @@ fn main() {
         let channel = con_core::release_channel::init();
         log::info!("Release channel: {}", channel.display_name());
 
-        // Set dock icon for development (cargo run)
-        set_dock_icon();
+        let config = match config {
+            Ok(config) => config,
+            Err(error) => {
+                gpui_component::init(cx);
+                let defaults = con_core::Config::default();
+                theme::init_theme(
+                    cx,
+                    &defaults.terminal.theme,
+                    &defaults.terminal.font_family,
+                    &defaults.appearance.ui_font_family,
+                    defaults.appearance.ui_font_size,
+                );
+                config_recovery::open(error, true, cx);
+                return;
+            }
+        };
+
+        // Apply saved choices to existing and newly created native windows.
+        app_icon::apply_persisted(&config.appearance.app_icon);
+        app_icon::init(cx);
+        app_icon::sync_saved_file_icon(cx);
 
         // Initialize gpui-component subsystems (theme, input, dialog, etc.)
         gpui_component::init(cx);
+        reduced_motion::init(cx);
         input_bar::InputBar::init(cx);
 
         // Load and activate con's design theme (synced to terminal theme)
@@ -2561,10 +2808,17 @@ fn main() {
         quick_terminal::init(cx);
         #[cfg(target_os = "macos")]
         macos_windowing::install_window_cycle_shortcuts();
+        #[cfg(target_os = "macos")]
+        macos_windowing::install_offscreen_window_recovery(cx);
 
         cx.on_action(|_: &NewWindow, cx: &mut App| {
-            let config = con_core::Config::load().unwrap_or_default();
-            open_con_window(config, fresh_window_session_with_history(), false, cx);
+            if has_open_windows(cx) {
+                if let Some(config) = load_config_for_new_window(cx) {
+                    open_con_window(config, fresh_window_session_with_history(), false, cx);
+                }
+            } else {
+                open_window_from_disk(cx);
+            }
         });
         cx.on_action(|_: &ToggleSummon, cx: &mut App| {
             toggle_global_summon(cx);
@@ -2586,8 +2840,13 @@ fn main() {
         });
         cx.on_action(|_: &NewTab, cx: &mut App| {
             if cx.active_window().is_none() {
-                let config = con_core::Config::load().unwrap_or_default();
-                open_con_window(config, fresh_window_session_with_history(), false, cx);
+                if has_open_windows(cx) {
+                    if let Some(config) = load_config_for_new_window(cx) {
+                        open_con_window(config, fresh_window_session_with_history(), false, cx);
+                    }
+                } else {
+                    open_window_from_disk(cx);
+                }
             }
         });
 
@@ -2682,6 +2941,10 @@ fn main() {
                     MenuItem::os_action("Paste", Paste, OsAction::Paste),
                     MenuItem::separator(),
                     MenuItem::os_action("Select All", SelectAll, OsAction::SelectAll),
+                    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                    MenuItem::separator(),
+                    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                    MenuItem::action("Find in Terminal", FindInTerminal),
                 ],
                 disabled: false,
             },
@@ -2717,7 +2980,16 @@ fn main() {
 
         cx.set_dock_menu(vec![MenuItem::action("New Window", NewWindow)]);
 
-        open_con_window(config.clone(), startup_session(), true, cx);
+        #[cfg(target_os = "macos")]
+        first_run::start(config.clone(), startup.clone(), cx);
+        #[cfg(not(target_os = "macos"))]
+        open_con_window_with_startup(
+            config.clone(),
+            startup_session(&startup),
+            true,
+            Some(startup.clone()),
+            cx,
+        );
 
         // Initialize the auto-updater. On macOS this loads Sparkle
         // from the app bundle; on Windows it kicks off a notify-only

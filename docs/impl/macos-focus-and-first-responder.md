@@ -17,6 +17,33 @@ This creates two separate focus systems that must be kept in sync:
 
 Both must be correct for keyboard shortcuts (Cmd+W, Cmd+T, etc.) to work.
 
+## Display reconfiguration
+
+`macos_windowing` installs one application-lifetime observer for
+`NSApplicationDidChangeScreenParametersNotification`. It coalesces notifications
+until 300 ms of quiet, then reads current screen visible frames and window
+frames on the GPUI main thread. Do not cache display geometry across changes.
+
+Visible, titled, non-minimized, non-fullscreen windows with less than half
+their area on the available screens are moved onto the screen with the largest
+overlap, or the first `NSScreen` (the primary display) if completely detached.
+Windows spanning displays count the union of visible areas, without counting
+overlapping or mirrored regions twice. Oversized windows shrink to fit; their
+previous size is not automatically restored later.
+
+This is placement recovery, not focus recovery: it must not activate a window,
+change the first responder or move the borderless Quick Terminal, which owns
+its own geometry. Windows/Linux do not compile or install this observer.
+
+## Native window close ownership
+
+`Window::on_window_should_close` is a decision callback, not a dismissal command.
+It may reject closing to show Settings' inline unsaved-change confirmation, but
+must not call `Window::remove_window` when returning true. GPUI's native on-close
+handler owns removal after the platform accepts the decision. Explicit keyboard
+or button dismissal still needs its own removal path. Keeping these paths
+separate prevents native resources being dropped during the close query.
+
 ---
 
 ## Problem 1 — GPUI has no focused element in editor-only tabs
@@ -128,6 +155,14 @@ After the deferred `shutdown_surface` completes, re-assert `workspace_focus` in 
 ---
 
 ## Summary: checklist for focus correctness
+
+The workspace root tracks `workspace_focus` for shortcut ancestry and explicit
+editor-only fallback. GPUI's `track_focus` also enables default mouse-down focus.
+Suppress that default on the root: empty titlebar and layout-handle clicks must
+not move keyboard focus away from the terminal, editor, or input field. Child
+input targets still focus normally before the root's bubbling handler runs.
+Do not compensate by focusing a terminal on every resize; that would steal
+focus from other inputs and dialogs.
 
 When adding a new non-terminal pane type:
 

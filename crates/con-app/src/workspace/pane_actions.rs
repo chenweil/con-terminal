@@ -44,16 +44,11 @@ impl ConWorkspace {
             super::chrome::agent_panel_motion_target_for_agent_request(self.agent_panel_open)
         {
             self.agent_panel_open = true;
-            let duration = Self::terminal_adjacent_chrome_duration(true, 290, 220);
             #[cfg(target_os = "macos")]
-            if !duration.is_zero() {
-                self.arm_chrome_transition_underlay(duration + Duration::from_millis(80));
-            }
-            #[cfg(target_os = "macos")]
-            if duration.is_zero() {
+            if cx.reduce_motion() {
                 self.arm_agent_panel_snap_guard(cx);
             }
-            self.agent_panel_motion.set_target(target, duration);
+            self.agent_panel_motion.set_target(target);
         }
         self.agent_panel.update(cx, |panel, cx| {
             panel.add_message("user", content, cx);
@@ -292,13 +287,14 @@ impl ConWorkspace {
         });
 
         cx.subscribe_in(&input, window, {
-            move |this, input_entity, event: &InputEvent, _window, cx| {
+            move |this, input_entity, event: &InputEvent, window, cx| {
                 if !matches!(event, InputEvent::PressEnter { .. }) {
                     return;
                 }
                 let value = input_entity.read(cx).value().to_string();
                 this.rename_surface_title(tab_idx, surface_id, value, cx);
                 this.surface_rename = None;
+                this.refocus_active_terminal(window, cx);
                 cx.notify();
             }
         })
@@ -337,7 +333,7 @@ impl ConWorkspace {
         let closing = close_outcome.terminal.clone();
         closing.set_focus_state(false, cx);
         closing.set_native_view_visible(false, cx);
-        closing.shutdown_surface(cx);
+        closing.shutdown_surface(Some(window), cx);
 
         #[cfg(target_os = "macos")]
         self.mark_tab_terminal_native_layout_pending(tab_idx, cx);
@@ -411,6 +407,7 @@ impl ConWorkspace {
         terminal.focus(window, cx);
         self.sync_active_terminal_focus_states(cx);
         self.sync_active_tab_native_view_visibility_now_or_after_layout(was_zoomed, window, cx);
+        self.sync_sidebar(cx);
         Self::schedule_terminal_bootstrap_reassert(
             &terminal,
             true,
@@ -477,10 +474,24 @@ impl ConWorkspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.has_active_tab() {
-            if let Some(t) = self.try_active_terminal() {
-                t.clear_scrollback(cx);
-            }
+        if self.has_active_tab()
+            && let Some(t) = self.try_active_terminal()
+        {
+            t.clear_scrollback(cx);
+        }
+    }
+
+    pub(super) fn find_in_terminal(
+        &mut self,
+        _: &FindInTerminal,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        if self.has_active_tab()
+            && let Some(terminal) = self.try_active_terminal()
+        {
+            terminal.show_terminal_find(_window, _cx);
         }
     }
 
@@ -654,10 +665,8 @@ impl ConWorkspace {
             .pane_terminals()
             .iter()
             .any(|(id, _)| *id == focused_pane_id);
-        if focused_is_terminal {
-            if let Some(t) = self.try_active_terminal() {
-                t.focus(window, cx);
-            }
+        if focused_is_terminal && let Some(t) = self.try_active_terminal() {
+            t.focus(window, cx);
         }
         self.sync_active_terminal_focus_states(cx);
         self.sync_active_tab_native_view_visibility_now_or_after_layout(was_zoomed, window, cx);
@@ -676,6 +685,9 @@ impl ConWorkspace {
         }
         // Focus the target pane first so toggle_zoom_focused acts on it.
         self.tabs[self.active_tab].pane_tree.focus_pane(pane_id);
+        if self.vertical_tabs_enabled() {
+            self.sync_sidebar(cx);
+        }
         self.toggle_focused_pane_zoom(window, cx);
     }
 
@@ -785,6 +797,7 @@ impl ConWorkspace {
                 user_label: None,
                 ai_label: None,
                 ai_icon: None,
+                agent_cli: None,
                 color: None,
                 summary_id,
                 summary_epoch: 0,
@@ -798,14 +811,17 @@ impl ConWorkspace {
             },
         );
 
-        if self.sync_tab_strip_motion() {
-            #[cfg(target_os = "macos")]
-            self.arm_top_chrome_snap_guard(cx);
-            if Self::should_defer_top_chrome_refresh_when_tab_strip_appears() {
-                cx.on_next_frame(window, |_, _, cx| {
-                    cx.notify();
-                });
-            }
+        // These are existing native surfaces, not fresh terminals. Their old
+        // split geometry must not qualify for the incoming tab's layout cache.
+        #[cfg(target_os = "macos")]
+        self.mark_tab_terminal_native_layout_pending(new_index, cx);
+
+        if self.sync_tab_strip_motion()
+            && Self::should_defer_top_chrome_refresh_when_tab_strip_appears()
+        {
+            cx.on_next_frame(window, |_, _, cx| {
+                cx.notify();
+            });
         }
 
         self.activate_tab(new_index, window, cx);
@@ -834,6 +850,7 @@ impl ConWorkspace {
         }
 
         let pane_count = self.tabs[tab_idx].pane_tree.pane_count();
+        let was_zoomed = self.tabs[tab_idx].pane_tree.zoomed_pane_id().is_some();
         let pane_tree = &mut self.tabs[tab_idx].pane_tree;
 
         if let Some(editor_view) = pane_tree.editor_view_for_pane(pane_id) {
@@ -904,18 +921,24 @@ impl ConWorkspace {
             if tab_is_visible {
                 let surviving_terminals: Vec<TerminalPane> =
                     pane_tree.all_terminals().into_iter().cloned().collect();
-                if let Some(terminal) = surviving_terminals.first() {
+                if let Some(terminal) = pane_tree.try_focused_terminal() {
                     terminal.ensure_surface(window, cx);
                     terminal.focus(window, cx);
                 } else {
-                    // No terminals left — keep keyboard focus on workspace
-                    self.workspace_focus.clone().focus(window, cx);
+                    self.focus_active_editor_or_workspace(window, cx);
                 }
                 for terminal in &surviving_terminals {
                     terminal.notify(cx);
                 }
+                #[cfg(target_os = "macos")]
+                self.mark_active_tab_terminal_native_layout_pending(cx);
+                self.sync_active_tab_native_view_visibility_now_or_after_layout(
+                    was_zoomed, window, cx,
+                );
                 self.sync_active_terminal_focus_states(cx);
             }
+            self.sync_sidebar(cx);
+            self.save_session(cx);
             cx.notify();
             return true;
         }
@@ -937,9 +960,9 @@ impl ConWorkspace {
             }
 
             if shutdown_closing_terminals {
-                cx.on_next_frame(window, move |_workspace, _window, cx| {
+                cx.on_next_frame(window, move |_workspace, window, cx| {
                     for terminal in &closing_terminals {
-                        terminal.shutdown_surface(cx);
+                        terminal.shutdown_surface(Some(&mut *window), cx);
                     }
                     if tab_is_visible {
                         for terminal in &surviving_terminals {
@@ -977,6 +1000,7 @@ impl ConWorkspace {
             self.sync_active_terminal_focus_states(cx);
         }
 
+        self.sync_sidebar(cx);
         self.save_session(cx);
         cx.notify();
         true

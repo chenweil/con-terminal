@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use con_ghostty::GhosttyTerminal;
 use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths};
 
@@ -8,6 +8,69 @@ use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths};
 pub enum TerminalPastePayload {
     Text(String),
     ForwardCtrlV,
+}
+
+/// Produce a bounded, inert preview for the unsafe-paste confirmation UI.
+/// Terminal controls, Unicode directional controls, and invisible formatting
+/// characters are replaced so text cannot alter the UI or disguise a command.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+pub fn unsafe_paste_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    const MAX_LINES: usize = 4;
+
+    let mut preview = String::with_capacity(text.len().min(MAX_CHARS));
+    let mut chars = text.chars();
+    let mut lines = 1;
+    let mut truncated = false;
+
+    for (consumed, ch) in chars.by_ref().enumerate() {
+        if consumed == MAX_CHARS {
+            truncated = true;
+            break;
+        }
+
+        match ch {
+            '\n' if lines < MAX_LINES => {
+                preview.push('↵');
+                preview.push('\n');
+                lines += 1;
+            }
+            '\n' => {
+                truncated = true;
+                break;
+            }
+            '\r' => preview.push('␍'),
+            '\t' => preview.push('⇥'),
+            ch if is_unsafe_preview_control(ch) => preview.push('�'),
+            ch => preview.push(ch),
+        }
+    }
+
+    if !truncated && chars.next().is_some() {
+        truncated = true;
+    }
+    if truncated {
+        preview.push('…');
+    }
+    preview
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn is_unsafe_preview_control(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            // Soft hyphen, Arabic letter mark, and Mongolian vowel separator.
+            '\u{00ad}' | '\u{061c}' | '\u{180e}'
+            // Zero-width controls plus left-to-right/right-to-left marks.
+            | '\u{200b}'..='\u{200f}'
+            // Unicode line/paragraph separators and bidi embeddings/overrides.
+            | '\u{2028}'..='\u{202e}'
+            // Word joiner, bidi isolates, and deprecated directional controls.
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+        )
 }
 
 pub fn payload_from_clipboard(item: &ClipboardItem) -> Option<TerminalPastePayload> {
@@ -43,43 +106,33 @@ pub fn payload_from_external_paths(paths: &ExternalPaths) -> Option<TerminalPast
     quoted_paths_text(paths.paths()).map(TerminalPastePayload::Text)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub fn copy_selection_to_clipboard(terminal: &GhosttyTerminal, cx: &mut gpui::App) -> bool {
-    let has_selection = terminal.has_selection();
-    let selection = has_selection.then(|| terminal.selection_text()).flatten();
-    match copy_selection_decision(has_selection, selection.as_deref()) {
+    let selection = terminal.take_selection_text();
+    match copy_selection_decision(selection.as_deref()) {
         CopySelectionDecision::NoSelection => false,
-        CopySelectionDecision::ClearOnly => {
-            terminal.clear_selection();
-            true
-        }
+        CopySelectionDecision::ClearOnly => true,
         CopySelectionDecision::CopyAndClear(selection) => {
             cx.write_to_clipboard(ClipboardItem::new_string(selection.to_string()));
-            terminal.clear_selection();
             true
         }
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 enum CopySelectionDecision<'a> {
     NoSelection,
     ClearOnly,
     CopyAndClear(&'a str),
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn copy_selection_decision(
-    has_selection: bool,
-    selection: Option<&str>,
-) -> CopySelectionDecision<'_> {
-    if !has_selection {
-        return CopySelectionDecision::NoSelection;
-    }
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn copy_selection_decision(selection: Option<&str>) -> CopySelectionDecision<'_> {
     match selection {
         Some(selection) if !selection.is_empty() => CopySelectionDecision::CopyAndClear(selection),
-        _ => CopySelectionDecision::ClearOnly,
+        Some(_) => CopySelectionDecision::ClearOnly,
+        None => CopySelectionDecision::NoSelection,
     }
 }
 
@@ -111,9 +164,7 @@ fn paths_from_uri_list(text: &str) -> Option<Vec<PathBuf>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some(path) = path_from_file_uri(line) else {
-            return None;
-        };
+        let path = path_from_file_uri(line)?;
         paths.push(path);
     }
 
@@ -212,25 +263,21 @@ mod tests {
 
     use super::{
         CopySelectionDecision, TerminalPastePayload, copy_selection_decision,
-        payload_from_clipboard, quoted_paths_text,
+        payload_from_clipboard, quoted_paths_text, unsafe_paste_preview,
     };
 
     #[test]
     fn copy_selection_decision_distinguishes_empty_and_absent_selection() {
         assert_eq!(
-            copy_selection_decision(false, Some("ignored")),
+            copy_selection_decision(None),
             CopySelectionDecision::NoSelection
         );
         assert_eq!(
-            copy_selection_decision(true, None),
+            copy_selection_decision(Some("")),
             CopySelectionDecision::ClearOnly
         );
         assert_eq!(
-            copy_selection_decision(true, Some("")),
-            CopySelectionDecision::ClearOnly
-        );
-        assert_eq!(
-            copy_selection_decision(true, Some("selected")),
+            copy_selection_decision(Some("selected")),
             CopySelectionDecision::CopyAndClear("selected")
         );
     }
@@ -397,6 +444,23 @@ mod tests {
         };
 
         assert_eq!(payload_from_clipboard(&item), None);
+    }
+
+    #[test]
+    fn unsafe_paste_preview_is_bounded_and_neutralizes_control_text() {
+        let text = format!(
+            "echo ok\n\x1b[31mhidden\u{202e}\u{200b}\u{2028}{}",
+            "x".repeat(300)
+        );
+        let preview = unsafe_paste_preview(&text);
+
+        assert!(preview.starts_with("echo ok↵\n�[31mhidden���"));
+        assert!(preview.ends_with('…'));
+        assert!(!preview.contains('\x1b'));
+        assert!(!preview.contains('\u{202e}'));
+        assert!(!preview.contains('\u{200b}'));
+        assert!(!preview.contains('\u{2028}'));
+        assert!(preview.chars().count() <= 245);
     }
 
     #[cfg(windows)]

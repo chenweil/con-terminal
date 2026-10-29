@@ -2,9 +2,10 @@ use con_core::config::{MAX_UI_FONT_SIZE, MIN_UI_FONT_SIZE, sanitize_terminal_fon
 use con_terminal::{Color, TerminalTheme};
 use gpui::App;
 use gpui_component::highlighter::LanguageRegistry;
-use gpui_component::scroll::ScrollbarShow;
-use gpui_component::{Theme, ThemeMode, ThemeRegistry};
+use gpui_component::scroll::ScrollbarMode;
+use gpui_component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry};
 use std::borrow::Cow;
+use std::rc::Rc;
 
 const CON_DARK_THEME: &str = include_str!("../../../assets/themes/con-dark.json");
 const CON_LIGHT_THEME: &str = include_str!("../../../assets/themes/con-light.json");
@@ -184,20 +185,18 @@ pub fn init_theme(
             .expect("Failed to load theme");
     }
 
-    // For init, generate from the resolved terminal theme
-    if let Some(tt) = TerminalTheme::by_name(terminal_theme) {
-        apply_dynamic_theme(&tt, cx);
+    let config = if let Some(tt) = TerminalTheme::by_name(terminal_theme) {
+        dynamic_theme(&tt, cx)
     } else {
-        apply_gpui_theme_by_name(terminal_theme, cx);
-    }
-    let mode = if terminal_theme.contains("light") {
-        ThemeMode::Light
-    } else {
-        ThemeMode::Dark
+        fallback_theme(terminal_theme, ThemeMode::Dark, cx)
     };
-    Theme::change(mode, None, cx);
-    apply_font_overrides(terminal_font_family, ui_font_family, ui_font_size, cx);
-    apply_scrollbar_overrides(cx);
+    apply_theme(
+        config,
+        terminal_font_family,
+        ui_font_family,
+        ui_font_size,
+        cx,
+    );
 }
 
 fn register_command_prompt_language() {
@@ -222,34 +221,39 @@ pub fn sync_gpui_theme(
     terminal_font_family: &str,
     ui_font_family: &str,
     ui_font_size: f32,
-    window: &mut gpui::Window,
     cx: &mut gpui::App,
 ) {
-    apply_dynamic_theme(terminal_theme, cx);
-    let mode = if terminal_theme.name.contains("light") {
-        ThemeMode::Light
-    } else {
-        ThemeMode::Dark
-    };
-    Theme::change(mode, Some(window), cx);
-    apply_font_overrides(terminal_font_family, ui_font_family, ui_font_size, cx);
-    apply_scrollbar_overrides(cx);
+    let config = dynamic_theme(terminal_theme, cx);
+    apply_theme(
+        config,
+        terminal_font_family,
+        ui_font_family,
+        ui_font_size,
+        cx,
+    );
 }
 
-fn apply_font_overrides(
+/// Publish the complete theme once, including Con's typography and track style.
+fn apply_theme(
+    mut config: Rc<ThemeConfig>,
     terminal_font_family: &str,
     ui_font_family: &str,
     ui_font_size: f32,
     cx: &mut App,
 ) {
-    Theme::global_mut(cx).mono_font_family =
-        canonical_terminal_font_family(terminal_font_family).into();
-    Theme::global_mut(cx).font_family = ui_font_family.to_string().into();
+    let theme_config = Rc::make_mut(&mut config);
+    theme_config.mono_font_family =
+        Some(canonical_terminal_font_family(terminal_font_family).into());
+    theme_config.font_family = Some(ui_font_family.to_string().into());
     let clamped_ui_font_size = ui_font_size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE);
-    Theme::global_mut(cx).font_size = gpui::px(clamped_ui_font_size);
-    Theme::global_mut(cx).mono_font_size = gpui::px(
-        (clamped_ui_font_size - 3.0).clamp(MIN_UI_FONT_SIZE - 1.0, MAX_UI_FONT_SIZE - 3.0),
-    );
+    theme_config.font_size = Some(clamped_ui_font_size);
+    theme_config.mono_font_size =
+        Some((clamped_ui_font_size - 3.0).clamp(MIN_UI_FONT_SIZE - 1.0, MAX_UI_FONT_SIZE - 3.0));
+    theme_config.colors.scrollbar = Some("#00000000".into());
+    Theme::update(cx, |theme| {
+        theme.apply_config(&config);
+        theme.scrollbar_mode = ScrollbarMode::Hover;
+    });
 }
 
 /// Map the user-facing display name (`"Ioskeley Mono"` — what the
@@ -282,51 +286,33 @@ pub fn canonical_terminal_font_family(name: &str) -> String {
     name.trim().to_string()
 }
 
-/// Apply con's scrollbar overrides after any Theme::change call.
-/// Must run AFTER Theme::change because it resets colors from the theme config.
-fn apply_scrollbar_overrides(cx: &mut App) {
-    Theme::global_mut(cx).scrollbar_show = ScrollbarShow::Hover;
-    Theme::global_mut(cx).colors.scrollbar = gpui::transparent_black();
-}
-
-/// Generate a GPUI theme dynamically from terminal ANSI colors and register it.
-fn apply_dynamic_theme(tt: &TerminalTheme, cx: &mut App) {
+/// Resolve a fresh config so same-mode palette changes are not registry-deduplicated.
+fn dynamic_theme(tt: &TerminalTheme, cx: &App) -> Rc<ThemeConfig> {
     let json = generate_gpui_theme_json(tt);
-    // Register (or re-register) the dynamic theme
-    // ThemeRegistry skips duplicates, so we directly set the theme config
-    match serde_json::from_str::<serde_json::Value>(&json) {
-        Ok(val) => {
-            if let Ok(theme_set) = serde_json::from_value::<gpui_component::ThemeSet>(val) {
-                for theme_config in theme_set.themes {
-                    let rc = std::rc::Rc::new(theme_config);
-                    if tt.name.contains("light") {
-                        Theme::global_mut(cx).light_theme = rc;
-                    } else {
-                        Theme::global_mut(cx).dark_theme = rc;
-                    }
-                }
-            }
-        }
+    match serde_json::from_str::<gpui_component::ThemeSet>(&json) {
+        Ok(theme_set) => Rc::new(
+            theme_set
+                .themes
+                .into_iter()
+                .next()
+                .expect("one generated theme"),
+        ),
         Err(e) => {
             log::error!("Failed to parse generated theme JSON: {e}");
-            apply_gpui_theme_by_name(&tt.name, cx);
+            fallback_theme(&tt.name, theme_mode(tt), cx)
         }
     }
 }
 
 /// Fallback: map terminal theme name to a pre-registered GPUI theme.
-fn apply_gpui_theme_by_name(terminal_theme_name: &str, cx: &mut App) {
-    let (dark_name, light_name) = match terminal_theme_name {
-        "catppuccin-mocha" => ("Catppuccin Mocha", "Con Light"),
-        "tokyonight" => ("Tokyo Night", "Con Light"),
-        _ => ("Con Dark", "Con Light"),
+fn fallback_theme(terminal_theme_name: &str, mode: ThemeMode, cx: &App) -> Rc<ThemeConfig> {
+    let name = match (mode.is_dark(), terminal_theme_name) {
+        (false, _) => "Con Light",
+        (true, "catppuccin-mocha") => "Catppuccin Mocha",
+        (true, "tokyonight") => "Tokyo Night",
+        (true, _) => "Con Dark",
     };
-    if let Some(d) = ThemeRegistry::global(cx).themes().get(dark_name).cloned() {
-        Theme::global_mut(cx).dark_theme = d;
-    }
-    if let Some(l) = ThemeRegistry::global(cx).themes().get(light_name).cloned() {
-        Theme::global_mut(cx).light_theme = l;
-    }
+    ThemeRegistry::global(cx).themes()[name].clone()
 }
 
 /// Generate a complete GPUI theme JSON string from terminal theme colors.
@@ -348,23 +334,24 @@ fn generate_gpui_theme_json(tt: &TerminalTheme) -> String {
     let magenta = tt.ansi[5];
     let cyan = tt.ansi[6];
 
-    let is_dark = is_dark_color(bg);
+    let is_dark = tt.is_dark();
     let mode = if is_dark { "dark" } else { "light" };
 
     // Generate surface colors by blending bg toward fg
     let surface1 = blend(bg, fg, 0.06);
     let surface2 = blend(bg, fg, 0.12);
     let surface3 = blend(bg, fg, 0.18);
-    let muted_fg = blend(fg, bg, 0.45);
+    let fg = contrasting_text(fg, &[bg]);
+    let muted_fg = contrasting_text(blend(fg, bg, 0.45), &[surface1]);
 
     // Primary contrast — use bg as text on primary buttons for max contrast
-    let primary_fg = bg;
     let primary_hover = if is_dark {
         darken(blue, 0.15)
     } else {
         darken(blue, 0.12)
     };
     let primary_active = darken(blue, 0.25);
+    let primary_fg = contrasting_text(bg, &[blue, primary_hover, primary_active]);
 
     // Danger hover/active
     let danger_hover = if is_dark {
@@ -373,6 +360,12 @@ fn generate_gpui_theme_json(tt: &TerminalTheme) -> String {
         darken(red, 0.1)
     };
     let danger_active = darken(red, 0.2);
+    let secondary_fg = contrasting_text(fg, &[surface1, surface2, surface3]);
+    let accent_fg = contrasting_text(fg, &[surface3]);
+    let success_fg = contrasting_text(fg, &[green]);
+    let danger_fg = contrasting_text(fg, &[red, danger_hover, danger_active]);
+    let warning_fg = contrasting_text(fg, &[yellow]);
+    let info_fg = contrasting_text(fg, &[cyan]);
 
     let theme_name = format!("con-gen-{}", tt.name);
 
@@ -406,7 +399,7 @@ fn generate_gpui_theme_json(tt: &TerminalTheme) -> String {
         "primary.active.background": "{primary_active_hex}",
 
         "secondary.background": "{surface1_hex}",
-        "secondary.foreground": "{fg_hex}",
+        "secondary.foreground": "{secondary_fg_hex}",
         "secondary.hover.background": "{surface2_hex}",
         "secondary.active.background": "{surface3_hex}",
 
@@ -414,27 +407,27 @@ fn generate_gpui_theme_json(tt: &TerminalTheme) -> String {
         "muted.foreground": "{muted_fg_hex}",
 
         "accent.background": "{surface3_hex}",
-        "accent.foreground": "{fg_hex}",
+        "accent.foreground": "{accent_fg_hex}",
 
         "success.background": "{green_hex}",
-        "success.foreground": "{primary_fg_hex}",
+        "success.foreground": "{success_fg_hex}",
 
         "danger.background": "{red_hex}",
-        "danger.foreground": "{primary_fg_hex}",
+        "danger.foreground": "{danger_fg_hex}",
         "danger.hover.background": "{danger_hover_hex}",
         "danger.active.background": "{danger_active_hex}",
 
         "warning.background": "{yellow_hex}",
-        "warning.foreground": "{primary_fg_hex}",
+        "warning.foreground": "{warning_fg_hex}",
 
         "info.background": "{cyan_hex}",
-        "info.foreground": "{primary_fg_hex}",
+        "info.foreground": "{info_fg_hex}",
 
-        "title_bar.background": "{surface1_hex}",
+        "title_bar.background": "{bg_hex}",
         "title_bar.border": "{border}",
 
         "sidebar.background": "{surface1_hex}",
-        "sidebar.foreground": "{fg_hex}",
+        "sidebar.foreground": "{secondary_fg_hex}",
         "sidebar.border": "{border}",
 
         "list.active.background": "{list_active}",
@@ -512,6 +505,12 @@ fn generate_gpui_theme_json(tt: &TerminalTheme) -> String {
         fg_hex = hex(fg),
         border = hex(surface2),
         primary_fg_hex = hex(primary_fg),
+        secondary_fg_hex = hex(secondary_fg),
+        accent_fg_hex = hex(accent_fg),
+        success_fg_hex = hex(success_fg),
+        danger_fg_hex = hex(danger_fg),
+        warning_fg_hex = hex(warning_fg),
+        info_fg_hex = hex(info_fg),
         primary_hover_hex = hex(primary_hover),
         primary_active_hex = hex(primary_active),
         surface1_hex = hex(surface1),
@@ -554,9 +553,51 @@ fn hex_rgb(r: u8, g: u8, b: u8) -> String {
     format!("#{:02X}{:02X}{:02X}", r, g, b)
 }
 
-fn is_dark_color(c: Color) -> bool {
-    let luma = 0.299 * c.r as f64 + 0.587 * c.g as f64 + 0.114 * c.b as f64;
-    luma < 128.0
+fn theme_mode(theme: &TerminalTheme) -> ThemeMode {
+    if theme.is_dark() {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    }
+}
+
+fn contrast_ratio(a: Color, b: Color) -> f64 {
+    let lighter = a.relative_luminance().max(b.relative_luminance());
+    let darker = a.relative_luminance().min(b.relative_luminance());
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+fn contrasting_text(preferred: Color, backgrounds: &[Color]) -> Color {
+    const MIN_CONTRAST: f64 = 4.5;
+    if backgrounds
+        .iter()
+        .all(|background| contrast_ratio(preferred, *background) >= MIN_CONTRAST)
+    {
+        return preferred;
+    }
+
+    let black = Color::rgb(0, 0, 0);
+    let white = Color::rgb(255, 255, 255);
+    let minimum_contrast = |candidate| {
+        backgrounds
+            .iter()
+            .map(|background| contrast_ratio(candidate, *background))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let target = if minimum_contrast(black) >= minimum_contrast(white) {
+        black
+    } else {
+        white
+    };
+    // Preserve the preferred tone instead of turning every low-contrast
+    // secondary label or placeholder into the strongest possible text.
+    for step in 1..=255 {
+        let candidate = blend(preferred, target, f64::from(step) / 255.0);
+        if minimum_contrast(candidate) >= MIN_CONTRAST {
+            return candidate;
+        }
+    }
+    target
 }
 
 fn blend(base: Color, target: Color, amount: f64) -> Color {
@@ -581,4 +622,193 @@ fn lighten(c: Color, amount: f64) -> Color {
         (c.g as f64 + (255.0 - c.g as f64) * amount) as u8,
         (c.b as f64 + (255.0 - c.b as f64) * amount) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn overrides_reach_base_theme_after_each_mode_change(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            for (mode, requested, ui_size, mono_size) in [
+                (ThemeMode::Light, 19.0, 19.0, 16.0),
+                (ThemeMode::Dark, 40.0, 24.0, 21.0),
+                (ThemeMode::Dark, -2.0, 12.0, 11.0),
+                (ThemeMode::Light, 17.0, 17.0, 14.0),
+            ] {
+                Theme::set_scrollbar_mode(ScrollbarMode::Scrolling, cx);
+                let mut config = ThemeConfig {
+                    mode,
+                    font_size: Some(11.0),
+                    mono_font_size: Some(9.0),
+                    ..Default::default()
+                };
+                config.colors.scrollbar = Some("#A03050".into());
+                let config = Rc::new(config);
+                apply_theme(
+                    config.clone(),
+                    "Ioskeley Mono",
+                    ".SystemUIFont",
+                    requested,
+                    cx,
+                );
+
+                // Registry-owned configurations must not acquire caller overrides.
+                assert_eq!(config.font_size, Some(11.0));
+                assert_eq!(config.colors.scrollbar.as_deref(), Some("#A03050"));
+
+                assert_eq!(
+                    Theme::global(cx).tokens.scrollbar,
+                    gpui::transparent_black().into(),
+                    "the styled scrollbar token must reflect Con's transparent track"
+                );
+                let base = gpui_base::Theme::global(cx);
+                assert_eq!(base.scrollbar.mode(), ScrollbarMode::Hover);
+                assert_eq!(base.tokens, Theme::global(cx).semantic_tokens());
+                assert_eq!(Theme::global(cx).mode, mode);
+                assert_eq!(base.tokens.typography.mono.as_ref(), "IoskeleyMono");
+                assert_eq!(base.tokens.typography.md.size, gpui::px(ui_size));
+                assert_eq!(base.tokens.typography.mono_md.size, gpui::px(mono_size));
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn native_palette_changes_reload_without_a_name_or_mode_change(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            init_theme(
+                cx,
+                "unknown-native-theme",
+                "Ioskeley Mono",
+                ".SystemUIFont",
+                19.0,
+            );
+            assert_eq!(Theme::global(cx).mode, ThemeMode::Dark);
+
+            let mut terminal = TerminalTheme::flexoki_dark();
+            for (background, expected) in [
+                (Color::rgb(0x12, 0x28, 0x35), 0x122835),
+                (Color::rgb(0x30, 0x18, 0x25), 0x301825),
+            ] {
+                terminal.background = background;
+                sync_gpui_theme(&terminal, "Ioskeley Mono", ".SystemUIFont", 19.0, cx);
+                let theme = Theme::global(cx);
+                assert_eq!(theme.background, gpui::rgb(expected).into());
+                assert_eq!(theme.mode, ThemeMode::Dark);
+                assert_eq!(
+                    gpui_base::Theme::global(cx).tokens.colors.background,
+                    theme.background
+                );
+                assert_eq!(theme.font_size, gpui::px(19.0));
+            }
+        });
+    }
+
+    fn generated_colors(theme: &TerminalTheme) -> serde_json::Map<String, serde_json::Value> {
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_gpui_theme_json(theme)).unwrap();
+        json["themes"][0]["colors"].as_object().unwrap().clone()
+    }
+
+    fn color(value: &serde_json::Value) -> Color {
+        let hex = value.as_str().unwrap().trim_start_matches('#');
+        Color::rgb(
+            u8::from_str_radix(&hex[0..2], 16).unwrap(),
+            u8::from_str_radix(&hex[2..4], 16).unwrap(),
+            u8::from_str_radix(&hex[4..6], 16).unwrap(),
+        )
+    }
+
+    #[test]
+    fn flexoki_muted_text_stays_readable_without_outshining_body_text() {
+        for theme in [
+            TerminalTheme::flexoki_dark(),
+            TerminalTheme::flexoki_light(),
+        ] {
+            let colors = generated_colors(&theme);
+            let background = color(&colors["muted.background"]);
+            let muted = color(&colors["muted.foreground"]);
+            let foreground = color(&colors["foreground"]);
+
+            assert!(contrast_ratio(muted, background) >= 4.5);
+            assert!(
+                contrast_ratio(muted, background) < contrast_ratio(foreground, background),
+                "{}: muted text must remain less prominent than body text",
+                theme.name,
+            );
+        }
+    }
+
+    #[test]
+    fn contrast_correction_preserves_valid_colors_and_checks_every_background() {
+        let preferred = Color::rgb(0x78, 0x77, 0x72);
+        let black = Color::rgb(0, 0, 0);
+        let surface = Color::rgb(0x30, 0x28, 0x20);
+        assert_eq!(contrasting_text(preferred, &[black]), preferred);
+
+        let corrected = contrasting_text(preferred, &[black, surface]);
+        assert_ne!(corrected, preferred);
+        assert_ne!(corrected, Color::rgb(255, 255, 255));
+        for background in [black, surface] {
+            assert!(contrast_ratio(corrected, background) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn low_contrast_normal_text_is_corrected() {
+        let mut theme = TerminalTheme::flexoki_light();
+        theme.foreground = Color::rgb(0xDD, 0xDD, 0xDD);
+        let colors = generated_colors(&theme);
+
+        assert!(contrast_ratio(color(&colors["foreground"]), theme.background) >= 4.5);
+        assert!(
+            contrast_ratio(
+                color(&colors["muted.foreground"]),
+                color(&colors["muted.background"])
+            ) >= 4.5
+        );
+    }
+
+    #[test]
+    fn pale_yellow_warning_gets_its_own_contrasting_text() {
+        let mut theme = TerminalTheme::tokyonight();
+        theme.ansi[3] = Color::rgb(0xFF, 0xF4, 0xA3);
+        let colors = generated_colors(&theme);
+
+        assert!(contrast_ratio(color(&colors["warning.foreground"]), theme.ansi[3]) >= 4.5);
+    }
+
+    #[test]
+    fn tinted_dark_background_selects_dark_mode_without_touching_palette() {
+        let mut theme = TerminalTheme::flexoki_light();
+        theme.name = "misleading-light".into();
+        theme.background = Color::rgb(0x12, 0x28, 0x35);
+        let palette = theme.ansi;
+        let json: serde_json::Value =
+            serde_json::from_str(&generate_gpui_theme_json(&theme)).unwrap();
+
+        assert_eq!(json["themes"][0]["mode"], "dark");
+        assert_eq!(theme.ansi, palette);
+    }
+
+    #[test]
+    fn terminal_adjacent_chrome_uses_native_background_without_tint() {
+        for (background, expected) in [
+            (Color::rgb(0xfa, 0xf9, 0xf5), "#FAF9F5"),
+            (Color::rgb(0x12, 0x28, 0x35), "#122835"),
+        ] {
+            let mut theme = TerminalTheme::paper_light();
+            theme.background = background;
+            let json: serde_json::Value =
+                serde_json::from_str(&generate_gpui_theme_json(&theme)).unwrap();
+            let colors = &json["themes"][0]["colors"];
+            assert_eq!(colors["title_bar.background"], expected);
+            assert_eq!(colors["background"], expected);
+            // Selection surfaces still need their own visual hierarchy.
+            assert_ne!(colors["secondary.background"], expected);
+        }
+    }
 }

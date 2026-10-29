@@ -1,6 +1,6 @@
 use con_agent::{
     AgentEvent, AgentProvider, Conversation, Message, PaneRequest, SkillRegistry, TerminalContext,
-    TerminalExecRequest, ToolApprovalDecision, is_dangerous,
+    TerminalExecRequest, ToolApprovalDecision,
 };
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -50,11 +50,22 @@ pub enum HarnessEvent {
         /// This is per-request: each agent invocation gets its own channel.
         approval_tx: Sender<ToolApprovalDecision>,
     },
+    /// A previously announced approval wait has ended. Both channel identity
+    /// and call ID are required because requests and provider call IDs overlap.
+    ToolApprovalEnded {
+        call_id: String,
+        approval_tx: Sender<ToolApprovalDecision>,
+    },
     /// Tool finished executing
     ToolCallComplete {
         call_id: String,
         tool_name: String,
         result: String,
+    },
+    /// One agent invocation ended. The channel identifies exactly the
+    /// approvals belonging to that invocation, even when requests overlap.
+    RequestFinished {
+        approval_tx: Sender<ToolApprovalDecision>,
     },
     /// Agent produced a final response
     ResponseComplete(Message),
@@ -87,6 +98,12 @@ pub struct AgentSession {
     pane_tx: Sender<PaneRequest>,
     pane_rx: Receiver<PaneRequest>,
     cancel_flag: Arc<AtomicBool>,
+}
+
+impl Default for AgentSession {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AgentSession {
@@ -322,8 +339,8 @@ impl AgentHarness {
     pub fn classify_input(&self, input: &str, is_remote: bool) -> InputKind {
         let trimmed = input.trim();
 
-        if trimmed.starts_with('/') {
-            let parts: Vec<&str> = trimmed[1..].splitn(2, ' ').collect();
+        if let Some(rest) = trimmed.strip_prefix('/') {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
             let skill_name = parts[0].to_string();
             let args = parts.get(1).map(|s| s.to_string());
             if self.skills.get(&skill_name).is_some() {
@@ -361,6 +378,8 @@ impl AgentHarness {
             focused_hostname_confidence: focused_runtime.remote_host_confidence,
             focused_hostname_source: focused_runtime.remote_host_source,
             focused_title: focused_observation.title.clone(),
+            focused_foreground_process_group_id: focused_observation.foreground_process_group_id,
+            focused_tty_name: focused_observation.tty_name.clone(),
             focused_front_state: focused_runtime.front_state,
             focused_pane_mode: focused_runtime.mode,
             focused_has_shell_integration: focused_observation.has_shell_integration,
@@ -472,18 +491,26 @@ impl AgentHarness {
                                         input,
                                     },
                                 );
-                                if is_dangerous(&tool_name) {
-                                    let _ = htx.send(HarnessEvent::ToolApprovalNeeded {
-                                        call_id: call_id.clone(),
-                                        tool_name: tool_name.clone(),
-                                        args: args.clone(),
-                                        approval_tx: per_request_approval_tx.clone(),
-                                    });
-                                }
                                 HarnessEvent::ToolCallStart {
                                     call_id,
                                     tool_name,
                                     args,
+                                }
+                            }
+                            AgentEvent::ToolApprovalNeeded {
+                                call_id,
+                                tool_name,
+                                args,
+                            } => HarnessEvent::ToolApprovalNeeded {
+                                call_id,
+                                tool_name,
+                                args,
+                                approval_tx: per_request_approval_tx.clone(),
+                            },
+                            AgentEvent::ToolApprovalEnded { call_id } => {
+                                HarnessEvent::ToolApprovalEnded {
+                                    call_id,
+                                    approval_tx: per_request_approval_tx.clone(),
                                 }
                             }
                             AgentEvent::ToolCallComplete {
@@ -584,6 +611,7 @@ impl AgentHarness {
                 }
             }
 
+            let _ = harness_tx.send(HarnessEvent::RequestFinished { approval_tx });
             log::info!("[harness] Request complete");
         });
     }
@@ -759,6 +787,7 @@ fn existing_skill_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep existing production item ordering.
 mod tests {
     use super::*;
     use crate::config::{Config, SkillsConfig};
@@ -1061,7 +1090,7 @@ fn shell_aliases() -> &'static HashSet<String> {
     static CACHE: OnceLock<HashSet<String>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let output = std::process::Command::new(&shell)
+        let output = con_paths::host_command(&shell)
             .args(["-ic", "alias"])
             .stderr(std::process::Stdio::null())
             .output()
@@ -1186,10 +1215,8 @@ fn looks_like_command(input: &str, is_remote: bool) -> bool {
     // On SSH sessions, remote executables aren't on local $PATH.
     // A command-shaped first word is likely a remote command — unless
     // the input reads like natural language.
-    if is_remote && is_command_shaped(first_word) {
-        if !has_natural_language_signals(input) {
-            return true;
-        }
+    if is_remote && is_command_shaped(first_word) && !has_natural_language_signals(input) {
+        return true;
     }
 
     false
@@ -1259,7 +1286,7 @@ async fn enrich_context_with_workspace_snapshot(mut context: TerminalContext) ->
 
             let agents_md = std::fs::read_to_string(cwd_path.join("AGENTS.md")).ok();
 
-            let git_branch = std::process::Command::new("git")
+            let git_branch = con_paths::host_command("git")
                 .args(["rev-parse", "--abbrev-ref", "HEAD"])
                 .current_dir(cwd_path)
                 .output()
@@ -1268,7 +1295,7 @@ async fn enrich_context_with_workspace_snapshot(mut context: TerminalContext) ->
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
             let git_diff = {
-                let stat = std::process::Command::new("git")
+                let stat = con_paths::host_command("git")
                     .args(["diff", "--stat"])
                     .current_dir(cwd_path)
                     .output()
@@ -1280,7 +1307,7 @@ async fn enrich_context_with_workspace_snapshot(mut context: TerminalContext) ->
                 if stat.trim().is_empty() {
                     None
                 } else {
-                    let diff = std::process::Command::new("git")
+                    let diff = con_paths::host_command("git")
                         .args(["diff"])
                         .current_dir(cwd_path)
                         .output()
@@ -1309,7 +1336,7 @@ async fn enrich_context_with_workspace_snapshot(mut context: TerminalContext) ->
             };
 
             let project_structure = {
-                let output = std::process::Command::new("git")
+                let output = con_paths::host_command("git")
                     .args(["ls-files", "--cached", "--others", "--exclude-standard"])
                     .current_dir(cwd_path)
                     .output()
@@ -1318,7 +1345,7 @@ async fn enrich_context_with_workspace_snapshot(mut context: TerminalContext) ->
                     .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
 
                 let listing = output.or_else(|| {
-                    std::process::Command::new("find")
+                    con_paths::host_command("find")
                         .args([
                             ".",
                             "-maxdepth",

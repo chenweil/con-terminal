@@ -1,5 +1,8 @@
 use super::*;
 
+pub(super) type HorizontalTabRevealState =
+    std::rc::Rc<std::cell::Cell<Option<(u64, usize, usize, Pixels)>>>;
+
 /// Drag state for pane title bar drag-to-tab promotion.
 #[derive(Clone)]
 pub(super) struct PaneTitleDragState {
@@ -14,6 +17,13 @@ pub(super) fn pane_title_drag_to_tab_active(drag: Option<&PaneTitleDragState>) -
     drag.is_some_and(|drag| drag.active)
 }
 
+/// A pane uses the tab destination already visible in this window. In vertical
+/// mode the sidebar owns promotion; creating a second strip changes native
+/// terminal geometry in the middle of the drag.
+pub(super) fn pane_drag_needs_horizontal_tabs(vertical_tabs: bool, active: bool) -> bool {
+    active && !vertical_tabs
+}
+
 /// Workspace-owned drag preview state for horizontal tab-strip drags.
 /// GPUI's built-in active-drag preview does not reliably honor relative
 /// `.top/.left` constraints, so horizontal tab drags hide that preview and
@@ -24,6 +34,8 @@ pub(super) struct TabDragPreviewState {
     pub(super) icon: &'static str,
     pub(super) source_top: Pixels,
     pub(super) cursor_offset_x: Pixels,
+    pub(super) size: Size<Pixels>,
+    pub(super) source_visual_index: usize,
 }
 
 pub(super) fn tab_drag_overlay_origin(
@@ -138,17 +150,6 @@ pub(super) fn pane_title_drag_tab_slot(
     tab_count
 }
 
-pub(super) fn remap_drop_slot_for_current_order(
-    source_index: usize,
-    hovered_index: usize,
-) -> usize {
-    if hovered_index > source_index {
-        hovered_index + 1
-    } else {
-        hovered_index
-    }
-}
-
 pub(super) fn is_dragged_tab_source(
     active_dragged_tab_session_id: Option<u64>,
     tab_session_id: u64,
@@ -205,6 +206,9 @@ pub(super) struct Tab {
     /// AI-suggested icon, paired with `ai_label`. When `None`, the
     /// row falls back to the heuristic icon.
     pub(super) ai_icon: Option<TabIconKind>,
+    /// Cached classification of the focused terminal as an interactive agent
+    /// CLI. Detection combines process, title, and bounded screen signals.
+    pub(super) agent_cli: Option<&'static str>,
     /// Stable identifier for this tab across the lifetime of the
     /// window — used as the cache key in the `TabSummaryEngine` so
     /// reorders, closes, and re-opens don't collide. Allocated from

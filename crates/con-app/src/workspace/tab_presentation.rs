@@ -26,12 +26,10 @@ pub(super) fn pane_display_name(
         ) && path
             .parent()
             .and_then(|p| p.parent())
-            .map_or(false, |pp| pp.parent().is_none());
+            .is_some_and(|pp| pp.parent().is_none());
 
-        if !is_bare_home {
-            if let Some(base) = path.file_name() {
-                return base.to_string_lossy().to_string();
-            }
+        if !is_bare_home && let Some(base) = path.file_name() {
+            return base.to_string_lossy().to_string();
         }
     }
 
@@ -56,30 +54,56 @@ pub(super) struct VerticalTabPresentation {
     pub(super) is_ssh: bool,
 }
 
+mod agents;
+pub(super) use agents::*;
+
+fn icon_or_agent(agent_cli: Option<&str>, fallback: &'static str) -> &'static str {
+    agent_cli_icon(agent_cli).unwrap_or(fallback)
+}
+
 /// Smart-name + smart-icon for tab metadata.
 ///
-/// Priority:
+/// Name priority:
 /// 1. **User-supplied label** (set via inline rename or context menu)
-///    — terminal-icon, no subtitle.
-/// 2. **SSH host** (e.g. `prod-1.example.com`) — globe icon, subtitle
-///    is `user@host` if available.
-/// 3. **Focused process** parsed out of the OSC-set terminal title
-///    (e.g. `vim README.md`, `htop`, `less log.txt`) — icon picked by
-///    process kind (editor / monitor / pager / shell), subtitle is the
-///    cwd basename.
-/// 4. **CWD basename** — terminal icon, no subtitle.
-/// 5. **Shell name** (`bash`, `zsh`, `fish`) — terminal icon, no
-///    subtitle.
-/// 6. Fallback `Tab N` — terminal icon, no subtitle.
+/// 2. **AI label**
+/// 3. **SSH host** (e.g. `prod-1.example.com`)
+/// 4. **Focused process** parsed out of the OSC-set terminal title
+/// 5. **CWD basename**
+/// 6. **Shell name** (`bash`, `zsh`, `fish`)
+/// 7. Fallback `Tab N`
+///
+/// Icon priority (terminal tabs only):
+/// agent CLI logo > SSH globe > AI icon > heuristic.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn smart_tab_presentation(
     user_label: Option<&str>,
     ai_label: Option<&str>,
     ai_icon: Option<&'static str>,
+    agent_cli: Option<&str>,
     hostname: Option<&str>,
     title: Option<&str>,
     current_dir: Option<&str>,
     tab_index: usize,
+    is_editor_only: bool,
 ) -> VerticalTabPresentation {
+    // Editor-only tabs (no terminal panes): fixed file icon, name
+    // priority user label → AI label → tab title → "Editor".
+    if is_editor_only {
+        let name = user_label
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| ai_label.map(str::trim).filter(|s| !s.is_empty()))
+            .or_else(|| title.map(str::trim).filter(|s| !s.is_empty()))
+            .unwrap_or("Editor")
+            .to_string();
+        return VerticalTabPresentation {
+            name,
+            subtitle: None,
+            icon: "phosphor/file-code.svg",
+            is_ssh: false,
+        };
+    }
+
     let is_ssh_session = hostname.map(|h| !h.trim().is_empty()).unwrap_or(false);
 
     // Helper: pick the heuristic icon (used when no AI / SSH signal).
@@ -105,7 +129,7 @@ pub(super) fn smart_tab_presentation(
         return VerticalTabPresentation {
             name: label.to_string(),
             subtitle: cwd_subtitle(current_dir),
-            icon,
+            icon: icon_or_agent(agent_cli, icon),
             is_ssh: is_ssh_session,
         };
     }
@@ -122,7 +146,7 @@ pub(super) fn smart_tab_presentation(
         return VerticalTabPresentation {
             name: label.to_string(),
             subtitle: cwd_subtitle(current_dir),
-            icon,
+            icon: icon_or_agent(agent_cli, icon),
             is_ssh: is_ssh_session,
         };
     }
@@ -132,21 +156,21 @@ pub(super) fn smart_tab_presentation(
         return VerticalTabPresentation {
             name: host.to_string(),
             subtitle: cwd_subtitle(current_dir),
-            icon: "phosphor/globe.svg",
+            icon: icon_or_agent(agent_cli, "phosphor/globe.svg"),
             is_ssh: true,
         };
     }
 
     // 4. Focused-process heuristic.
-    if let Some(raw) = title.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some((command, icon)) = parse_focused_process(raw) {
-            return VerticalTabPresentation {
-                name: command,
-                subtitle: cwd_subtitle(current_dir),
-                icon,
-                is_ssh: false,
-            };
-        }
+    if let Some(raw) = title.map(str::trim).filter(|s| !s.is_empty())
+        && let Some((command, icon)) = parse_focused_process(raw)
+    {
+        return VerticalTabPresentation {
+            name: command,
+            subtitle: cwd_subtitle(current_dir),
+            icon: icon_or_agent(agent_cli, icon),
+            is_ssh: false,
+        };
     }
 
     if let Some(dir) = current_dir {
@@ -157,16 +181,14 @@ pub(super) fn smart_tab_presentation(
         ) && path
             .parent()
             .and_then(|p| p.parent())
-            .map_or(false, |pp| pp.parent().is_none());
-        if !is_bare_home {
-            if let Some(base) = path.file_name() {
-                return VerticalTabPresentation {
-                    name: base.to_string_lossy().into_owned(),
-                    subtitle: None,
-                    icon: "phosphor/terminal.svg",
-                    is_ssh: false,
-                };
-            }
+            .is_some_and(|pp| pp.parent().is_none());
+        if !is_bare_home && let Some(base) = path.file_name() {
+            return VerticalTabPresentation {
+                name: base.to_string_lossy().into_owned(),
+                subtitle: None,
+                icon: icon_or_agent(agent_cli, "phosphor/terminal.svg"),
+                is_ssh: false,
+            };
         }
     }
 
@@ -174,7 +196,7 @@ pub(super) fn smart_tab_presentation(
         return VerticalTabPresentation {
             name: raw.to_string(),
             subtitle: None,
-            icon: "phosphor/terminal.svg",
+            icon: icon_or_agent(agent_cli, "phosphor/terminal.svg"),
             is_ssh: false,
         };
     }
@@ -182,19 +204,22 @@ pub(super) fn smart_tab_presentation(
     VerticalTabPresentation {
         name: format!("Tab {}", tab_index + 1),
         subtitle: None,
-        icon: "phosphor/terminal.svg",
+        icon: icon_or_agent(agent_cli, "phosphor/terminal.svg"),
         is_ssh: false,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn tab_rename_initial_label(
     user_label: Option<&str>,
     ai_label: Option<&str>,
     ai_icon: Option<&'static str>,
+    agent_cli: Option<&str>,
     hostname: Option<&str>,
     title: Option<&str>,
     current_dir: Option<&str>,
     tab_index: usize,
+    is_editor_only: bool,
 ) -> String {
     if let Some(label) = user_label.filter(|label| !label.trim().is_empty()) {
         label.to_string()
@@ -203,10 +228,12 @@ pub(super) fn tab_rename_initial_label(
             user_label,
             ai_label,
             ai_icon,
+            agent_cli,
             hostname,
             title,
             current_dir,
             tab_index,
+            is_editor_only,
         )
         .name
     }
@@ -219,29 +246,14 @@ pub(super) fn cwd_subtitle(current_dir: Option<&str>) -> Option<String> {
         if dir == home {
             return Some("~".to_string());
         }
-        if let Some(rest) = dir.strip_prefix(home) {
-            if rest.starts_with('/') {
-                let trimmed = format!("~{rest}");
-                return Some(shorten_path(&trimmed));
-            }
+        if let Some(rest) = dir.strip_prefix(home)
+            && rest.starts_with('/')
+        {
+            let trimmed = format!("~{rest}");
+            return Some(trimmed);
         }
     }
-    Some(shorten_path(dir))
-}
-
-pub(super) fn shorten_path(path: &str) -> String {
-    const MAX_LEN: usize = 32;
-    if path.chars().count() <= MAX_LEN {
-        return path.to_string();
-    }
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() <= 2 {
-        return path.to_string();
-    }
-    let last = parts.last().copied().unwrap_or("");
-    let parent = parts.get(parts.len() - 2).copied().unwrap_or("");
-    let prefix = if path.starts_with('/') { "/" } else { "" };
-    format!("{prefix}…/{parent}/{last}")
+    Some(dir.to_string())
 }
 
 /// Parse a terminal title to extract the focused command and pick an
@@ -294,6 +306,20 @@ pub(super) fn parse_focused_process(title: &str) -> Option<(String, &'static str
         _ => Some((trimmed.to_string(), "phosphor/terminal.svg")),
     }
 }
+
+/// Derive a display title for an editor tab.
+///
+/// - `Some(path)` → `path.file_name()` as string
+/// - `None` → `"Editor"`
+pub(crate) fn editor_tab_title(active_file: Option<&std::path::Path>) -> String {
+    match active_file.and_then(|p| p.file_name()) {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => "Editor".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn longest_common_prefix<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
     let mut iter = values.into_iter();

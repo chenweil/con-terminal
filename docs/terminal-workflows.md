@@ -79,6 +79,24 @@ If you want the cleanest possible terminal surface, hide pane title bars from
 Settings -> Appearance. The shortcuts and terminal context menu still expose the
 same pane actions.
 
+## Browse files
+
+Select a file in the file browser or search results to preview it in an editor
+pane. The italic file tab is temporary: selecting another file replaces it
+without adding more tabs.
+
+Double-click the file tab to keep it open. Editing or saving the file also keeps
+it, so browsing cannot replace your changes. Selecting a file that is already
+open returns to its existing tab.
+
+Use the file row's **Open in editor tab** button when you want a permanent tab
+right away. This does not replace the temporary tab. Images use the same
+temporary-tab behavior, but remain read-only.
+
+When editing an HTML file (`.html` or `.htm`), choose **Open in browser** in
+its tab bar to view the saved file in your default browser. Save your edits
+first if you want to see them; this action does not save the editor buffer.
+
 ## The input bar
 
 The input bar is one surface with three modes:
@@ -145,6 +163,13 @@ Use the platform modifier to open links from terminal output:
 
 - macOS: hold <kbd>⌘</kbd>, then click a URL.
 - Windows and Linux: hold <kbd>⌃</kbd>, then click a URL.
+
+In a mouse-aware TUI, an ordinary click still belongs to the app. Hold the
+modifier to open a terminal link instead.
+
+On macOS, hover a terminal link and press <kbd>⌘</kbd><kbd>C</kbd> to copy its
+complete address, even if it wraps across several lines. A text selection
+takes priority over the hovered link.
 
 Paste text normally. Dragging files into the terminal sends their paths. When a
 TUI supports image/file paste protocols, con forwards compatible clipboard and

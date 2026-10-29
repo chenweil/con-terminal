@@ -1,12 +1,13 @@
 use crossbeam_channel::Sender;
+use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::clipboard::Clipboard;
-use gpui_component::divider::Divider;
-use gpui_component::input::{Input, InputEvent, InputState, Position};
+use gpui_component::input::{InputEvent, Position, Textarea, TextareaState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::spinner::Spinner;
+use gpui_component::separator::Separator;
+use gpui_component::text::TextView;
 use gpui_component::{ActiveTheme, Disableable, Icon, Sizable as _, Theme};
 
 /// Max lines to show for tool result previews in collapsed steps
@@ -30,16 +31,17 @@ use std::time::Duration;
 
 use crate::chat_markdown::{
     ChatMarkdownBlockView, ChatMarkdownTone, ParsedChatMarkdown, chat_markdown_block_gap,
-    render_parsed_chat_markdown, render_parsed_chat_markdown_prefix,
+    render_parsed_chat_markdown_prefix_with_copy_namespace,
 };
 use crate::input_bar::SkillEntry;
 use crate::motion::{MotionValue, vertical_reveal_offset};
 use crate::settings_panel::provider_label;
-use crate::ui_scale::{mono_px, mono_space_px, ui_px, ui_space_px};
+use crate::ui_scale::{mono_px, mono_space_px, ui_icon_px, ui_px, ui_space_px};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AgentStatus {
     Idle,
+    AwaitingResponse,
     Thinking,
     Responding,
 }
@@ -146,6 +148,18 @@ impl PanelState {
         self.messages.len()
     }
 
+    /// Presentation only. Approval decisions remain owned by the harness.
+    pub(crate) fn activity(&self) -> con_core::terminal_status::Activity {
+        use con_core::terminal_status::Activity;
+        if !self.pending_approvals.is_empty() {
+            Activity::NeedsInput
+        } else if self.status != AgentStatus::Idle || self.streaming {
+            Activity::Busy
+        } else {
+            Activity::Idle
+        }
+    }
+
     /// Populate from a loaded conversation, including persisted thinking and steps.
     pub fn from_conversation(conv: &con_agent::Conversation) -> Self {
         let mut state = Self::new();
@@ -163,9 +177,9 @@ impl PanelState {
     }
 
     pub fn clear(&mut self) {
+        self.deny_pending_approvals("Conversation cleared before approval");
         self.messages = vec![PanelMessage::new("system", SYSTEM_GREETING)];
         self.tool_calls.clear();
-        self.pending_approvals.clear();
         self.streaming = false;
         self.status = AgentStatus::Idle;
     }
@@ -173,18 +187,23 @@ impl PanelState {
     /// Truncate conversation back to (but not including) the message at `msg_idx`.
     /// Used for edit-and-rerun: removes the old user message and everything after it.
     pub fn truncate_to(&mut self, msg_idx: usize) {
+        self.deny_pending_approvals("Conversation truncated before approval");
         if msg_idx < self.messages.len() {
             self.messages.truncate(msg_idx);
         }
         self.tool_calls.clear();
-        self.pending_approvals.clear();
         self.streaming = false;
         self.status = AgentStatus::Idle;
     }
 
     pub fn add_message(&mut self, role: &str, content: &str) {
         self.streaming = false;
-        self.status = AgentStatus::Idle;
+        // Submission feedback must not wait for context gathering or network events.
+        self.status = if role == "user" {
+            AgentStatus::AwaitingResponse
+        } else {
+            AgentStatus::Idle
+        };
         self.messages.push(PanelMessage::new(role, content));
     }
 
@@ -204,16 +223,17 @@ impl PanelState {
     }
 
     pub fn restore_last_assistant_trace(&mut self, thinking: Option<&str>, steps: &[AgentStep]) {
-        if let Some(last) = self.messages.last_mut() {
-            if last.role == "assistant" {
-                last.set_thinking(thinking.map(ToOwned::to_owned));
-                last.steps = restored_steps_from_agent_steps(steps);
-                last.thinking_collapsed = true;
-                if !last.steps.is_empty() {
-                    last.steps_collapsed = true;
-                }
-                last.touch();
+        if let Some(last) = self.messages.last_mut()
+            && last.role == "assistant"
+        {
+            last.set_thinking(thinking.map(ToOwned::to_owned));
+            last.steps = restored_steps_from_agent_steps(steps);
+            last.thinking_collapsed = true;
+            if !last.steps.is_empty() || last.thinking.as_ref().is_some_and(|text| !text.is_empty())
+            {
+                last.steps_collapsed = true;
             }
+            last.touch();
         }
     }
 
@@ -221,7 +241,7 @@ impl PanelState {
         self.status = AgentStatus::Thinking;
         if let Some(last) = self.messages.last_mut() {
             last.steps.push(StepEntry {
-                icon: "phosphor/brain-duotone.svg",
+                icon: "phosphor/sparkle.svg",
                 label: step.to_string(),
                 detail: None,
                 status: StepStatus::Complete,
@@ -268,6 +288,44 @@ impl PanelState {
         });
     }
 
+    fn deny_pending_approvals(&mut self, reason: &str) {
+        for approval in self.pending_approvals.drain(..) {
+            let _ = approval.approval_tx.send(ToolApprovalDecision {
+                call_id: approval.call_id,
+                allowed: false,
+                reason: Some(reason.to_string()),
+            });
+        }
+    }
+
+    fn finish_request(&mut self, approval_tx: &Sender<ToolApprovalDecision>) {
+        let mut retained = Vec::with_capacity(self.pending_approvals.len());
+        for approval in self.pending_approvals.drain(..) {
+            if approval.approval_tx.same_channel(approval_tx) {
+                let _ = approval.approval_tx.send(ToolApprovalDecision {
+                    call_id: approval.call_id,
+                    allowed: false,
+                    reason: Some("Agent request finished before approval".to_string()),
+                });
+            } else {
+                retained.push(approval);
+            }
+        }
+        self.pending_approvals = retained;
+    }
+
+    fn finish_approval(&mut self, approval_tx: &Sender<ToolApprovalDecision>, call_id: &str) {
+        self.pending_approvals.retain(|approval| {
+            !(approval.call_id == call_id && approval.approval_tx.same_channel(approval_tx))
+        });
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.deny_pending_approvals("Agent request cancelled");
+        self.streaming = false;
+        self.status = AgentStatus::Idle;
+    }
+
     pub fn update_thinking(&mut self, text: &str) {
         self.status = AgentStatus::Thinking;
         if !self.streaming {
@@ -303,18 +361,18 @@ impl PanelState {
             // Only overwrite streamed content if final_content is non-empty.
             // Some providers don't emit text items, leaving final_content empty —
             // in that case, keep whatever was accumulated during streaming.
-            if !final_content.is_empty() {
-                if let Some(last) = self.messages.last_mut() {
-                    last.replace_content(final_content);
-                }
+            if !final_content.is_empty()
+                && let Some(last) = self.messages.last_mut()
+            {
+                last.replace_content(final_content);
             }
             // Attach metadata to the last assistant message
-            if let Some(last) = self.messages.last_mut() {
-                if last.role == "assistant" {
-                    last.model = model.map(|s| s.to_string());
-                    last.duration_ms = duration_ms;
-                    last.touch();
-                }
+            if let Some(last) = self.messages.last_mut()
+                && last.role == "assistant"
+            {
+                last.model = model.map(|s| s.to_string());
+                last.duration_ms = duration_ms;
+                last.touch();
             }
             self.streaming = false;
         } else if !final_content.is_empty() {
@@ -325,8 +383,7 @@ impl PanelState {
         }
         // Ensure a message exists for tool call steps even when no text was produced.
         // This happens when the agent only used tools without generating text output.
-        if !self.tool_calls.is_empty()
-            && self.messages.last().map_or(true, |m| m.role != "assistant")
+        if !self.tool_calls.is_empty() && self.messages.last().is_none_or(|m| m.role != "assistant")
         {
             let mut msg = PanelMessage::new("assistant", "");
             msg.model = model.map(|s| s.to_string());
@@ -338,7 +395,7 @@ impl PanelState {
             let args_display = format_tool_args(&tc.tool_name, &tc.args);
             let human_name = humanize_tool_name(&tc.tool_name);
             let (status, detail) = if let Some(result) = &tc.result {
-                let formatted = format_tool_result(&tc.tool_name, &result);
+                let formatted = format_tool_result(&tc.tool_name, result);
                 (StepStatus::Complete, Some(formatted))
             } else {
                 (StepStatus::Complete, None)
@@ -356,13 +413,14 @@ impl PanelState {
                 last.touch();
             }
         }
-        // Auto-collapse steps on completed messages to reduce scroll noise. This
+        // Auto-collapse activity on completed messages to reduce scroll noise. This
         // must happen after live tool calls are moved into the step timeline.
-        if let Some(last) = self.messages.last_mut() {
-            if !last.steps.is_empty() {
-                last.steps_collapsed = true;
-                last.touch();
-            }
+        if let Some(last) = self.messages.last_mut()
+            && (!last.steps.is_empty()
+                || last.thinking.as_ref().is_some_and(|text| !text.is_empty()))
+        {
+            last.steps_collapsed = true;
+            last.touch();
         }
     }
 
@@ -397,12 +455,19 @@ impl PanelState {
             } => {
                 self.add_pending_approval(&call_id, &tool_name, &args, approval_tx);
             }
+            HarnessEvent::ToolApprovalEnded {
+                call_id,
+                approval_tx,
+            } => self.finish_approval(&approval_tx, &call_id),
             HarnessEvent::ToolCallComplete {
                 call_id,
                 tool_name: _,
                 result,
             } => {
                 self.complete_tool_call(&call_id, &result);
+            }
+            HarnessEvent::RequestFinished { approval_tx } => {
+                self.finish_request(&approval_tx);
             }
             HarnessEvent::ResponseComplete(msg) => {
                 self.complete_response(&msg.content, msg.model.as_deref(), msg.duration_ms);
@@ -421,11 +486,13 @@ impl PanelState {
 
 pub struct AgentPanel {
     state: PanelState,
+    busy_indicator: Entity<crate::tab_activity::BusyIndicator>,
+    assistant_avatar_asset: SharedString,
     assistant_message_views: Vec<Option<Entity<AssistantMessageView>>>,
     message_list_state: ListState,
     message_list_handler_installed: bool,
     history_scroll_handle: ScrollHandle,
-    transcript_footer_scroll_handle: ScrollHandle,
+    message_list_message_count: usize,
     showing_history: bool,
     conversation_list: Vec<ConversationSummary>,
     auto_approve: bool,
@@ -437,12 +504,12 @@ pub struct AgentPanel {
     /// Index of user message currently being edited inline (None = not editing)
     editing_msg_idx: Option<usize>,
     /// Input state for the inline edit field
-    edit_input_state: Option<Entity<InputState>>,
+    edit_input_state: Option<Entity<TextareaState>>,
     /// When true, show a compact inline input at the bottom of the panel
     /// (used when the main input bar is hidden but agent panel is open)
     show_inline_input: bool,
     /// Input state for the inline input at bottom of agent panel
-    inline_input_state: Option<Entity<InputState>>,
+    inline_input_state: Option<Entity<TextareaState>>,
     /// Skills available for /slash-command completion in inline input
     skills: Vec<SkillEntry>,
     /// Global submitted-input history for the inline composer.
@@ -454,12 +521,11 @@ pub struct AgentPanel {
     follow_output: FollowOutputState,
     /// Currently highlighted skill in inline autocomplete
     inline_skill_selection: usize,
-    /// Tracks whether shift was held on the last enter keystroke (for inline input)
-    inline_shift_enter: bool,
+    inline_skill_popup_scroll: ScrollHandle,
     ui_opacity: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct ProviderSelectItem {
     provider: ProviderKind,
     short_label: &'static str,
@@ -480,6 +546,9 @@ struct PanelMessage {
     thinking: Option<String>,
     thinking_markdown: Option<Arc<ParsedChatMarkdown>>,
     thinking_collapsed: bool,
+    /// When true, render the message body as a selectable text view so the
+    /// user can drag-select and copy arbitrary sentences.
+    select_mode: bool,
     steps: Vec<StepEntry>,
     steps_collapsed: bool,
     /// Model name for assistant messages (e.g. "claude-sonnet-4-6")
@@ -524,6 +593,7 @@ impl PanelMessage {
             thinking: None,
             thinking_markdown: None,
             thinking_collapsed: true,
+            select_mode: false,
             steps: Vec::new(),
             steps_collapsed: false,
             model: None,
@@ -574,7 +644,11 @@ impl PanelMessage {
             return;
         };
 
-        self.thinking_markdown = Some(Arc::new(ParsedChatMarkdown::parse(thinking)));
+        // ParsedChatMarkdown carries gpui text-geometry handles: it is
+        // main-thread only, and this Arc never leaves the UI thread.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let parsed = Arc::new(ParsedChatMarkdown::parse(thinking));
+        self.thinking_markdown = Some(parsed);
     }
 }
 
@@ -586,11 +660,13 @@ fn next_panel_message_id() -> u64 {
 
 struct AssistantMessageView {
     panel: WeakEntity<AgentPanel>,
+    avatar_asset: SharedString,
     msg_idx: usize,
     message: PanelMessage,
     state_key: AssistantMessageStateKey,
     is_streaming_assistant: bool,
     rendered_markdown_blocks: usize,
+    markdown_expanded: bool,
     markdown_hydration_pending: bool,
     markdown_block_views: Vec<Option<Entity<ChatMarkdownBlockView>>>,
     markdown_block_view_len: usize,
@@ -608,6 +684,7 @@ struct AssistantMessageStateKey {
 impl AssistantMessageView {
     fn new(
         panel: WeakEntity<AgentPanel>,
+        avatar_asset: SharedString,
         msg_idx: usize,
         message: PanelMessage,
         state_key: AssistantMessageStateKey,
@@ -617,11 +694,13 @@ impl AssistantMessageView {
             Self::initial_markdown_block_limit(state_key.content_markdown_blocks);
         Self {
             panel,
+            avatar_asset,
             msg_idx,
             message,
             state_key,
             is_streaming_assistant,
             rendered_markdown_blocks,
+            markdown_expanded: false,
             markdown_hydration_pending: false,
             markdown_block_views: Vec::new(),
             markdown_block_view_len: 0,
@@ -650,6 +729,7 @@ impl AssistantMessageView {
             self.state_key = state_key;
             self.is_streaming_assistant = is_streaming_assistant;
             if self.state_key.content_markdown_blocks == 0 {
+                self.markdown_expanded = false;
                 self.rendered_markdown_blocks = 0;
                 self.markdown_hydration_pending = false;
                 self.markdown_block_views.clear();
@@ -658,6 +738,7 @@ impl AssistantMessageView {
                 || self.rendered_markdown_blocks == 0
                 || self.rendered_markdown_blocks > self.state_key.content_markdown_blocks
             {
+                self.markdown_expanded = false;
                 self.rendered_markdown_blocks =
                     Self::initial_markdown_block_limit(self.state_key.content_markdown_blocks);
                 self.markdown_hydration_pending = false;
@@ -699,6 +780,9 @@ impl AssistantMessageView {
                 .await;
             let _ = this.update(cx, |view, cx| {
                 view.markdown_hydration_pending = false;
+                if !view.is_streaming_assistant && !view.markdown_expanded {
+                    return;
+                }
                 let total_blocks = view.state_key.content_markdown_blocks;
                 if total_blocks <= view.rendered_markdown_blocks {
                     return;
@@ -738,7 +822,9 @@ impl AssistantMessageView {
         }
 
         let gap = chat_markdown_block_gap(ChatMarkdownTone::Message, theme);
+        let copy_namespace = format!("asst-{}", self.msg_idx);
         div()
+            .debug_selector(|| "assistant-markdown".into())
             .w_full()
             .flex()
             .flex_col()
@@ -748,12 +834,23 @@ impl AssistantMessageView {
                 let view = if let Some(view) = self.markdown_block_views[block_idx].as_ref() {
                     let view = view.clone();
                     view.update(cx, |view, cx| {
-                        view.update(document, block_idx, ChatMarkdownTone::Message, cx);
+                        view.update(
+                            document,
+                            block_idx,
+                            ChatMarkdownTone::Message,
+                            copy_namespace.clone(),
+                            cx,
+                        );
                     });
                     view
                 } else {
                     let view = cx.new(|_| {
-                        ChatMarkdownBlockView::new(document, block_idx, ChatMarkdownTone::Message)
+                        ChatMarkdownBlockView::new(
+                            document,
+                            block_idx,
+                            ChatMarkdownTone::Message,
+                            copy_namespace.clone(),
+                        )
                     });
                     self.markdown_block_views[block_idx] = Some(view.clone());
                     view
@@ -778,9 +875,11 @@ impl AgentPanel {
         match provider {
             ProviderKind::Anthropic => "Claude",
             ProviderKind::OpenAI => "OpenAI",
+            ProviderKind::CodexLocal => "Codex",
             ProviderKind::ChatGPT => "ChatGPT",
             ProviderKind::GitHubCopilot => "Copilot",
             ProviderKind::OpenAICompatible => "Compat",
+            ProviderKind::Magpie => "Magpie",
             ProviderKind::MiniMax => "MiniMax",
             ProviderKind::Moonshot => "Moonshot",
             ProviderKind::ZAI => "Z.AI",
@@ -790,28 +889,16 @@ impl AgentPanel {
             ProviderKind::Ollama => "Ollama",
             ProviderKind::OpenRouter => "OpenRouter",
             ProviderKind::Mistral => "Mistral",
+            ProviderKind::Together => "Together",
+            ProviderKind::Cohere => "Cohere",
+            ProviderKind::Perplexity => "Perplexity",
+            ProviderKind::XAI => "xAI",
             _ => "Provider",
         }
     }
 
     fn provider_icon_path(provider: &ProviderKind) -> &'static str {
-        match provider {
-            ProviderKind::Anthropic => "providers/anthropic.svg",
-            ProviderKind::OpenAI => "providers/openai.svg",
-            ProviderKind::ChatGPT => "providers/openai.svg",
-            ProviderKind::GitHubCopilot => "providers/githubcopilot.svg",
-            ProviderKind::OpenAICompatible => "phosphor/plugs-connected.svg",
-            ProviderKind::MiniMax => "providers/minimax.svg",
-            ProviderKind::Moonshot => "providers/moonshot.svg",
-            ProviderKind::ZAI => "providers/zai.svg",
-            ProviderKind::DeepSeek => "providers/deepseek.svg",
-            ProviderKind::Groq => "providers/groq.svg",
-            ProviderKind::Gemini => "providers/gemini.svg",
-            ProviderKind::Ollama => "providers/ollama.svg",
-            ProviderKind::OpenRouter => "providers/openrouter.svg",
-            ProviderKind::Mistral => "providers/mistral.svg",
-            _ => "phosphor/plugs-connected.svg",
-        }
+        crate::provider_icons::provider_icon_path(provider)
     }
 
     fn provider_option(provider: ProviderKind) -> ProviderSelectItem {
@@ -828,9 +915,11 @@ impl AgentPanel {
         vec![
             ProviderKind::Anthropic,
             ProviderKind::OpenAI,
+            ProviderKind::CodexLocal,
             ProviderKind::ChatGPT,
             ProviderKind::GitHubCopilot,
             ProviderKind::OpenAICompatible,
+            ProviderKind::Magpie,
             ProviderKind::MiniMax,
             ProviderKind::Moonshot,
             ProviderKind::ZAI,
@@ -848,6 +937,15 @@ impl AgentPanel {
 
     fn provider_is_configured(config: &AgentConfig, provider: &ProviderKind) -> bool {
         let sidebar_provider = Self::session_sidebar_provider_kind(provider);
+        if sidebar_provider == ProviderKind::Magpie {
+            return config.provider == ProviderKind::Magpie || config.providers.magpie.is_some();
+        }
+        if sidebar_provider == ProviderKind::CodexLocal {
+            // Explicit local selection/config is enough: auth is owned by Codex,
+            // not a Con key/cache. Never hide the active local route behind keys.
+            return config.provider == ProviderKind::CodexLocal
+                || config.providers.codex_local.is_some();
+        }
         if oauth_token_dir(&sidebar_provider).is_some_and(|dir| dir.exists()) {
             return true;
         }
@@ -892,9 +990,11 @@ impl AgentPanel {
         for provider in [
             ProviderKind::Anthropic,
             ProviderKind::OpenAI,
+            ProviderKind::CodexLocal,
             ProviderKind::ChatGPT,
             ProviderKind::GitHubCopilot,
             ProviderKind::OpenAICompatible,
+            ProviderKind::Magpie,
             ProviderKind::MiniMax,
             ProviderKind::Moonshot,
             ProviderKind::ZAI,
@@ -928,11 +1028,13 @@ impl AgentPanel {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut panel = Self {
             state: PanelState::new(),
+            busy_indicator: cx.new(|cx| crate::tab_activity::BusyIndicator::new(window, cx)),
+            assistant_avatar_asset: con_core::config::DEFAULT_AGENT_AVATAR_ASSET.into(),
             assistant_message_views: Vec::new(),
             message_list_state: ListState::new(0, ListAlignment::Top, px(2048.0)),
             message_list_handler_installed: false,
             history_scroll_handle: ScrollHandle::new(),
-            transcript_footer_scroll_handle: ScrollHandle::new(),
+            message_list_message_count: 0,
             showing_history: false,
             conversation_list: Vec::new(),
             auto_approve: false,
@@ -953,7 +1055,7 @@ impl AgentPanel {
             inline_input_has_skills: false,
             follow_output: FollowOutputState::Auto,
             inline_skill_selection: 0,
-            inline_shift_enter: false,
+            inline_skill_popup_scroll: ScrollHandle::new(),
             ui_opacity: 0.90,
         };
         panel.message_list_state.set_follow_mode(FollowMode::Tail);
@@ -965,57 +1067,105 @@ impl AgentPanel {
         &self.state
     }
 
-    pub fn set_model_name(&mut self, name: String) {
+    pub fn set_model_name(&mut self, name: String, cx: &mut Context<Self>) -> bool {
+        let changed = self.model_name != name;
         self.model_name = name;
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     pub fn set_provider_name(
         &mut self,
         provider: ProviderKind,
         _: &mut Window,
-        _: &mut Context<Self>,
-    ) {
-        self.current_provider = Some(Self::session_sidebar_provider_kind(&provider));
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let provider = Some(Self::session_sidebar_provider_kind(&provider));
+        let changed = self.current_provider != provider;
+        self.current_provider = provider;
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     pub fn set_session_provider_options(
         &mut self,
         providers: Vec<ProviderKind>,
         _: &mut Window,
-        _: &mut Context<Self>,
-    ) {
-        self.session_provider_options = providers
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let providers = providers
             .into_iter()
             .map(Self::provider_option)
             .collect::<Vec<_>>();
+        let changed = self.session_provider_options != providers;
+        self.session_provider_options = providers;
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     pub fn set_session_model_options(
         &mut self,
         models: Vec<String>,
         _: &mut Window,
-        _: &mut Context<Self>,
-    ) {
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let changed = self.session_model_options != models;
         self.session_model_options = models;
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
-    pub fn set_auto_approve(&mut self, enabled: bool) {
+    pub fn set_auto_approve(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.auto_approve == enabled {
+            return;
+        }
         self.auto_approve = enabled;
+        cx.notify();
     }
 
-    pub fn set_ui_opacity(&mut self, opacity: f32) {
-        self.ui_opacity = opacity.clamp(0.35, 1.0);
+    pub fn set_ui_opacity(&mut self, opacity: f32, cx: &mut Context<Self>) {
+        let opacity = opacity.clamp(0.35, 1.0);
+        if self.ui_opacity == opacity {
+            return;
+        }
+        self.ui_opacity = opacity;
+        cx.notify();
+    }
+
+    pub fn set_assistant_avatar_asset(&mut self, asset: &'static str, cx: &mut Context<Self>) {
+        let asset = SharedString::from(asset);
+        if self.assistant_avatar_asset == asset {
+            return;
+        }
+        self.assistant_avatar_asset = asset.clone();
+        for view in self.assistant_message_views.iter().flatten() {
+            view.update(cx, |view, cx| {
+                view.avatar_asset = asset.clone();
+                cx.notify();
+            });
+        }
+        cx.notify();
     }
 
     /// Create with a pre-populated panel state (e.g. restored from session).
     pub fn with_state(state: PanelState, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut panel = Self {
             state,
+            busy_indicator: cx.new(|cx| crate::tab_activity::BusyIndicator::new(window, cx)),
+            assistant_avatar_asset: con_core::config::DEFAULT_AGENT_AVATAR_ASSET.into(),
             assistant_message_views: Vec::new(),
             message_list_state: ListState::new(0, ListAlignment::Top, px(2048.0)),
             message_list_handler_installed: false,
             history_scroll_handle: ScrollHandle::new(),
-            transcript_footer_scroll_handle: ScrollHandle::new(),
+            message_list_message_count: 0,
             showing_history: false,
             conversation_list: Vec::new(),
             auto_approve: false,
@@ -1036,7 +1186,7 @@ impl AgentPanel {
             inline_input_has_skills: false,
             follow_output: FollowOutputState::Auto,
             inline_skill_selection: 0,
-            inline_shift_enter: false,
+            inline_skill_popup_scroll: ScrollHandle::new(),
             ui_opacity: 0.90,
         };
         panel.message_list_state.set_follow_mode(FollowMode::Tail);
@@ -1050,7 +1200,7 @@ impl AgentPanel {
         self.message_list_state = ListState::new(0, ListAlignment::Top, px(2048.0));
         self.message_list_state.set_follow_mode(FollowMode::Tail);
         self.message_list_handler_installed = false;
-        self.transcript_footer_scroll_handle = ScrollHandle::new();
+        self.message_list_message_count = 0;
         self.assistant_message_views.clear();
         self.follow_output = FollowOutputState::Auto;
         self.showing_history = false;
@@ -1090,14 +1240,18 @@ impl AgentPanel {
     ) {
         let content = content.to_string();
         let input_state = cx.new(|cx| {
-            let mut s = InputState::new(window, cx).auto_grow(1, 6);
+            let mut s = TextareaState::new(window, cx).auto_grow(1, 6);
             s.set_value(&content, window, cx);
             s
         });
         // Subscribe to Enter key to submit the edit
         cx.subscribe_in(&input_state, window, {
             move |this, _, ev: &InputEvent, _window, cx| {
-                if let InputEvent::PressEnter { secondary: false } = ev {
+                if let InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } = ev
+                {
                     this.submit_edit(cx);
                 }
             }
@@ -1146,8 +1300,13 @@ impl AgentPanel {
         cx.notify();
     }
 
-    pub fn set_show_inline_input(&mut self, show: bool) {
+    pub fn set_show_inline_input(&mut self, show: bool, cx: &mut Context<Self>) -> bool {
+        let changed = self.show_inline_input != show;
         self.show_inline_input = show;
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     fn ensure_inline_input_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1156,16 +1315,11 @@ impl AgentPanel {
         }
 
         let state = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .placeholder("Ask anything…")
                 .auto_grow(1, 4)
+                .submit_on_enter(true)
         });
-        cx.observe_keystrokes(|this, event, _window, _cx| {
-            if event.keystroke.key == "enter" {
-                this.inline_shift_enter = event.keystroke.modifiers.shift;
-            }
-        })
-        .detach();
         cx.observe_keystrokes(|this, event, window, cx| {
             if !Self::should_fallback_handle_inline_history_key(event)
                 || !this.show_inline_input
@@ -1204,10 +1358,14 @@ impl AgentPanel {
                     let previous_skill_selection = this.inline_skill_selection;
                     if skills.is_empty() {
                         this.inline_skill_selection = 0;
+                        this.inline_skill_popup_scroll
+                            .scroll_to_item(this.inline_skill_selection);
                     } else {
                         this.inline_skill_selection = this
                             .inline_skill_selection
                             .min(skills.len().saturating_sub(1));
+                        this.inline_skill_popup_scroll
+                            .scroll_to_item(this.inline_skill_selection);
                     }
                     if this.inline_skill_selection != previous_skill_selection {
                         needs_notify = true;
@@ -1217,22 +1375,9 @@ impl AgentPanel {
                         cx.notify();
                     }
                 }
-                InputEvent::PressEnter { .. } => {
-                    if this.inline_shift_enter {
-                        this.inline_shift_enter = false;
+                InputEvent::PressEnter { shift, .. } => {
+                    if *shift {
                         return;
-                    }
-
-                    if let Some(ref input) = this.inline_input_state {
-                        input.update(cx, |s, cx| {
-                            let cursor = s.cursor();
-                            let val = s.value().to_string();
-                            if cursor > 0 && val.as_bytes().get(cursor - 1) == Some(&b'\n') {
-                                let mut cleaned = val[..cursor - 1].to_string();
-                                cleaned.push_str(&val[cursor..]);
-                                s.set_value(&cleaned, window, cx);
-                            }
-                        });
                     }
 
                     let has_completions = !this.filtered_inline_skills(cx).is_empty();
@@ -1276,10 +1421,14 @@ impl AgentPanel {
         let completions_len = self.filtered_inline_skills(cx).len();
         if completions_len == 0 {
             self.inline_skill_selection = 0;
+            self.inline_skill_popup_scroll
+                .scroll_to_item(self.inline_skill_selection);
         } else {
             self.inline_skill_selection = self
                 .inline_skill_selection
                 .min(completions_len.saturating_sub(1));
+            self.inline_skill_popup_scroll
+                .scroll_to_item(self.inline_skill_selection);
         }
 
         if visual_changed
@@ -1291,13 +1440,14 @@ impl AgentPanel {
         }
     }
 
-    pub fn set_recent_inputs(&mut self, inputs: Vec<String>) {
+    pub fn set_recent_inputs(&mut self, inputs: Vec<String>, cx: &mut Context<Self>) {
         if self.recent_inputs == inputs {
             return;
         }
         self.recent_inputs = inputs;
         self.inline_history_nav_index = None;
         self.inline_history_nav_draft = None;
+        cx.notify();
     }
 
     fn sync_inline_input_visual_state(&mut self, cx: &App) -> bool {
@@ -1338,24 +1488,56 @@ impl AgentPanel {
         true
     }
 
+    /// Append quoted context (e.g. a terminal selection) to the inline
+    /// agent input and focus it. Returns false when the inline input is
+    /// not available yet so the caller can fall back to the input bar.
+    pub fn ask_ai_with_context(
+        &mut self,
+        context: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(input) = self.inline_input_state.clone() else {
+            return false;
+        };
+
+        if let Some(context) = context.map(str::trim_end).filter(|text| !text.is_empty()) {
+            let current = input.read(cx).value().to_string();
+            let updated = crate::input_bar::append_ask_ai_context(&current, context);
+            let end = crate::input_bar::text_end_position(&updated);
+            input.update(cx, |state, cx| {
+                state.set_value(&updated, window, cx);
+                state.set_cursor_position(end, window, cx);
+            });
+        }
+
+        input.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+        true
+    }
+
     /// Return matching skills if the inline input text starts with `/`.
     pub fn filtered_inline_skills(&self, cx: &App) -> Vec<&SkillEntry> {
         let Some(ref input) = self.inline_input_state else {
             return Vec::new();
         };
         let text = input.read(cx).value().to_string();
-        let trimmed = text.trim();
+        let trimmed = text.trim_start();
         if !trimmed.starts_with('/') {
             return Vec::new();
         }
         let query = &trimmed[1..].to_lowercase();
-        if query.contains(' ') {
+        if query.contains(char::is_whitespace) {
             return Vec::new();
         }
         self.skills
             .iter()
             .filter(|s| query.is_empty() || s.name.to_lowercase().starts_with(query))
             .collect()
+    }
+
+    pub(crate) fn inline_skill_popup_scroll_handle(&self) -> ScrollHandle {
+        self.inline_skill_popup_scroll.clone()
     }
 
     pub fn inline_skill_selection(&self) -> usize {
@@ -1378,10 +1560,13 @@ impl AgentPanel {
     ) {
         if let Some(ref input) = self.inline_input_state {
             input.update(cx, |s, cx| {
-                s.set_value(&format!("/{name} "), window, cx);
+                s.set_value(format!("/{name} "), window, cx);
+                s.focus_handle(cx).focus(window, cx);
             });
         }
         self.inline_skill_selection = 0;
+        self.inline_skill_popup_scroll
+            .scroll_to_item(self.inline_skill_selection);
         cx.emit(InlineSkillAutocompleteChanged);
         cx.notify();
     }
@@ -1424,6 +1609,8 @@ impl AgentPanel {
             state.set_cursor_position(Position::new(0, cursor), window, cx);
         });
         self.inline_skill_selection = 0;
+        self.inline_skill_popup_scroll
+            .scroll_to_item(self.inline_skill_selection);
         cx.emit(InlineSkillAutocompleteChanged);
         cx.notify();
         true
@@ -1477,6 +1664,8 @@ impl AgentPanel {
         match key {
             "up" if has_completions => {
                 self.inline_skill_selection = self.inline_skill_selection.saturating_sub(1);
+                self.inline_skill_popup_scroll
+                    .scroll_to_item(self.inline_skill_selection);
                 cx.emit(InlineSkillAutocompleteChanged);
                 cx.notify();
                 true
@@ -1484,6 +1673,8 @@ impl AgentPanel {
             "down" if has_completions => {
                 let max = self.filtered_inline_skills(cx).len().saturating_sub(1);
                 self.inline_skill_selection = (self.inline_skill_selection + 1).min(max);
+                self.inline_skill_popup_scroll
+                    .scroll_to_item(self.inline_skill_selection);
                 cx.emit(InlineSkillAutocompleteChanged);
                 cx.notify();
                 true
@@ -1543,12 +1734,24 @@ impl AgentPanel {
 
     fn sync_message_list_count(&mut self) {
         let old_count = self.message_list_state.item_count();
-        let new_count = self.state.messages.len();
-        if new_count > old_count {
+        let message_count = self.state.messages.len();
+        let has_activity = self.state.status != AgentStatus::Idle
+            || self.state.streaming
+            || !self.state.tool_calls.is_empty()
+            || !self.state.pending_approvals.is_empty();
+        let new_count = message_count + usize::from(has_activity);
+        if message_count != self.message_list_message_count || old_count != new_count {
+            // Replace the old tail as well: a new assistant message can occupy
+            // the index that previously held the live activity row.
+            let start = self
+                .message_list_message_count
+                .min(message_count)
+                .min(old_count);
             self.message_list_state
-                .splice(old_count..old_count, new_count - old_count);
-        } else if new_count < old_count {
-            self.message_list_state.splice(new_count..old_count, 0);
+                .splice(start..old_count, new_count - start);
+            self.message_list_message_count = message_count;
+        } else if has_activity {
+            self.remeasure_message(message_count);
         }
     }
 
@@ -1556,6 +1759,33 @@ impl AgentPanel {
         if msg_idx < self.message_list_state.item_count() {
             self.message_list_state
                 .remeasure_items(msg_idx..msg_idx + 1);
+        }
+    }
+
+    fn toggle_message_select_mode(&mut self, msg_idx: usize, cx: &mut Context<Self>) {
+        let Some(msg) = self.state.messages.get_mut(msg_idx) else {
+            return;
+        };
+        msg.select_mode = !msg.select_mode;
+        let entering = msg.select_mode;
+        msg.touch();
+        self.remeasure_message(msg_idx);
+        cx.notify();
+
+        if entering {
+            // The selectable text view parses its markdown on a background
+            // task, so the final row height settles a few frames later —
+            // remeasure once more after the parse had time to land.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                let _ = this.update(cx, |panel, cx| {
+                    panel.remeasure_message(msg_idx);
+                    cx.notify();
+                });
+            })
+            .detach();
         }
     }
 
@@ -1707,6 +1937,33 @@ impl AgentPanel {
         cx.notify();
     }
 
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        self.state.stop();
+        self.follow_output_after_change();
+        cx.notify();
+    }
+
+    pub fn finish_request(
+        &mut self,
+        approval_tx: &Sender<ToolApprovalDecision>,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.finish_request(approval_tx);
+        self.follow_output_after_change();
+        cx.notify();
+    }
+
+    pub fn finish_approval(
+        &mut self,
+        approval_tx: &Sender<ToolApprovalDecision>,
+        call_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.finish_approval(approval_tx, call_id);
+        self.follow_output_after_change();
+        cx.notify();
+    }
+
     fn ensure_content_markdown_async(&mut self, msg_idx: usize, cx: &mut Context<Self>) {
         let Some(message) = self.state.messages.get_mut(msg_idx) else {
             return;
@@ -1726,6 +1983,8 @@ impl AgentPanel {
         message.touch();
 
         cx.spawn(async move |this, cx| {
+            // Main-thread-only markdown cache (see the same allow above).
+            #[allow(clippy::arc_with_non_send_sync)]
             let parsed = Arc::new(
                 cx.background_executor()
                     .spawn(async move { ParsedChatMarkdown::parse(&parse_content) })
@@ -1764,9 +2023,7 @@ impl AgentPanel {
         is_streaming_assistant: bool,
         cx: &mut Context<Self>,
     ) -> Option<Entity<AssistantMessageView>> {
-        let Some(message) = self.state.messages.get(msg_idx) else {
-            return None;
-        };
+        let message = self.state.messages.get(msg_idx)?;
         if message.role != "assistant" {
             return None;
         }
@@ -1810,6 +2067,7 @@ impl AgentPanel {
             let view = cx.new(|_| {
                 AssistantMessageView::new(
                     panel,
+                    self.assistant_avatar_asset.clone(),
                     msg_idx,
                     snapshot,
                     state_key,
@@ -1844,21 +2102,18 @@ impl AgentPanel {
             return Some((tool_icon(&tc.tool_name), label));
         }
         match self.state.status {
-            AgentStatus::Thinking => Some(("phosphor/brain-duotone.svg", "Thinking…")),
+            AgentStatus::AwaitingResponse => Some(("phosphor/sparkle.svg", "Working…")),
+            AgentStatus::Thinking => Some(("phosphor/sparkle.svg", "Thinking…")),
             AgentStatus::Responding => Some(("phosphor/chat-circle-fill.svg", "Writing…")),
             AgentStatus::Idle => None,
         }
-    }
-
-    fn running_tool_call(&self) -> Option<&ToolCallEntry> {
-        self.state.tool_calls.iter().find(|tc| tc.result.is_none())
     }
 }
 
 fn tool_icon(tool_name: &str) -> &'static str {
     match tool_name {
         "terminal_exec" | "batch_exec" => "phosphor/play-circle-fill.svg",
-        "shell_exec" => "phosphor/terminal-duotone.svg",
+        "shell_exec" => "phosphor/play.svg",
         "probe_shell_context" => "phosphor/magnifying-glass.svg",
         "file_write" => "phosphor/pencil-simple.svg",
         "file_read" => "phosphor/file-code.svg",
@@ -2226,13 +2481,13 @@ fn format_exec_result(value: &serde_json::Value) -> String {
                 }
                 out.push_str(&format!("stderr: {}", stderr.trim()));
             }
-            if let Some(code) = exit_code {
-                if code != 0 {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&format!("exit code: {}", code));
+            if let Some(code) = exit_code
+                && code != 0
+            {
+                if !out.is_empty() {
+                    out.push('\n');
                 }
+                out.push_str(&format!("exit code: {}", code));
             }
             if out.is_empty() {
                 "(no output)".to_string()
@@ -2431,13 +2686,8 @@ fn render_result_block(
     connected: bool,
 ) -> AnyElement {
     let is_short = content.lines().count() <= 1 && content.len() < 80;
-    let nested_surface = if connected {
-        trace_inner_surface(theme)
-    } else {
-        trace_step_surface(theme)
-    };
     let result_shell_surface = if connected {
-        theme.background.opacity(0.88)
+        theme.foreground.opacity(0.025)
     } else {
         trace_inner_surface(theme)
     };
@@ -2446,24 +2696,17 @@ fn render_result_block(
     if is_short && content != "(no output)" {
         if connected {
             div()
-                .pl(px(18.0))
-                .pr(px(12.0))
-                .py(px(8.0))
-                .bg(nested_surface)
-                .child(
-                    div()
-                        .px(px(9.0))
-                        .py(px(6.0))
-                        .rounded(px(9.0))
-                        .bg(result_shell_surface)
-                        .text_size(px(10.5))
-                        .font_family(theme.mono_font_family.clone())
-                        .line_height(px(15.0))
-                        .text_color(theme.foreground.opacity(0.72))
-                        .overflow_x_hidden()
-                        .whitespace_normal()
-                        .child(content.to_string()),
-                )
+                .px(mono_space_px(theme, 10.0))
+                .py(mono_space_px(theme, 8.0))
+                .rounded(ui_space_px(theme, 8.0))
+                .bg(result_shell_surface)
+                .text_size(mono_px(theme, 10.5))
+                .font_family(theme.mono_font_family.clone())
+                .line_height(mono_px(theme, 15.0))
+                .text_color(theme.foreground)
+                .overflow_x_hidden()
+                .whitespace_normal()
+                .child(content.to_string())
                 .into_any_element()
         } else {
             // Short result — inline, no code block
@@ -2486,27 +2729,20 @@ fn render_result_block(
         let body = if let Some(rows) = structured_rows {
             render_key_value_text(rows.as_slice(), theme).into_any_element()
         } else {
-            render_result_text(content, theme.foreground.opacity(0.74), theme).into_any_element()
+            render_result_text(content, theme.foreground, theme).into_any_element()
         };
         if connected {
             div()
-                .pl(px(18.0))
-                .pr(px(12.0))
-                .py(px(9.0))
-                .bg(nested_surface)
-                .child(
-                    div()
-                        .px(px(10.0))
-                        .py(px(9.0))
-                        .rounded(px(10.0))
-                        .bg(result_shell_surface)
-                        .overflow_x_hidden()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_size(px(10.75))
-                        .line_height(px(16.0))
-                        .text_color(theme.muted_foreground.opacity(0.72))
-                        .child(body),
-                )
+                .px(mono_space_px(theme, 10.0))
+                .py(mono_space_px(theme, 9.0))
+                .rounded(ui_space_px(theme, 8.0))
+                .bg(result_shell_surface)
+                .overflow_x_hidden()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(mono_px(theme, 10.75))
+                .line_height(mono_px(theme, 16.0))
+                .text_color(theme.muted_foreground)
+                .child(body)
                 .into_any_element()
         } else {
             div()
@@ -2547,9 +2783,7 @@ fn parse_key_value_rows(content: &str) -> Option<Vec<(String, String)>> {
         if trimmed.is_empty() || trimmed.starts_with("…") {
             continue;
         }
-        let Some((key, value)) = trimmed.split_once(": ") else {
-            return None;
-        };
+        let (key, value) = trimmed.split_once(": ")?;
         if key.len() > 32 || value.is_empty() {
             return None;
         }
@@ -2598,28 +2832,28 @@ fn render_result_text(content: &str, color: Hsla, theme: &gpui_component::Theme)
     div().child(StyledText::new(display.clone()).with_runs(vec![text_style.to_run(display.len())]))
 }
 
-fn trace_group_surface(theme: &gpui_component::Theme) -> Hsla {
-    theme.secondary.opacity(0.42)
-}
-
-fn trace_step_surface(theme: &gpui_component::Theme) -> Hsla {
-    theme.background.opacity(0.94)
+// Keep transcript disclosure feedback below the weight of message surfaces.
+fn trace_disclosure_style(cx: &App, theme: &Theme) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .foreground(theme.muted_foreground)
+        .hover(theme.foreground.opacity(0.035))
+        .active(theme.foreground.opacity(0.055))
 }
 
 fn trace_step_header_surface(theme: &gpui_component::Theme) -> Hsla {
-    theme.muted.opacity(0.09)
+    theme.transparent
 }
 
 fn trace_step_header_hover_surface(theme: &gpui_component::Theme) -> Hsla {
-    theme.muted.opacity(0.13)
+    theme.foreground.opacity(0.055)
 }
 
 fn trace_detail_surface(theme: &gpui_component::Theme) -> Hsla {
-    theme.secondary.opacity(0.18)
+    theme.transparent
 }
 
 fn trace_inner_surface(theme: &gpui_component::Theme) -> Hsla {
-    theme.background.opacity(0.90)
+    theme.background.opacity(0.45)
 }
 
 fn result_toggle_label(content: &str, expanded: bool) -> String {
@@ -2649,7 +2883,7 @@ fn restored_steps_from_agent_steps(agent_steps: &[AgentStep]) -> Vec<StepEntry> 
         match step {
             AgentStep::Thinking(text) => {
                 restored.push(StepEntry {
-                    icon: "phosphor/brain-duotone.svg",
+                    icon: "phosphor/sparkle.svg",
                     label: text.clone(),
                     detail: None,
                     status: StepStatus::Complete,
@@ -2704,14 +2938,13 @@ fn restored_steps_from_agent_steps(agent_steps: &[AgentStep]) -> Vec<StepEntry> 
                 };
 
                 let mut updated = false;
-                if let Some(call_id) = call_id.as_deref() {
-                    if let Some(idx) = tool_call_positions.remove(call_id) {
-                        if let Some(existing) = restored.get_mut(idx) {
-                            existing.detail = detail.clone();
-                            existing.status = status;
-                            updated = true;
-                        }
-                    }
+                if let Some(call_id) = call_id.as_deref()
+                    && let Some(idx) = tool_call_positions.remove(call_id)
+                    && let Some(existing) = restored.get_mut(idx)
+                {
+                    existing.detail = detail.clone();
+                    existing.status = status;
+                    updated = true;
                 }
 
                 if !updated {
@@ -2783,45 +3016,6 @@ fn render_inline_state(
         .into_any_element()
 }
 
-fn render_meta_chip(
-    label: impl Into<SharedString>,
-    surface: Hsla,
-    text: Hsla,
-    theme: &gpui_component::Theme,
-    mono: bool,
-) -> AnyElement {
-    let chip_px = |value| {
-        if mono {
-            mono_space_px(theme, value)
-        } else {
-            ui_space_px(theme, value)
-        }
-    };
-    let mut label_el = div()
-        .text_size(if mono {
-            mono_px(theme, 10.25)
-        } else {
-            ui_px(theme, 10.25)
-        })
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(text)
-        .child(label.into());
-
-    if mono {
-        label_el = label_el.font_family(theme.mono_font_family.clone());
-    }
-
-    div()
-        .flex()
-        .items_center()
-        .px(chip_px(8.0))
-        .py(chip_px(3.0))
-        .rounded(chip_px(7.0))
-        .bg(surface)
-        .child(label_el)
-        .into_any_element()
-}
-
 fn humanize_provider_name(name: &str) -> String {
     match name.trim().to_ascii_lowercase().as_str() {
         "chatgpt" => "ChatGPT".to_string(),
@@ -2838,10 +3032,10 @@ fn humanize_provider_name(name: &str) -> String {
                     s.extend(chars);
                     s
                 }
-                None => "Con".to_string(),
+                None => "con".to_string(),
             }
         }
-        _ => "Con".to_string(),
+        _ => "con".to_string(),
     }
 }
 
@@ -2857,7 +3051,7 @@ fn split_model_identity(model: &str) -> (Option<String>, String) {
         }
     }
     if model.is_empty() {
-        (None, "Con".to_string())
+        (None, "con".to_string())
     } else {
         (None, humanize_model_name(model))
     }
@@ -2877,7 +3071,7 @@ fn render_model_chips(
                 div()
                     .text_size(ui_px(theme, 10.5))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.muted_foreground.opacity(0.48))
+                    .text_color(theme.muted_foreground)
                     .child(provider),
             )
             .child(
@@ -2888,20 +3082,21 @@ fn render_model_chips(
             );
     }
 
-    row = row.child(render_meta_chip(
-        label,
-        theme.secondary_hover,
-        theme.foreground.opacity(0.60),
-        theme,
-        true,
-    ));
+    row = row.child(
+        div()
+            .text_size(ui_px(theme, 11.0))
+            .font_family(theme.font_family.clone())
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.foreground)
+            .child(label),
+    );
 
     if let Some(dur) = duration_ms {
         row = row.child(
             div()
-                .text_size(mono_px(theme, 10.0))
-                .font_family(theme.mono_font_family.clone())
-                .text_color(theme.muted_foreground.opacity(0.38))
+                .text_size(ui_px(theme, 10.5))
+                .font_family(theme.font_family.clone())
+                .text_color(theme.muted_foreground)
                 .child(format_duration_ms(dur)),
         );
     }
@@ -2935,13 +3130,13 @@ fn render_result_toggle_chrome(
                     "phosphor/caret-down.svg"
                 })
                 .size(mono_space_px(theme, 9.5))
-                .text_color(theme.muted_foreground.opacity(0.30)),
+                .text_color(theme.muted_foreground),
         )
         .child(
             div()
-                .text_size(mono_px(theme, 10.0))
-                .font_family(theme.mono_font_family.clone())
-                .text_color(theme.muted_foreground.opacity(0.40))
+                .text_size(ui_px(theme, 11.0))
+                .font_family(theme.font_family.clone())
+                .text_color(theme.muted_foreground)
                 .child(label),
         )
         .into_any_element()
@@ -2978,6 +3173,104 @@ fn run_status_summary(step_count: usize, running_count: usize, denied_count: usi
     }
 }
 
+/// Shared column geometry for reasoning, tool and live activity headers.
+fn activity_row_header(
+    role: &'static str,
+    icon: Option<AnyElement>,
+    label: &str,
+    preview: Option<&str>,
+    accessories: Vec<AnyElement>,
+    label_color: Hsla,
+    theme: &Theme,
+) -> Div {
+    let mut icon_column = div()
+        .debug_selector(move || format!("agent-{role}-icon"))
+        .flex_none()
+        .size(ui_icon_px(theme, 16.0))
+        .flex()
+        .items_center()
+        .justify_center();
+    if let Some(icon) = icon {
+        icon_column = icon_column.child(icon);
+    }
+    let mut row = div()
+        .w_full()
+        .min_w_0()
+        .h(ui_space_px(theme, 28.0))
+        .px(ui_space_px(theme, 8.0))
+        .flex()
+        .items_center()
+        .gap(ui_space_px(theme, 8.0))
+        .child(icon_column)
+        .child(
+            div()
+                .debug_selector(move || {
+                    if role == "work" {
+                        "agent-run-title".into()
+                    } else {
+                        format!("agent-{role}-label")
+                    }
+                })
+                .min_w_0()
+                .flex_shrink_1()
+                .truncate()
+                .when(preview.is_none(), |label| label.flex_1())
+                .text_size(ui_px(theme, 12.5))
+                .line_height(ui_px(theme, 18.0))
+                .font_family(theme.font_family.clone())
+                .font_weight(if role == "note" || role == "work" {
+                    FontWeight::NORMAL
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .text_color(label_color)
+                .child(label.to_owned()),
+        );
+    if let Some(preview) = preview {
+        row = row.child(
+            div()
+                .debug_selector(move || format!("agent-{role}-detail"))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(ui_px(theme, 11.5))
+                .line_height(ui_px(theme, 18.0))
+                .text_color(theme.muted_foreground)
+                .child(preview.to_owned()),
+        );
+    }
+    row.children(accessories)
+}
+
+fn activity_icon(path: &str, color: Hsla, theme: &Theme) -> AnyElement {
+    svg()
+        .path(SharedString::from(path.to_owned()))
+        .size(ui_icon_px(theme, 13.0))
+        .text_color(color)
+        .into_any_element()
+}
+
+fn activity_caret(expanded: bool, theme: &Theme) -> AnyElement {
+    div()
+        .flex_none()
+        .size(ui_icon_px(theme, 16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            svg()
+                .path(if expanded {
+                    "phosphor/caret-down.svg"
+                } else {
+                    "phosphor/caret-right.svg"
+                })
+                .size(ui_icon_px(theme, 10.0))
+                .text_color(theme.muted_foreground),
+        )
+        .into_any_element()
+}
+
 fn render_user_message_text(
     content: &str,
     msg_idx: usize,
@@ -2985,8 +3278,8 @@ fn render_user_message_text(
 ) -> AnyElement {
     if !content.contains('\n') {
         return div()
-            .text_size(ui_px(theme, 13.5))
-            .line_height(ui_px(theme, 21.0))
+            .text_size(ui_px(theme, 14.0))
+            .line_height(ui_px(theme, 22.0))
             .text_color(theme.foreground)
             .child(content.to_string())
             .into_any_element();
@@ -2996,8 +3289,8 @@ fn render_user_message_text(
         .flex()
         .flex_col()
         .gap(ui_space_px(theme, 4.0))
-        .text_size(ui_px(theme, 13.5))
-        .line_height(ui_px(theme, 21.0))
+        .text_size(ui_px(theme, 14.0))
+        .line_height(ui_px(theme, 22.0))
         .text_color(theme.foreground);
 
     for (line_idx, line) in content.lines().enumerate() {
@@ -3062,59 +3355,86 @@ fn unparsed_markdown_suffix(message: &PanelMessage) -> Option<&str> {
     (!suffix.is_empty()).then_some(suffix)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_assistant_message(
     msg: &PanelMessage,
+    avatar_asset: SharedString,
     panel: WeakEntity<AgentPanel>,
     view: WeakEntity<AssistantMessageView>,
     msg_idx: usize,
-    _is_streaming_assistant: bool,
+    is_streaming_assistant: bool,
     rendered_markdown_blocks: usize,
+    markdown_expanded: bool,
     rendered_markdown: Option<AnyElement>,
     theme: &Theme,
+    cx: &App,
 ) -> AnyElement {
     let assistant_content_for_copy = msg.content.clone();
     let msg_model = msg.model.as_deref().unwrap_or("");
-    let msg_duration_ms = msg.duration_ms;
-    let mut msg_el = div().flex().flex_col().gap(px(4.0));
-    let mut header_row = div().flex().items_center().gap(px(6.0)).pb(px(3.0)).child(
-        svg()
-            .path("phosphor/oven-duotone.svg")
-            .size(px(13.0))
-            .text_color(theme.primary.opacity(0.65)),
-    );
+    let has_reasoning = msg.thinking.as_ref().is_some_and(|text| !text.is_empty());
+    let msg_duration_ms = msg
+        .duration_ms
+        .filter(|_| msg.steps.is_empty() && !has_reasoning);
+    let mut msg_el = div()
+        .debug_selector(|| "agent-assistant-message".into())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(ui_space_px(theme, 8.0));
+    let mut answer_el = div()
+        .debug_selector(|| "agent-answer".into())
+        .flex()
+        .flex_col()
+        .gap(ui_space_px(theme, 8.0));
+    let mut header_row = div()
+        .flex()
+        .items_center()
+        .gap(ui_space_px(theme, 8.0))
+        .pb(ui_space_px(theme, 2.0))
+        .pl(ui_space_px(theme, 8.0))
+        .child(
+            img(avatar_asset)
+                .size(ui_icon_px(theme, 16.0))
+                .object_fit(ObjectFit::Contain)
+                .flex_none(),
+        );
     header_row = header_row.child(render_model_chips(msg_model, msg_duration_ms, theme));
     msg_el = msg_el.child(header_row);
 
+    let mut reasoning_el = div()
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap(ui_space_px(theme, 4.0));
     if let Some(thinking) = &msg.thinking
         && !thinking.is_empty()
+        && !msg.steps_collapsed
     {
         let thinking_collapsed = msg.thinking_collapsed;
-        let chevron = if thinking_collapsed {
-            "phosphor/caret-right.svg"
+        let thinking_summary = if is_streaming_assistant {
+            "Thinking…"
         } else {
-            "phosphor/caret-down.svg"
-        };
-        let word_count = thinking.split_whitespace().count();
-        let thinking_summary = if word_count > 0 {
-            format!("Thought · {} words", word_count)
-        } else {
-            "Thinking…".to_string()
+            "Reasoning"
         };
 
         let thinking_panel = panel.clone();
-        msg_el = msg_el.child(
-            div()
-                .id(SharedString::from(format!("thinking-toggle-{msg_idx}")))
-                .flex()
-                .items_center()
-                .gap(px(5.0))
-                .ml(px(19.0))
-                .py(px(2.0))
-                .px(px(4.0))
-                .rounded(px(4.0))
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.muted.opacity(0.05)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+        reasoning_el = reasoning_el.child(
+            Button::new(SharedString::from(format!("thinking-toggle-{msg_idx}")))
+                .debug_selector(|| "agent-reasoning-toggle".into())
+                .custom(trace_disclosure_style(cx, theme))
+                .w_full()
+                .h_auto()
+                .p_0()
+                .rounded(ui_space_px(theme, 8.0))
+                .text_color(theme.muted_foreground)
+                .accessibility_label(if thinking_collapsed {
+                    "Expand reasoning"
+                } else {
+                    "Collapse reasoning"
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
                     let _ = thinking_panel.update(cx, |this, cx| {
                         if let Some(m) = this.state.messages.get_mut(msg_idx) {
                             m.thinking_collapsed = !m.thinking_collapsed;
@@ -3125,153 +3445,237 @@ fn render_assistant_message(
                     });
                 })
                 .child(
-                    svg()
-                        .path(chevron)
-                        .size(px(10.0))
-                        .text_color(theme.muted_foreground.opacity(0.3)),
-                )
-                .child(
-                    svg()
-                        .path("phosphor/brain-duotone.svg")
-                        .size(px(11.0))
-                        .text_color(theme.primary.opacity(0.42)),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(theme.muted_foreground.opacity(0.4))
-                        .child(thinking_summary),
+                    activity_row_header(
+                        "reasoning",
+                        Some(activity_icon(
+                            "phosphor/sparkle.svg",
+                            theme.muted_foreground,
+                            theme,
+                        )),
+                        thinking_summary,
+                        None,
+                        vec![activity_caret(!thinking_collapsed, theme)],
+                        theme.foreground,
+                        theme,
+                    )
+                    .px(ui_space_px(theme, 8.0)),
                 ),
         );
 
         if !thinking_collapsed {
             let mut thinking_el = div()
-                .ml(px(23.0))
-                .mr(px(4.0))
+                .debug_selector(|| "agent-reasoning-content".into())
+                .w_full()
                 .mt(px(1.0))
                 .mb(px(2.0))
-                .px(px(10.0))
-                .py(px(7.0))
-                .rounded(px(8.0))
-                .bg(theme.muted.opacity(0.04))
-                .max_h(px(200.0))
-                .overflow_y_hidden()
-                .text_size(px(12.0))
-                .line_height(px(18.0))
-                .text_color(theme.muted_foreground.opacity(0.54));
+                .pl(ui_space_px(theme, 32.0))
+                .pr(ui_space_px(theme, 10.0))
+                .py(ui_space_px(theme, 8.0))
+                .text_size(ui_px(theme, 12.0))
+                .line_height(ui_px(theme, 19.0))
+                .text_color(theme.muted_foreground);
             if let Some(markdown) = msg.thinking_markdown.as_ref() {
-                thinking_el = thinking_el.child(render_parsed_chat_markdown(
-                    markdown,
-                    ChatMarkdownTone::Thinking,
-                    theme,
-                ));
+                thinking_el =
+                    thinking_el.child(render_parsed_chat_markdown_prefix_with_copy_namespace(
+                        markdown,
+                        ChatMarkdownTone::Thinking,
+                        theme,
+                        markdown.block_count(),
+                        format!("asst-think-{msg_idx}"),
+                    ));
             } else {
                 thinking_el = thinking_el.child(div().whitespace_normal().child(thinking.clone()));
             }
-            msg_el = msg_el.child(thinking_el);
+            reasoning_el = reasoning_el.child(thinking_el);
+            reasoning_el = reasoning_el.child(
+                div().pl(ui_space_px(theme, 32.0)).child(
+                    Clipboard::new(format!("copy-think-{msg_idx}"))
+                        .value(SharedString::from(thinking.clone())),
+                ),
+            );
         }
     }
 
     if !msg.content.is_empty() {
         let mut content_el = div()
-            .ml(px(19.0))
-            .pr(px(4.0))
-            .text_size(px(14.0))
-            .line_height(px(23.0))
-            .text_color(theme.foreground.opacity(0.88));
+            .text_size(ui_px(theme, 14.0))
+            .line_height(ui_px(theme, 22.0))
+            .text_color(theme.foreground);
 
-        if let Some(markdown) = msg.content_markdown.as_ref() {
+        if msg.select_mode {
+            content_el = content_el.child(
+                div()
+                    .w_full()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(px(8.0))
+                    .bg(theme.primary.opacity(0.04))
+                    .child(
+                        TextView::markdown(
+                            ElementId::Name(format!("select-md-{}", msg.id).into()),
+                            SharedString::from(msg.content.clone()),
+                        )
+                        .selectable(true),
+                    ),
+            );
+        } else if let Some(markdown) = msg.content_markdown.as_ref() {
             let visible_blocks =
                 visible_markdown_block_count(rendered_markdown_blocks, markdown.block_count());
             if let Some(rendered_markdown) = rendered_markdown {
                 content_el = content_el.child(rendered_markdown);
             } else {
-                content_el = content_el.child(render_parsed_chat_markdown_prefix(
-                    markdown,
-                    ChatMarkdownTone::Message,
-                    theme,
-                    visible_blocks,
-                ));
+                content_el =
+                    content_el.child(render_parsed_chat_markdown_prefix_with_copy_namespace(
+                        markdown,
+                        ChatMarkdownTone::Message,
+                        theme,
+                        visible_blocks,
+                        format!("asst-{msg_idx}"),
+                    ));
             }
             if let Some(suffix) = unparsed_markdown_suffix(msg) {
                 content_el = content_el.child(div().mt(ui_space_px(theme, 6.0)).child(
                     render_plain_multiline_text(
                         suffix,
-                        theme.mono_font_family.clone(),
-                        mono_px(theme, 14.0),
-                        mono_px(theme, 23.0),
-                        theme.foreground.opacity(0.78),
+                        theme.font_family.clone(),
+                        ui_px(theme, 14.0),
+                        ui_px(theme, 22.0),
+                        theme.foreground,
                     ),
                 ));
             }
-            if visible_blocks < markdown.block_count() {
-                let remaining = markdown.block_count().saturating_sub(visible_blocks);
+            if !is_streaming_assistant
+                && markdown.block_count() > LONG_MARKDOWN_PROGRESSIVE_THRESHOLD_BLOCKS
+            {
+                let expanding = markdown_expanded && visible_blocks < markdown.block_count();
                 let more_view = view.clone();
                 content_el = content_el.child(
-                    div().mt(ui_space_px(theme, 8.0)).child(
-                        div()
-                            .id(SharedString::from(format!("assistant-more-{msg_idx}")))
-                            .flex()
-                            .items_center()
-                            .gap(mono_space_px(theme, 6.0))
-                            .px(mono_space_px(theme, 8.0))
-                            .py(mono_space_px(theme, 4.0))
-                            .rounded(mono_space_px(theme, 7.0))
-                            .cursor_pointer()
-                            .bg(theme.muted.opacity(0.05))
-                            .hover(|s| s.bg(theme.muted.opacity(0.09)))
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                let _ = more_view.update(cx, |view, cx| {
-                                    view.rendered_markdown_blocks = (view.rendered_markdown_blocks
-                                        + LONG_MARKDOWN_BATCH_BLOCKS * 2)
-                                        .min(view.state_key.content_markdown_blocks);
-                                    let msg_idx = view.msg_idx;
-                                    let panel = view.panel.clone();
-                                    let _ = panel.update(cx, |panel, cx| {
-                                        panel.remeasure_message(msg_idx);
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .mt(ui_space_px(theme, 8.0))
+                        .child(
+                            Button::new(SharedString::from(format!("assistant-more-{msg_idx}")))
+                                .ghost()
+                                .small()
+                                .text_color(theme.muted_foreground)
+                                .accessibility_label(if expanding {
+                                    "Expanding reply"
+                                } else if markdown_expanded {
+                                    "Show less"
+                                } else {
+                                    "Continue reading"
+                                })
+                                .disabled(expanding)
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let _ = more_view.update(cx, |view, cx| {
+                                        view.markdown_expanded = !view.markdown_expanded;
+                                        if view.markdown_expanded {
+                                            view.schedule_markdown_hydration(cx);
+                                        } else {
+                                            view.rendered_markdown_blocks =
+                                                AssistantMessageView::initial_markdown_block_limit(
+                                                    view.state_key.content_markdown_blocks,
+                                                );
+                                        }
+                                        let msg_idx = view.msg_idx;
+                                        let panel = view.panel.clone();
+                                        let _ = panel.update(cx, |panel, cx| {
+                                            panel.remeasure_message(msg_idx);
+                                            cx.notify();
+                                        });
                                         cx.notify();
                                     });
-                                    cx.notify();
-                                });
-                            })
-                            .child(
-                                svg()
-                                    .path("phosphor/caret-down.svg")
-                                    .size(mono_space_px(theme, 10.0))
-                                    .text_color(theme.muted_foreground.opacity(0.55)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(mono_px(theme, 10.5))
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_color(theme.muted_foreground.opacity(0.58))
-                                    .child(format!("Show more · {remaining} blocks left")),
-                            ),
-                    ),
+                                })
+                                .child(
+                                    div()
+                                        .debug_selector(|| "assistant-more".into())
+                                        .flex()
+                                        .items_center()
+                                        .gap(ui_space_px(theme, 6.0))
+                                        .child(
+                                            svg()
+                                                .path(if markdown_expanded {
+                                                    "phosphor/caret-up.svg"
+                                                } else {
+                                                    "phosphor/caret-down.svg"
+                                                })
+                                                .size(mono_space_px(theme, 10.0))
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(ui_px(theme, 11.0))
+                                                .font_family(theme.font_family.clone())
+                                                .text_color(theme.muted_foreground)
+                                                .child(if expanding {
+                                                    "Showing more…"
+                                                } else if markdown_expanded {
+                                                    "Show less"
+                                                } else {
+                                                    "Continue reading"
+                                                }),
+                                        ),
+                                ),
+                        ),
                 );
             }
         } else {
             content_el = content_el.child(render_plain_multiline_text(
                 &msg.content,
-                theme.mono_font_family.clone(),
-                mono_px(theme, 14.0),
-                mono_px(theme, 23.0),
-                theme.foreground.opacity(0.88),
+                theme.font_family.clone(),
+                ui_px(theme, 14.0),
+                ui_px(theme, 22.0),
+                theme.foreground,
             ));
         }
 
-        msg_el = msg_el.child(content_el);
+        answer_el = answer_el.child(content_el);
 
-        msg_el = msg_el.child(
-            div().ml(px(19.0)).mt(px(2.0)).child(
-                Clipboard::new(format!("copy-asst-{msg_idx}"))
-                    .value(SharedString::from(assistant_content_for_copy)),
-            ),
+        let select_mode = msg.select_mode;
+        let select_panel = panel.clone();
+        answer_el = answer_el.child(
+            div()
+                .mt(px(2.0))
+                .flex()
+                .items_center()
+                .gap(px(1.0))
+                .child(
+                    Clipboard::new(format!("copy-asst-{msg_idx}"))
+                        .value(SharedString::from(assistant_content_for_copy)),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("select-toggle-{msg_idx}")))
+                        .icon(Icon::default().path(if select_mode {
+                            "phosphor/selection-all.svg"
+                        } else {
+                            "phosphor/selection-plus.svg"
+                        }))
+                        .ghost()
+                        .xsmall()
+                        .text_color(if select_mode {
+                            theme.primary
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .tooltip(if select_mode {
+                            "Exit text selection"
+                        } else {
+                            "Select text"
+                        })
+                        .on_click(move |_, _, cx| {
+                            let _ = select_panel.update(cx, |this, cx| {
+                                this.toggle_message_select_mode(msg_idx, cx);
+                            });
+                        }),
+                ),
         );
     }
 
-    if !msg.steps.is_empty() {
-        let step_count = msg.steps.len();
+    if !msg.steps.is_empty() || has_reasoning {
+        let step_count = msg.steps.len() + usize::from(has_reasoning);
         let collapsed = msg.steps_collapsed;
         let chevron = if collapsed {
             "phosphor/caret-right.svg"
@@ -3288,116 +3692,93 @@ fn render_assistant_message(
             .iter()
             .filter(|step| step.status == StepStatus::Denied)
             .count();
-        let run_title = if running_count > 0 {
-            "Working now"
+        let run_title = if running_count > 0 || is_streaming_assistant {
+            "Working".to_string()
         } else if denied_count > 0 {
-            "Run needs review"
+            "Needs review".to_string()
+        } else if let Some(duration) = msg.duration_ms {
+            format!("Worked for {}", format_duration_ms(duration))
         } else {
-            "Run trace"
+            "Activity".to_string()
         };
 
         let run_panel = panel.clone();
         let mut run_card = div()
-            .ml(ui_space_px(theme, 19.0))
-            .mr(ui_space_px(theme, 4.0))
-            .mt(ui_space_px(theme, 6.0))
-            .px(ui_space_px(theme, 10.0))
-            .py(ui_space_px(theme, 10.0))
+            .debug_selector(|| "agent-run-card".into())
             .rounded(ui_space_px(theme, 12.0))
-            .bg(trace_group_surface(theme))
+            .bg(theme.transparent)
             .flex()
             .flex_col()
-            .gap(ui_space_px(theme, 10.0));
+            .items_start()
+            .gap(ui_space_px(theme, 2.0));
 
+        let work_summary = div()
+            .debug_selector(|| "agent-run-summary".into())
+            .flex_none()
+            .text_size(ui_px(theme, 11.0))
+            .line_height(ui_px(theme, 18.0))
+            .text_color(theme.muted_foreground)
+            .child(run_status_summary(step_count, 0, 0))
+            .into_any_element();
         run_card = run_card.child(
-            div()
-                .id(SharedString::from(format!("steps-toggle-{msg_idx}")))
-                .flex()
-                .items_center()
-                .min_w_0()
-                .gap(ui_space_px(theme, 8.0))
-                .px(ui_space_px(theme, 4.0))
-                .py(ui_space_px(theme, 3.0))
-                .cursor_pointer()
-                .rounded(ui_space_px(theme, 10.0))
-                .hover(|s| s.bg(theme.muted.opacity(0.035)))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            Button::new(SharedString::from(format!("steps-toggle-{msg_idx}")))
+                .debug_selector(|| "agent-run-toggle".into())
+                .custom(trace_disclosure_style(cx, theme))
+                .max_w_full()
+                .h_auto()
+                .p_0()
+                .rounded(ui_space_px(theme, 8.0))
+                .text_color(theme.muted_foreground)
+                .accessibility_label(if collapsed {
+                    "Expand activity"
+                } else {
+                    "Collapse activity"
+                })
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
                     let _ = run_panel.update(cx, |this, cx| {
-                        if let Some(m) = this.state.messages.get_mut(msg_idx) {
-                            m.steps_collapsed = !m.steps_collapsed;
-                            m.touch();
+                        if let Some(message) = this.state.messages.get_mut(msg_idx) {
+                            message.steps_collapsed = !message.steps_collapsed;
+                            message.touch();
                         }
                         this.remeasure_message(msg_idx);
                         cx.notify();
                     });
                 })
                 .child(
-                    svg()
-                        .path(chevron)
-                        .size(ui_space_px(theme, 11.0))
-                        .text_color(theme.muted_foreground.opacity(0.34)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(ui_space_px(theme, 2.0))
-                        .child(render_section_kicker(run_title, theme))
-                        .child(
-                            div()
-                                .text_size(ui_px(theme, 12.75))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.foreground.opacity(0.74))
-                                .child("Actions, probes, and output"),
-                        )
-                        .child(
-                            div()
-                                .text_size(ui_px(theme, 10.75))
-                                .text_color(theme.muted_foreground.opacity(0.46))
-                                .min_w_0()
-                                .child("A compact trace of what the agent actually did"),
-                        ),
-                )
-                .child({
-                    let mut summary = div()
-                        .flex()
-                        .items_center()
-                        .gap(ui_space_px(theme, 8.0))
-                        .flex_shrink_0()
-                        .child(
-                            div()
-                                .text_size(mono_px(theme, 10.5))
-                                .font_family(theme.mono_font_family.clone())
-                                .text_color(theme.muted_foreground.opacity(0.40))
-                                .child(run_status_summary(step_count, running_count, denied_count)),
-                        );
-                    if running_count > 0 {
-                        summary = summary.child(render_inline_state(
-                            format!("{} live", running_count).into(),
-                            theme.warning,
-                            theme,
-                        ));
-                    }
-                    if denied_count > 0 {
-                        summary = summary.child(render_inline_state(
-                            format!("{} denied", denied_count).into(),
-                            theme.danger,
-                            theme,
-                        ));
-                    }
-                    summary
-                }),
+                    activity_row_header(
+                        "work",
+                        Some(activity_icon(chevron, theme.muted_foreground, theme)),
+                        &run_title,
+                        None,
+                        vec![work_summary],
+                        if denied_count > 0 {
+                            theme.danger
+                        } else {
+                            theme.muted_foreground
+                        },
+                        theme,
+                    )
+                    .w_auto()
+                    .px(ui_space_px(theme, 8.0)),
+                ),
         );
 
         if !collapsed {
-            let mut steps_el = div().flex().flex_col().gap(ui_space_px(theme, 8.0));
+            let mut steps_el = div()
+                .w_full()
+                .pl(ui_space_px(theme, 24.0))
+                .flex()
+                .flex_col()
+                .gap(ui_space_px(theme, 2.0));
+            if has_reasoning {
+                steps_el = steps_el.child(reasoning_el);
+            }
 
             for (step_idx, step) in msg.steps.iter().enumerate() {
                 let icon_color = match step.status {
                     StepStatus::Running => theme.warning,
-                    StepStatus::Complete => theme.muted_foreground.opacity(0.4),
+                    StepStatus::Complete => theme.muted_foreground,
                     StepStatus::Denied => theme.danger.opacity(0.7),
                 };
 
@@ -3410,123 +3791,86 @@ fn render_assistant_message(
                     (step.label.as_str(), None)
                 };
 
-                let mut top_line = div()
-                    .flex()
-                    .items_center()
-                    .gap(ui_space_px(theme, 6.0))
-                    .child(
-                        svg()
-                            .path(step.icon)
-                            .size(ui_space_px(theme, 12.0))
-                            .flex_shrink_0()
-                            .text_color(icon_color),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui_px(theme, 12.5))
-                            .text_color(theme.foreground.opacity(0.66))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(step_name.to_string()),
-                    )
-                    .child(div().flex_1());
-
+                let mut accessories = Vec::new();
                 if let Some(status_tag) = render_step_status_tag(step.status, theme) {
-                    top_line = top_line.child(status_tag);
+                    accessories.push(status_tag);
                 }
-
-                if let Some(dur) = step.duration {
-                    top_line = top_line.child(
+                if let Some(duration) = step.duration {
+                    accessories.push(
                         div()
-                            .flex_shrink_0()
-                            .text_size(mono_px(theme, 10.0))
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(theme.muted_foreground.opacity(0.36))
-                            .child(format_step_duration(dur)),
+                            .flex_none()
+                            .text_size(ui_px(theme, 10.5))
+                            .font_family(theme.font_family.clone())
+                            .text_color(theme.muted_foreground)
+                            .child(format_step_duration(duration))
+                            .into_any_element(),
                     );
                 }
-
                 if has_detail {
-                    top_line = top_line.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(mono_space_px(theme, 4.0))
-                            .child(
-                                div()
-                                    .text_size(mono_px(theme, 10.0))
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_color(theme.muted_foreground.opacity(0.34))
-                                    .child(if detail_collapsed { "Details" } else { "Hide" }),
-                            )
-                            .child(
-                                svg()
-                                    .path(if detail_collapsed {
-                                        "phosphor/caret-right.svg"
-                                    } else {
-                                        "phosphor/caret-down.svg"
-                                    })
-                                    .size(mono_space_px(theme, 10.0))
-                                    .flex_shrink_0()
-                                    .text_color(theme.muted_foreground.opacity(0.30)),
-                            ),
-                    );
+                    accessories.push(activity_caret(!detail_collapsed, theme));
                 }
-
-                let mut step_header = div()
-                    .flex()
-                    .flex_col()
-                    .gap(ui_space_px(theme, 3.0))
-                    .px(ui_space_px(theme, 12.0))
-                    .py(ui_space_px(theme, 10.0))
-                    .child(top_line);
-
-                if let Some(detail_text) = step_detail {
-                    step_header = step_header.child(
-                        div()
-                            .ml(mono_space_px(theme, 18.0))
-                            .text_size(mono_px(theme, 10.5))
-                            .line_height(mono_px(theme, 15.0))
-                            .text_color(theme.muted_foreground.opacity(0.56))
-                            .font_family(theme.mono_font_family.clone())
-                            .overflow_x_hidden()
-                            .whitespace_nowrap()
-                            .child(truncate_str(detail_text, 84)),
-                    );
-                }
+                let step_header = activity_row_header(
+                    if has_detail { "tool" } else { "note" },
+                    Some(activity_icon(step.icon, icon_color, theme)),
+                    step_name,
+                    step_detail,
+                    accessories,
+                    if has_detail {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    },
+                    theme,
+                );
 
                 let mut step_shell = div()
                     .flex()
                     .flex_col()
-                    .rounded(ui_space_px(theme, 12.0))
-                    .overflow_hidden()
-                    .bg(trace_step_surface(theme))
+                    .rounded(ui_space_px(theme, 8.0))
+                    .bg(theme.transparent)
                     .gap(px(0.0));
 
                 let step_header_shell = step_header
+                    .px(ui_space_px(theme, 8.0))
                     .bg(trace_step_header_surface(theme))
-                    .min_h(ui_space_px(theme, 44.0));
+                    .rounded(ui_space_px(theme, 8.0))
+                    .min_h(ui_space_px(theme, 28.0));
 
                 if has_detail {
                     let step_panel = panel.clone();
                     step_shell = step_shell.child(
-                        step_header_shell
-                            .id(SharedString::from(format!(
-                                "step-detail-{msg_idx}-{step_idx}"
-                            )))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(trace_step_header_hover_surface(theme)))
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                let _ = step_panel.update(cx, |this, cx| {
-                                    if let Some(m) = this.state.messages.get_mut(msg_idx)
-                                        && let Some(s) = m.steps.get_mut(step_idx)
-                                    {
-                                        s.detail_collapsed = !s.detail_collapsed;
-                                        m.touch();
-                                    }
-                                    this.remeasure_message(msg_idx);
-                                    cx.notify();
-                                });
-                            }),
+                        Button::new(SharedString::from(format!(
+                            "step-detail-{msg_idx}-{step_idx}"
+                        )))
+                        .custom(trace_disclosure_style(cx, theme))
+                        .w_full()
+                        .h_auto()
+                        .p_0()
+                        .rounded(ui_space_px(theme, 8.0))
+                        .accessibility_label(format!(
+                            "{} {} details",
+                            if detail_collapsed {
+                                "Expand"
+                            } else {
+                                "Collapse"
+                            },
+                            step_name
+                        ))
+                        .tooltip(step.label.clone())
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            let _ = step_panel.update(cx, |this, cx| {
+                                if let Some(m) = this.state.messages.get_mut(msg_idx)
+                                    && let Some(s) = m.steps.get_mut(step_idx)
+                                {
+                                    s.detail_collapsed = !s.detail_collapsed;
+                                    m.touch();
+                                }
+                                this.remeasure_message(msg_idx);
+                                cx.notify();
+                            });
+                        })
+                        .child(step_header_shell.w_full()),
                     );
                 } else {
                     step_shell = step_shell.child(step_header_shell);
@@ -3542,29 +3886,30 @@ fn render_assistant_message(
                         result_preview(detail, TOOL_RESULT_PREVIEW_LINES)
                     };
                     let detail_block = div()
-                        .px(ui_space_px(theme, 12.0))
-                        .pt(ui_space_px(theme, 10.0))
+                        .pl(ui_space_px(theme, 32.0))
+                        .pr(ui_space_px(theme, 10.0))
+                        .pt(ui_space_px(theme, 4.0))
                         .bg(trace_detail_surface(theme))
+                        .child(
+                            div().flex().justify_end().child(
+                                Clipboard::new(format!("copy-step-{msg_idx}-{step_idx}"))
+                                    .value(SharedString::from(detail.to_string())),
+                            ),
+                        )
                         .child(render_result_block(
                             &visible_detail,
                             &format!("step-result-{msg_idx}-{step_idx}"),
                             theme,
                             true,
                         ));
-                    step_shell = step_shell.child(
-                        detail_block.with_animation(
-                            SharedString::from(format!("step-detail-reveal-{msg_idx}-{step_idx}")),
-                            Animation::new(std::time::Duration::from_millis(170))
-                                .with_easing(ease_out_quint()),
-                            |this, delta| this.opacity(delta).pt(px((1.0 - delta) * 6.0)),
-                        ),
-                    );
+                    step_shell = step_shell.child(detail_block);
                     if is_expandable {
                         let expanded = step.detail_expanded;
                         let button_label = result_toggle_label(detail, expanded);
                         let detail_toggle_panel = panel.clone();
                         let detail_toggle = div()
-                            .px(ui_space_px(theme, 12.0))
+                            .pl(ui_space_px(theme, 32.0))
+                            .pr(ui_space_px(theme, 10.0))
                             .pt(ui_space_px(theme, 4.0))
                             .pb(ui_space_px(theme, 10.0))
                             .bg(trace_detail_surface(theme))
@@ -3574,10 +3919,8 @@ fn render_assistant_message(
                                         "step-detail-expand-{msg_idx}-{step_idx}"
                                     )))
                                     .cursor_pointer()
-                                    .hover(|s| {
-                                        s.bg(theme.muted.opacity(0.03))
-                                            .rounded(ui_space_px(theme, 6.0))
-                                    })
+                                    .rounded(ui_space_px(theme, 6.0))
+                                    .hover(|s| s.bg(trace_step_header_hover_surface(theme)))
                                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                         let _ = detail_toggle_panel.update(cx, |this, cx| {
                                             if let Some(message) =
@@ -3602,16 +3945,7 @@ fn render_assistant_message(
                                             )),
                                     ),
                             );
-                        step_shell = step_shell.child(
-                            detail_toggle.with_animation(
-                                SharedString::from(format!(
-                                    "step-detail-toggle-{msg_idx}-{step_idx}"
-                                )),
-                                Animation::new(std::time::Duration::from_millis(185))
-                                    .with_easing(ease_out_quint()),
-                                |this, delta| this.opacity(delta).pt(px((1.0 - delta) * 4.0)),
-                            ),
-                        );
+                        step_shell = step_shell.child(detail_toggle);
                     } else {
                         step_shell = step_shell.child(
                             div()
@@ -3625,16 +3959,15 @@ fn render_assistant_message(
                 steps_el = steps_el.child(step_shell);
             }
 
-            run_card = run_card.child(steps_el.with_animation(
-                SharedString::from(format!("steps-reveal-{msg_idx}")),
-                Animation::new(std::time::Duration::from_millis(190)).with_easing(ease_out_quint()),
-                |this, delta| this.opacity(delta).pt(px((1.0 - delta) * 8.0)),
-            ));
+            run_card = run_card.child(steps_el);
         }
 
         msg_el = msg_el.child(run_card);
     }
 
+    if !msg.content.is_empty() {
+        msg_el = msg_el.child(answer_el);
+    }
     msg_el.into_any_element()
 }
 
@@ -3651,7 +3984,7 @@ impl Render for AssistantMessageView {
             self.message.ensure_thinking_markdown();
         }
 
-        if self.is_streaming_assistant
+        if (self.is_streaming_assistant || self.markdown_expanded)
             && self.state_key.content_markdown_blocks > self.rendered_markdown_blocks
         {
             self.schedule_markdown_hydration(cx);
@@ -3669,13 +4002,16 @@ impl Render for AssistantMessageView {
 
         render_assistant_message(
             &self.message,
+            self.avatar_asset.clone(),
             panel,
             view,
             msg_idx,
             self.is_streaming_assistant,
             rendered_markdown_blocks,
+            self.markdown_expanded,
             rendered_markdown,
             theme,
+            cx,
         )
     }
 }
@@ -3698,10 +4034,9 @@ impl AgentPanel {
         if is_system {
             msg_el = msg_el.child(
                 div()
-                    .px(ui_space_px(theme, 6.0))
-                    .py(ui_space_px(theme, 8.0))
-                    .text_size(ui_px(theme, 12.5))
-                    .text_color(theme.muted_foreground.opacity(0.40))
+                    .py(ui_space_px(theme, 4.0))
+                    .text_size(ui_px(theme, 13.0))
+                    .text_color(theme.muted_foreground)
                     .line_height(ui_px(theme, 19.0))
                     .child(msg.content.clone()),
             );
@@ -3731,9 +4066,8 @@ impl AgentPanel {
                                         },
                                     ))
                                     .child(
-                                        Input::new(edit_input)
+                                        Textarea::new(edit_input)
                                             .appearance(false)
-                                            .cleanable(false)
                                             .font_family(theme.mono_font_family.clone()),
                                     ),
                             )
@@ -3798,22 +4132,33 @@ impl AgentPanel {
                     div()
                         .id(ElementId::Name(format!("user-msg-{msg_idx}").into()))
                         .group("user-msg")
+                        // Keep the hover toolbar inside this group's hit region.
+                        .pb(ui_px(theme, 24.0))
+                        .relative()
+                        .w_full()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .items_end()
                         .gap(px(3.0))
                         .child(
                             div()
-                                .max_w(rems(22.0))
-                                .px(px(12.0))
-                                .py(px(8.0))
-                                .rounded(px(14.0))
-                                .rounded_tr(px(4.0))
-                                .bg(theme.primary.opacity(0.06))
+                                .debug_selector(|| "agent-user-bubble".into())
+                                .max_w_full()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .px(ui_space_px(theme, 14.0))
+                                .py(ui_space_px(theme, 10.0))
+                                .rounded(ui_space_px(theme, 12.0))
+                                .bg(theme.foreground.opacity(0.045))
                                 .child(render_user_message_text(&user_content, msg_idx, theme)),
                         )
                         .child(
                             div()
+                                .debug_selector(|| "agent-user-actions".into())
+                                .absolute()
+                                .right(px(0.0))
+                                .bottom(px(0.0))
                                 .flex()
                                 .items_center()
                                 .gap(px(1.0))
@@ -3827,6 +4172,7 @@ impl AgentPanel {
                                     let content_for_edit = user_content.clone();
                                     div()
                                         .id(ElementId::Name(format!("edit-{msg_idx}").into()))
+                                        .debug_selector(|| "agent-user-edit".into())
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -3848,7 +4194,7 @@ impl AgentPanel {
                                         .child(
                                             svg()
                                                 .path("phosphor/pencil-simple.svg")
-                                                .size(px(13.0))
+                                                .size(ui_icon_px(theme, 13.0))
                                                 .text_color(theme.muted_foreground.opacity(0.4)),
                                         )
                                 })
@@ -3876,7 +4222,7 @@ impl AgentPanel {
                                         .child(
                                             svg()
                                                 .path("phosphor/arrow-clockwise.svg")
-                                                .size(px(13.0))
+                                                .size(ui_icon_px(theme, 13.0))
                                                 .text_color(theme.muted_foreground.opacity(0.4)),
                                         )
                                 }),
@@ -3904,40 +4250,11 @@ impl AgentPanel {
     }
 }
 
-impl Render for AgentPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_inline_input_state(window, cx);
-        self.install_message_list_handler(cx);
-        self.sync_message_list_count();
-
+impl AgentPanel {
+    fn render_current_activity(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let theme = &theme;
-        let content_reveal = self.content_reveal.value(window);
-
-        // ── Messages ──────────────────────────────────────────────
-        let total_messages = self.state.messages.len();
-        if self.assistant_message_views.len() > total_messages {
-            self.assistant_message_views.truncate(total_messages);
-        }
-        let messages_content = list(
-            self.message_list_state.clone(),
-            cx.processor(|this, msg_idx: usize, window, cx| {
-                div()
-                    .w_full()
-                    .pb(px(16.0))
-                    .child(this.render_message_item(msg_idx, window, cx))
-                    .into_any_element()
-            }),
-        )
-        .with_sizing_behavior(ListSizingBehavior::Auto)
-        .h_full()
-        .min_h_0()
-        .w_full()
-        .pt(px(12.0))
-        .pb(px(64.0))
-        .flex_grow();
-
-        let mut transcript_footer = div().flex().flex_col().gap(px(16.0));
+        let mut activity = div().flex().flex_col().gap(px(16.0));
 
         // ── Active tool calls (skip if awaiting approval — the card shows it) ──
         // Collect call_ids that have pending approvals to avoid duplicate rendering.
@@ -3957,60 +4274,47 @@ impl Render for AgentPanel {
             .collect();
 
         if !visible_tool_calls.is_empty() {
-            let mut tc_container = div()
-                .flex()
-                .flex_col()
-                .ml(ui_space_px(theme, 19.0))
-                .mr(ui_space_px(theme, 4.0))
-                .gap(ui_space_px(theme, 10.0))
-                .px(ui_space_px(theme, 10.0))
-                .py(ui_space_px(theme, 10.0))
-                .rounded(ui_space_px(theme, 12.0))
-                .bg(trace_group_surface(theme))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .min_w_0()
-                        .gap(ui_space_px(theme, 8.0))
-                        .px(ui_space_px(theme, 4.0))
-                        .py(ui_space_px(theme, 3.0))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .gap(ui_space_px(theme, 2.0))
-                                .child(render_section_kicker("Working now", theme))
-                                .child(
-                                    div()
-                                        .text_size(ui_px(theme, 12.75))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme.foreground.opacity(0.74))
-                                        .child("Live tools for this reply"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(ui_px(theme, 10.75))
-                                        .text_color(theme.muted_foreground.opacity(0.46))
-                                        .min_w_0()
-                                        .child("Commands and reads still in progress"),
-                                ),
-                        )
-                        .child(render_inline_state(
-                            format!(
-                                "{} live",
-                                visible_tool_calls
-                                    .iter()
-                                    .filter(|(_, tc)| tc.result.is_none())
-                                    .count()
-                            )
-                            .into(),
-                            theme.warning,
-                            theme,
-                        )),
-                );
+            let running_count = visible_tool_calls
+                .iter()
+                .filter(|(_, tc)| tc.result.is_none())
+                .count();
+            let mut tc_container = div().flex().flex_col().gap(ui_space_px(theme, 8.0)).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .gap(ui_space_px(theme, 8.0))
+                    .px(ui_space_px(theme, 4.0))
+                    .py(ui_space_px(theme, 3.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(ui_space_px(theme, 2.0))
+                            .child(
+                                div()
+                                    .text_size(ui_px(theme, 12.75))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.foreground)
+                                    .child("Tool activity"),
+                            ),
+                    )
+                    .child(render_inline_state(
+                        if running_count > 0 {
+                            format!("{running_count} running").into()
+                        } else {
+                            "Finished".into()
+                        },
+                        if running_count > 0 {
+                            theme.warning
+                        } else {
+                            theme.muted_foreground
+                        },
+                        theme,
+                    )),
+            );
 
             for (tc_idx, tc) in visible_tool_calls {
                 let is_done = tc.result.is_some();
@@ -4019,89 +4323,45 @@ impl Render for AgentPanel {
                 let human_name = humanize_tool_name(&tc.tool_name);
 
                 let icon_color = if is_done {
-                    theme.muted_foreground.opacity(0.4)
+                    theme.muted_foreground
                 } else {
                     theme.warning
                 };
 
-                // Icon or spinner
-                let icon_el: AnyElement = if is_done {
-                    svg()
-                        .path(icon)
-                        .size(ui_space_px(theme, 12.0))
-                        .flex_shrink_0()
-                        .text_color(icon_color)
-                        .into_any_element()
-                } else {
+                let duration = tc.duration.unwrap_or_else(|| tc.started_at.elapsed());
+                let mut accessories = vec![
                     div()
-                        .flex_shrink_0()
-                        .child(Spinner::new().small().color(theme.warning))
-                        .into_any_element()
-                };
-
-                let dur = tc.duration.unwrap_or_else(|| tc.started_at.elapsed());
-
-                // Two-line layout matching completed steps
-                let top_line = div()
-                    .flex()
-                    .items_center()
-                    .gap(ui_space_px(theme, 6.0))
-                    .child(icon_el)
-                    .child(
-                        div()
-                            .text_size(ui_px(theme, 12.5))
-                            .text_color(theme.foreground.opacity(0.66))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(human_name),
-                    )
-                    .child(div().flex_1()) // spacer
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(mono_px(theme, 10.0))
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(theme.muted_foreground.opacity(0.36))
-                            .child(format_step_duration(dur)),
-                    );
-                let top_line = if is_done {
-                    top_line
-                } else {
-                    top_line.child(render_inline_state("Live".into(), theme.warning, theme))
-                };
-
-                let mut tc_row = div()
-                    .flex()
-                    .flex_col()
-                    .gap(ui_space_px(theme, 3.0))
-                    .px(ui_space_px(theme, 12.0))
-                    .py(ui_space_px(theme, 10.0))
-                    .child(top_line);
-
-                // Args on second line
-                if !args_display.is_empty() {
-                    tc_row = tc_row.child(
-                        div()
-                            .ml(mono_space_px(theme, 18.0))
-                            .text_size(mono_px(theme, 10.75))
-                            .text_color(theme.muted_foreground.opacity(0.50))
-                            .font_family(theme.mono_font_family.clone())
-                            .overflow_x_hidden()
-                            .whitespace_nowrap()
-                            .child(truncate_str(&args_display, 60)),
-                    );
+                        .flex_none()
+                        .text_size(ui_px(theme, 10.5))
+                        .font_family(theme.font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(format_step_duration(duration))
+                        .into_any_element(),
+                ];
+                if !is_done {
+                    accessories.push(render_inline_state("Live".into(), theme.warning, theme));
                 }
+                let tc_row = activity_row_header(
+                    "live",
+                    Some(activity_icon(icon, icon_color, theme)),
+                    &human_name,
+                    (!args_display.is_empty()).then_some(args_display.as_str()),
+                    accessories,
+                    theme.foreground,
+                    theme,
+                );
 
                 let mut tc_el = div()
                     .flex()
                     .flex_col()
                     .rounded(ui_space_px(theme, 12.0))
                     .overflow_hidden()
-                    .bg(trace_step_surface(theme))
+                    .bg(theme.transparent)
                     .gap(px(0.0))
                     .child(
                         tc_row
                             .bg(trace_step_header_surface(theme))
-                            .min_h(ui_space_px(theme, 44.0)),
+                            .min_h(ui_space_px(theme, 32.0)),
                     );
 
                 // Result preview
@@ -4115,7 +4375,8 @@ impl Render for AgentPanel {
                     };
                     tc_el = tc_el.child(
                         div()
-                            .px(px(12.0))
+                            .pl(ui_space_px(theme, 32.0))
+                            .pr(ui_space_px(theme, 10.0))
                             .pt(px(10.0))
                             .bg(trace_detail_surface(theme))
                             .child(render_result_block(
@@ -4162,7 +4423,7 @@ impl Render for AgentPanel {
                 }
                 tc_container = tc_container.child(tc_el);
             }
-            transcript_footer = transcript_footer.child(tc_container);
+            activity = activity.child(tc_container);
         }
 
         // ── Pending approvals ───────────────────────────────────
@@ -4205,7 +4466,7 @@ impl Render for AgentPanel {
                                             .child(
                                                 svg()
                                                     .path(icon)
-                                                    .size(px(13.0))
+                                                    .size(ui_icon_px(theme, 13.0))
                                                     .flex_shrink_0()
                                                     .text_color(theme.warning.opacity(0.70)),
                                             )
@@ -4234,7 +4495,7 @@ impl Render for AgentPanel {
                             .whitespace_nowrap()
                             .child(truncate_str(&args_display, 80)),
                     )
-                    .child(Divider::horizontal().color(theme.warning.opacity(0.12)))
+                    .child(Separator::horizontal().color(theme.warning.opacity(0.12)))
                     // Action row — clear hierarchy
                     .child(
                         div()
@@ -4272,68 +4533,95 @@ impl Render for AgentPanel {
                             ),
                     );
 
-            transcript_footer = transcript_footer.child(approval_el);
+            activity = activity.child(approval_el);
         }
 
-        // ── Status indicator (hidden when approval cards are visible — they ARE the status) ──
-        if self.state.pending_approvals.is_empty() {
-            if let Some((_icon, label)) = self.status_text() {
-                let status_color = match self.state.status {
-                    AgentStatus::Thinking => theme.warning,
-                    AgentStatus::Responding => theme.success,
-                    AgentStatus::Idle => theme.muted_foreground,
+        if self.state.pending_approvals.is_empty()
+            && self.state.tool_calls.is_empty()
+            && !self.state.messages.last().is_some_and(|message| {
+                message.role == "assistant"
+                    && self.state.streaming
+                    && (!message.steps.is_empty()
+                        || message
+                            .thinking
+                            .as_ref()
+                            .is_some_and(|text| !text.is_empty()))
+            })
+            && let Some((_, label)) = self.status_text()
+        {
+            activity = activity.child(activity_row_header(
+                "status",
+                Some(self.busy_indicator.clone().into_any_element()),
+                label,
+                None,
+                Vec::new(),
+                theme.muted_foreground,
+                theme,
+            ));
+        }
+
+        div()
+            .debug_selector(|| "agent-current-activity".into())
+            .w_full()
+            .child(activity)
+            .into_any_element()
+    }
+}
+
+impl Render for AgentPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.install_message_list_handler(cx);
+        self.sync_message_list_count();
+
+        let theme = cx.theme().clone();
+        let theme = &theme;
+        let content_reveal = self.content_reveal.value(window, cx);
+
+        // ── Messages ──────────────────────────────────────────────
+        let total_messages = self.state.messages.len();
+        if self.assistant_message_views.len() > total_messages {
+            self.assistant_message_views.truncate(total_messages);
+        }
+        let messages_content = list(
+            self.message_list_state.clone(),
+            cx.processor(|this, msg_idx: usize, window, cx| {
+                let is_user = this
+                    .state
+                    .messages
+                    .get(msg_idx)
+                    .is_some_and(|message| message.role == "user");
+                let content = if msg_idx == this.state.messages.len() {
+                    this.render_current_activity(cx)
+                } else {
+                    this.render_message_item(msg_idx, window, cx)
                 };
-                transcript_footer = transcript_footer.child(
-                    div()
-                        .ml(px(19.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .py(px(3.0))
-                        .px(px(4.0))
-                        .child(Spinner::new().small().color(status_color))
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(theme.muted_foreground.opacity(0.50))
-                                .child(label),
-                        ),
-                );
-            }
-        } // end pending_approvals.is_empty() guard
+                div()
+                    .w_full()
+                    .pb(if is_user {
+                        px(0.0)
+                    } else {
+                        ui_px(cx.theme(), 24.0)
+                    })
+                    .child(content)
+                    .into_any_element()
+            }),
+        )
+        .with_sizing_behavior(ListSizingBehavior::Auto)
+        .h_full()
+        .min_h_0()
+        .w_full()
+        .pt(px(12.0))
+        .pb(px(16.0))
+        .flex_grow_1();
 
         // ── Header ──────────────────────────────────────────────
-        let status_indicator: AnyElement = match self.state.status {
-            AgentStatus::Idle => div()
-                .size(px(7.0))
-                .rounded_full()
-                .bg(theme.muted_foreground.opacity(0.25))
-                .into_any_element(),
-            AgentStatus::Thinking => Spinner::new()
-                .small()
-                .color(theme.warning)
-                .into_any_element(),
-            AgentStatus::Responding => Spinner::new()
-                .small()
-                .color(theme.success)
-                .into_any_element(),
-        };
-
-        let header_left = div()
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .flex_shrink_0()
-            .child(
-                svg()
-                    .path("phosphor/oven-duotone.svg")
-                    .size(px(14.0))
-                    .text_color(theme.primary),
-            )
-            .child(status_indicator);
-
         let control_icons = {
-            let mut actions = div().flex().items_center().gap(px(2.0)).flex_shrink_0();
+            let mut actions = div()
+                .debug_selector(|| "agent-header-actions".into())
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .flex_shrink_0();
 
             if self.state.status != AgentStatus::Idle {
                 actions = actions.child(
@@ -4341,7 +4629,11 @@ impl Render for AgentPanel {
                         .icon(Icon::default().path("phosphor/stop.svg"))
                         .ghost()
                         .xsmall()
+                        .size(ui_space_px(theme, 26.0))
+                        .rounded(ui_space_px(theme, 8.0))
+                        .text_color(theme.muted_foreground)
                         .tooltip("Stop")
+                        .accessibility_label("Stop response")
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.emit(CancelRequest);
                             this.state.status = AgentStatus::Idle;
@@ -4361,12 +4653,19 @@ impl Render for AgentPanel {
                         }))
                         .ghost()
                         .xsmall()
+                        .size(ui_space_px(theme, 26.0))
+                        .rounded(ui_space_px(theme, 8.0))
                         .text_color(if self.auto_approve {
                             theme.primary
                         } else {
-                            theme.muted_foreground.opacity(0.65)
+                            theme.muted_foreground
                         })
                         .tooltip(if self.auto_approve {
+                            "Auto-approve on"
+                        } else {
+                            "Auto-approve off"
+                        })
+                        .accessibility_label(if self.auto_approve {
                             "Auto-approve on"
                         } else {
                             "Auto-approve off"
@@ -4383,7 +4682,11 @@ impl Render for AgentPanel {
                         .icon(Icon::default().path("phosphor/clock-counter-clockwise.svg"))
                         .ghost()
                         .xsmall()
+                        .size(ui_space_px(theme, 26.0))
+                        .rounded(ui_space_px(theme, 8.0))
+                        .text_color(theme.muted_foreground)
                         .tooltip("History")
+                        .accessibility_label("Conversation history")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_history(cx);
                         })),
@@ -4393,7 +4696,11 @@ impl Render for AgentPanel {
                         .icon(Icon::default().path("phosphor/plus.svg"))
                         .ghost()
                         .xsmall()
-                        .tooltip("New Chat")
+                        .size(ui_space_px(theme, 26.0))
+                        .rounded(ui_space_px(theme, 8.0))
+                        .text_color(theme.muted_foreground)
+                        .tooltip("New conversation")
+                        .accessibility_label("New conversation")
                         .on_click(cx.listener(|this, _, _, cx| {
                             cx.emit(NewConversation);
                             this.clear_messages(cx);
@@ -4410,43 +4717,29 @@ impl Render for AgentPanel {
             .as_ref()
             .map(|provider| provider.short_label)
             .unwrap_or("AI");
+        let provider_label = current_provider
+            .as_ref()
+            .map(|provider| provider.label)
+            .unwrap_or(provider_short_label);
         let panel = cx.entity().clone();
         let provider_picker = Button::new("agent-provider-picker")
             .ghost()
             .xsmall()
             .compact()
+            .h(ui_px(theme, 26.0))
+            .px(ui_space_px(theme, 8.0))
+            .rounded(ui_space_px(theme, 8.0))
             .dropdown_caret(true)
-            .tooltip("Provider")
+            .tooltip(format!("Provider: {provider_label}"))
+            .accessibility_label(format!("Provider: {provider_label}"))
+            .text_color(theme.foreground)
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .size(px(20.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .bg(theme.title_bar.opacity(self.ui_opacity * 0.92))
-                            .child(
-                                svg()
-                                    .path(provider_icon_path)
-                                    .size(px(12.0))
-                                    .text_color(theme.foreground.opacity(0.82)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(12.0))
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(theme.foreground.opacity(0.88))
-                            .child(provider_short_label),
-                    ),
+                svg()
+                    .path(provider_icon_path)
+                    .size(ui_icon_px(theme, 14.0))
+                    .text_color(theme.foreground),
             )
-            .dropdown_menu_with_anchor(Corner::BottomLeft, {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, {
                 let options = self.session_provider_options.clone();
                 let current_provider = self.current_provider.clone();
                 let panel = panel.clone();
@@ -4463,7 +4756,7 @@ impl Render for AgentPanel {
                                         let provider = option.provider.clone();
                                         let panel = panel.clone();
                                         move |_, _, cx| {
-                                            let _ = panel.update(cx, |_, cx| {
+                                            panel.update(cx, |_, cx| {
                                                 cx.emit(SelectSessionProvider {
                                                     provider: provider.clone(),
                                                 });
@@ -4481,165 +4774,81 @@ impl Render for AgentPanel {
         } else {
             SharedString::from(humanize_model_name(&self.model_name))
         };
-        let model_picker = div().w(px(156.0)).flex_shrink_0().overflow_hidden().child(
-            Button::new("agent-model-picker")
-                .ghost()
-                .xsmall()
-                .compact()
-                .dropdown_caret(true)
-                .tooltip("Model")
-                .disabled(self.session_model_options.is_empty())
-                .label(model_label)
-                .dropdown_menu_with_anchor(Corner::BottomLeft, {
-                    let current_model = self.model_name.clone();
-                    let options = self.session_model_options.clone();
-                    let panel = panel.clone();
-                    move |menu: PopupMenu, _, _| {
-                        options.iter().cloned().fold(
-                            menu.min_w(px(240.0)).max_h(px(240.0)).scrollable(true),
-                            |menu, model: String| {
-                                let checked = model == current_model;
-                                menu.item(
-                                    PopupMenuItem::new(model.clone())
-                                        .checked(checked)
-                                        .on_click({
-                                            let selected_model = model.clone();
-                                            let panel = panel.clone();
-                                            move |_, _, cx| {
-                                                let _ = panel.update(cx, |_, cx| {
-                                                    cx.emit(SelectSessionModel {
-                                                        model: selected_model.clone(),
-                                                    });
-                                                });
-                                            }
-                                        }),
-                                )
-                            },
-                        )
-                    }
-                }),
-        );
-
-        let header = div()
+        let model_picker = div()
+            .debug_selector(|| "agent-model-region".into())
             .flex()
             .items_center()
-            .gap(px(7.0))
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .child(
+                Button::new("agent-model-picker")
+                    .ghost()
+                    .xsmall()
+                    .compact()
+                    .h(ui_px(theme, 26.0))
+                    .px(ui_space_px(theme, 8.0))
+                    .rounded(ui_space_px(theme, 8.0))
+                    .max_w_full()
+                    .flex_shrink_1()
+                    .dropdown_caret(true)
+                    .tooltip(if self.model_name.is_empty() {
+                        "Choose a model".to_owned()
+                    } else {
+                        format!("Model: {}", self.model_name)
+                    })
+                    .text_color(theme.foreground)
+                    .disabled(self.session_model_options.is_empty())
+                    .label(model_label)
+                    .dropdown_menu_with_anchor(Anchor::BottomLeft, {
+                        let current_model = self.model_name.clone();
+                        let options = self.session_model_options.clone();
+                        let panel = panel.clone();
+                        move |menu: PopupMenu, _, _| {
+                            options.iter().cloned().fold(
+                                menu.min_w(px(240.0)).max_h(px(240.0)).scrollable(true),
+                                |menu, model: String| {
+                                    let checked = model == current_model;
+                                    menu.item(
+                                        PopupMenuItem::new(model.clone())
+                                            .checked(checked)
+                                            .on_click({
+                                                let selected_model = model.clone();
+                                                let panel = panel.clone();
+                                                move |_, _, cx| {
+                                                    panel.update(cx, |_, cx| {
+                                                        cx.emit(SelectSessionModel {
+                                                            model: selected_model.clone(),
+                                                        });
+                                                    });
+                                                }
+                                            }),
+                                    )
+                                },
+                            )
+                        }
+                    }),
+            );
+
+        let header = div()
+            .debug_selector(|| "agent-header".into())
+            .flex()
+            .items_center()
+            .gap(ui_space_px(theme, 4.0))
             .w_full()
             .min_w_0()
-            .px(px(14.0))
-            .py(px(10.0))
+            .px(ui_space_px(theme, 16.0))
+            .py(ui_space_px(theme, 8.0))
             .flex_shrink_0()
-            .child(header_left)
             .child(provider_picker)
             .child(model_picker);
-        let header = header.child(control_icons);
-
-        let live_activity_strip = if let Some(approval) = self.state.pending_approvals.first() {
-            let args_display = format_tool_args(&approval.tool_name, &approval.args);
-            Some(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(ui_space_px(theme, 7.0))
-                    .mx(ui_space_px(theme, 14.0))
-                    .mb(ui_space_px(theme, 8.0))
-                    .child(render_section_kicker("Needs approval", theme))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(ui_space_px(theme, 8.0))
-                            .child(render_inline_state(
-                                "Approval waiting".into(),
-                                theme.warning,
-                                theme,
-                            ))
-                            .child(
-                                div()
-                                    .text_size(mono_px(theme, 10.5))
-                                    .line_height(mono_px(theme, 15.0))
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_color(theme.muted_foreground.opacity(0.60))
-                                    .min_w_0()
-                                    .overflow_x_hidden()
-                                    .whitespace_nowrap()
-                                    .child(truncate_str(&args_display, 96)),
-                            ),
-                    )
-                    .child(Divider::horizontal().color(theme.muted.opacity(0.10)))
-                    .into_any_element(),
-            )
-        } else if let Some(tc) = self.running_tool_call() {
-            let args_display = format_tool_args(&tc.tool_name, &tc.args);
-            let human_name = humanize_tool_name(&tc.tool_name);
-            Some(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(ui_space_px(theme, 7.0))
-                    .mx(ui_space_px(theme, 14.0))
-                    .mb(ui_space_px(theme, 8.0))
-                    .child(render_section_kicker("Current run", theme))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(ui_space_px(theme, 8.0))
-                            .child(Spinner::new().small().color(theme.warning))
-                            .child(
-                                div()
-                                    .text_size(ui_px(theme, 12.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground.opacity(0.74))
-                                    .child(human_name),
-                            )
-                            .child(
-                                div()
-                                    .text_size(mono_px(theme, 10.5))
-                                    .line_height(mono_px(theme, 15.0))
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_color(theme.muted_foreground.opacity(0.60))
-                                    .min_w_0()
-                                    .overflow_x_hidden()
-                                    .whitespace_nowrap()
-                                    .child(truncate_str(&args_display, 96)),
-                            ),
-                    )
-                    .child(Divider::horizontal().color(theme.muted.opacity(0.10)))
-                    .into_any_element(),
-            )
-        } else if let Some((_icon, label)) = self.status_text() {
-            Some(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(ui_space_px(theme, 7.0))
-                    .mx(ui_space_px(theme, 14.0))
-                    .mb(ui_space_px(theme, 8.0))
-                    .child(render_section_kicker("Live status", theme))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(ui_space_px(theme, 8.0))
-                            .child(
-                                Spinner::new()
-                                    .small()
-                                    .color(theme.muted_foreground.opacity(0.6)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(ui_px(theme, 12.0))
-                                    .text_color(theme.foreground.opacity(0.66))
-                                    .child(label),
-                            ),
-                    )
-                    .child(Divider::horizontal().color(theme.muted.opacity(0.10)))
-                    .into_any_element(),
-            )
-        } else {
-            None
-        };
+        let header = header.child(control_icons).map(|header| {
+            #[cfg(target_os = "macos")]
+            let header = header
+                .w_auto()
+                .mx(px(crate::workspace::frame::AGENT_CONTENT_INSET));
+            header
+        });
 
         // ── Panel ───────────────────────────────────────────────
         // Use system proportional font for readable prose — the workspace root
@@ -4651,15 +4860,12 @@ impl Render for AgentPanel {
             .size_full()
             .min_h_0()
             .items_stretch()
-            .bg(theme.title_bar.opacity(self.ui_opacity))
+            // The workspace paints the panel glass once. A second translucent
+            // fill here makes the entire side panel look nearly opaque.
+            .bg(theme.transparent)
             .font_family(theme.font_family.clone())
             .text_size(theme.font_size)
-            .child(header)
-            .child(Divider::horizontal().color(theme.muted.opacity(0.08)));
-
-        if let Some(live_activity_strip) = live_activity_strip {
-            panel = panel.child(live_activity_strip);
-        }
+            .child(header);
 
         if self.showing_history {
             let mut history_content = div()
@@ -4770,6 +4976,11 @@ impl Render for AgentPanel {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .map(|content| {
+                        #[cfg(target_os = "macos")]
+                        let content = content.mx(px(crate::workspace::frame::AGENT_CONTENT_INSET));
+                        content
+                    })
                     .child(
                         history_content
                             .opacity(content_reveal)
@@ -4781,15 +4992,20 @@ impl Render for AgentPanel {
             let show_jump_to_latest = self.follow_output == FollowOutputState::Detached
                 && !self.is_scrolled_near_bottom();
             let transcript_surface = div()
+                .debug_selector(|| "agent-transcript-viewport".into())
                 .relative()
                 .flex_1()
                 .min_h_0()
                 .child(
-                    div().size_full().min_h_0().pl(px(14.0)).pr(px(34.0)).child(
-                        messages_content
-                            .opacity(content_reveal)
-                            .pt(vertical_reveal_offset(content_reveal, 10.0)),
-                    ),
+                    div()
+                        .size_full()
+                        .min_h_0()
+                        .px(ui_space_px(theme, 16.0))
+                        .child(
+                            messages_content
+                                .opacity(content_reveal)
+                                .pt(vertical_reveal_offset(content_reveal, 10.0)),
+                        ),
                 )
                 .vertical_scrollbar(&self.message_list_state);
 
@@ -4799,79 +5015,67 @@ impl Render for AgentPanel {
                 .flex_col()
                 .flex_1()
                 .min_h_0()
+                .map(|content| {
+                    #[cfg(target_os = "macos")]
+                    let content = content.mx(px(crate::workspace::frame::AGENT_CONTENT_INSET));
+                    content
+                })
                 .child(transcript_surface);
-
-            messages_container = messages_container.child(
-                div()
-                    .relative()
-                    .flex_shrink_0()
-                    .max_h(px(320.0))
-                    .min_h_0()
-                    .pl(px(16.0))
-                    .pr(px(22.0))
-                    .pb(px(12.0))
-                    .child(
-                        div()
-                            .id("agent-transcript-footer")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.transcript_footer_scroll_handle)
-                            .child(
-                                transcript_footer
-                                    .opacity(content_reveal)
-                                    .pt(vertical_reveal_offset(content_reveal, 10.0)),
-                            ),
-                    )
-                    .vertical_scrollbar(&self.transcript_footer_scroll_handle),
-            );
 
             if show_jump_to_latest {
                 messages_container = messages_container.child(
                     div()
                         .absolute()
-                        .right(px(14.0))
-                        .bottom(if self.show_inline_input {
-                            px(66.0)
-                        } else {
-                            px(14.0)
-                        })
+                        .right(ui_space_px(theme, 16.0))
+                        .bottom(ui_space_px(theme, 16.0))
                         .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .px(px(10.0))
-                                .py(px(5.0))
-                                .rounded_full()
-                                .cursor_pointer()
-                                .bg(theme.title_bar.opacity(0.84))
-                                .hover(|s| {
-                                    s.bg(theme.title_bar.opacity(0.94))
-                                        .text_color(theme.foreground.opacity(0.96))
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.follow_output = FollowOutputState::PendingJump;
-                                        this.scroll_to_bottom();
-                                        cx.notify();
-                                    }),
+                            Button::new("agent-jump-to-latest")
+                                .debug_selector(|| "agent-jump-to-latest".into())
+                                .custom(
+                                    ButtonCustomVariant::new(cx)
+                                        .color(
+                                            theme.background.blend(theme.foreground.opacity(0.065)),
+                                        )
+                                        .hover(
+                                            theme.background.blend(theme.foreground.opacity(0.10)),
+                                        )
+                                        .active(
+                                            theme.background.blend(theme.foreground.opacity(0.14)),
+                                        )
+                                        .foreground(theme.foreground),
                                 )
-                                .child(div().w(px(10.0)).h(px(10.0)).flex_shrink_0())
+                                .xsmall()
+                                .tab_stop(true)
+                                .h(ui_space_px(theme, 30.0))
+                                .p_0()
+                                .rounded(ui_space_px(theme, 8.0))
+                                .accessibility_label("Jump to latest message")
+                                .tooltip("Jump to latest message")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.follow_output = FollowOutputState::PendingJump;
+                                    this.scroll_to_bottom();
+                                    cx.notify();
+                                }))
                                 .child(
                                     div()
-                                        .text_size(px(10.5))
-                                        .line_height(px(11.0))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme.foreground.opacity(0.86))
-                                        .child("Latest"),
-                                )
-                                .child(
-                                    svg()
-                                        .path("phosphor/arrow-line-down.svg")
-                                        .size(px(10.0))
-                                        .flex_shrink_0()
-                                        .text_color(theme.muted_foreground.opacity(0.8)),
+                                        .flex()
+                                        .items_center()
+                                        .gap(ui_space_px(theme, 6.0))
+                                        .px(ui_space_px(theme, 10.0))
+                                        .child(
+                                            svg()
+                                                .path("phosphor/arrow-line-down.svg")
+                                                .size(ui_icon_px(theme, 14.0))
+                                                .text_color(theme.foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(ui_px(theme, 12.0))
+                                                .line_height(ui_px(theme, 18.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme.foreground)
+                                                .child("Latest"),
+                                        ),
                                 ),
                         ),
                 );
@@ -4886,61 +5090,45 @@ impl Render for AgentPanel {
             let inline_input = self.inline_input_state.clone().unwrap();
 
             let has_text = self.inline_input_has_text;
-            let has_skills = self.inline_input_has_skills;
-            let inline_control_size = mono_space_px(theme, 24.0);
             let inline_input_text_size = mono_px(theme, 13.0);
 
-            // Send button — circular, matches main input bar
-            let send_button = div()
-                .id("inline-send-btn")
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(inline_control_size)
-                .rounded(mono_space_px(theme, 12.0))
-                .cursor_pointer()
-                .flex_shrink_0()
-                .bg(if has_text && !has_skills {
-                    theme.primary
-                } else {
-                    theme.muted.opacity(0.12)
-                })
-                .hover(|s| {
-                    if has_text {
-                        s.bg(theme.primary_hover)
-                    } else {
-                        s.bg(theme.muted.opacity(0.18))
-                    }
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
+            // Keep the inline action at the same visual weight as the main bar.
+            let send_button =
+                crate::input_chrome::send_button("inline-send-btn", has_text, theme, cx)
+                    .accessibility_label("Send message")
+                    .tooltip("Send message")
+                    .debug_selector(|| "agent-composer-send".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(ref input) = this.inline_input_state {
                             let text = input.read(cx).text().to_string();
                             if !text.trim().is_empty() {
                                 input.update(cx, |s, cx| s.set_value("", window, cx));
+                                input.read(cx).focus_handle(cx).focus(window, cx);
                                 cx.emit(InlineInputSubmit { text });
                             }
                         }
-                    }),
-                )
-                .child(
-                    svg()
-                        .path("phosphor/arrow-up.svg")
-                        .size(mono_space_px(theme, 12.0))
-                        .text_color(if has_text && !has_skills {
-                            theme.primary_foreground
-                        } else {
-                            theme.muted_foreground.opacity(0.4)
-                        }),
-                );
+                    }));
 
             panel = panel.child(
                 div()
-                    .absolute()
-                    .left(mono_space_px(theme, 8.0))
-                    .right(mono_space_px(theme, 9.0))
-                    .bottom(mono_space_px(theme, 8.0))
+                    .w_full()
+                    .flex_shrink_0()
+                    .px(mono_space_px(theme, 12.0))
+                    .pt(mono_space_px(theme, 8.0))
+                    .pb(mono_space_px(theme, 8.0))
+                    .map(|composer| {
+                        #[cfg(target_os = "macos")]
+                        {
+                            composer
+                                .pl_0()
+                                .pr(px(crate::workspace::frame::CARD_OUTER_INSET))
+                                .pb_0()
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            composer
+                        }
+                    })
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         let key = event.keystroke.key.as_str();
                         let has_completions = !this.filtered_inline_skills(cx).is_empty();
@@ -4971,6 +5159,8 @@ impl Render for AgentPanel {
                                 input.update(cx, |s, cx| s.set_value("", window, cx));
                             }
                             this.inline_skill_selection = 0;
+                            this.inline_skill_popup_scroll
+                                .scroll_to_item(this.inline_skill_selection);
                             cx.emit(InlineSkillAutocompleteChanged);
                             cx.notify();
                             window.prevent_default();
@@ -4980,16 +5170,35 @@ impl Render for AgentPanel {
                     // Input container — matches main input bar visual style
                     .child(
                         div()
+                            .debug_selector(|| "agent-composer-surface".into())
+                            .relative()
                             .flex()
-                            .items_center()
+                            .items_end()
                             .w_full()
                             .min_h(mono_space_px(theme, 46.0))
                             .gap(mono_space_px(theme, 8.0))
-                            .pl(mono_space_px(theme, 7.0))
+                            .pl(mono_space_px(theme, 8.0))
                             .pr(mono_space_px(theme, 8.0))
                             .py(mono_space_px(theme, 8.0))
-                            .rounded(mono_space_px(theme, 14.0))
-                            .bg(theme.background)
+                            .map(|surface| {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    surface.child(crate::workspace::frame::card_fill(
+                                        crate::workspace::frame::PANE_RADIUS,
+                                        theme.title_bar.blend(if theme.is_dark() {
+                                            theme.foreground.opacity(0.10)
+                                        } else {
+                                            gpui::white().opacity(0.55)
+                                        }),
+                                    ))
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    surface
+                                        .rounded(mono_space_px(theme, 12.0))
+                                        .bg(theme.background.blend(theme.foreground.opacity(0.035)))
+                                }
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, window, cx| {
@@ -5003,20 +5212,40 @@ impl Render for AgentPanel {
                                 div()
                                     .flex_1()
                                     .w_full()
-                                    .min_w(mono_space_px(theme, 120.0))
+                                    .min_w_0()
+                                    .debug_selector(|| "agent-composer-field".into())
                                     .font_family(theme.mono_font_family.clone())
                                     .text_size(inline_input_text_size)
+                                    // PressEnter owns submission; prevent native newline fallback.
+                                    .on_action(|_: &gpui_component::input::Enter, _, _| {})
                                     .child(
                                         div().w_full().child(
-                                            Input::new(&inline_input)
+                                            Textarea::new(&inline_input)
                                                 .appearance(false)
-                                                .cleanable(false)
                                                 .font_family(theme.mono_font_family.clone())
-                                                .text_size(inline_input_text_size),
+                                                .text_size(inline_input_text_size)
+                                                .min_h(mono_space_px(theme, 28.0)),
                                         ),
                                     ),
                             )
-                            .child(send_button),
+                            .child(send_button)
+                            .map(|surface| {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    surface.child(
+                                        crate::workspace::frame::card_edge(
+                                            crate::workspace::frame::PANE_RADIUS,
+                                            theme.foreground,
+                                            theme.is_dark(),
+                                        )
+                                        .inset_0(),
+                                    )
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    surface
+                                }
+                            }),
                     ),
             );
         }
@@ -5029,25 +5258,26 @@ impl Render for AgentPanel {
 fn humanize_model_name(model: &str) -> String {
     // Common patterns: "claude-sonnet-4-6" → "Sonnet 4.6",
     // "claude-sonnet-4-5-20250929" → "Sonnet 4.5"
-    if model.contains("claude") {
-        if let Some(rest) = model.strip_prefix("claude-") {
-            let mut segments: Vec<&str> = rest.split('-').collect();
-            // Strip trailing date stamp (8+ contiguous digits, e.g. 20250929).
-            if let Some(last) = segments.last() {
-                if last.len() >= 8 && last.chars().all(|c| c.is_ascii_digit()) {
-                    segments.pop();
-                }
-            }
-            if segments.len() >= 2 {
-                let family = segments[0];
-                let version = segments[1..].join(".");
-                let family_cap = if let Some(first) = family.chars().next() {
-                    format!("{}{}", first.to_uppercase(), &family[first.len_utf8()..])
-                } else {
-                    String::new()
-                };
-                return format!("{} {}", family_cap, version);
-            }
+    if model.contains("claude")
+        && let Some(rest) = model.strip_prefix("claude-")
+    {
+        let mut segments: Vec<&str> = rest.split('-').collect();
+        // Strip trailing date stamp (8+ contiguous digits, e.g. 20250929).
+        if let Some(last) = segments.last()
+            && last.len() >= 8
+            && last.chars().all(|c| c.is_ascii_digit())
+        {
+            segments.pop();
+        }
+        if segments.len() >= 2 {
+            let family = segments[0];
+            let version = segments[1..].join(".");
+            let family_cap = if let Some(first) = family.chars().next() {
+                format!("{}{}", first.to_uppercase(), &family[first.len_utf8()..])
+            } else {
+                String::new()
+            };
+            return format!("{} {}", family_cap, version);
         }
     }
     if model.contains("gpt-4") {
@@ -5061,9 +5291,865 @@ fn humanize_model_name(model: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // Keep existing production item ordering.
 mod tests {
     use super::{AgentPanel, PanelState, StepStatus, humanize_model_name};
     use con_agent::{AgentConfig, ProviderConfig, ProviderKind};
+    use con_core::terminal_status::Activity;
+
+    #[gpui::test]
+    fn expanding_retained_markdown_updates_the_virtualized_row(cx: &mut gpui::TestAppContext) {
+        use std::sync::Arc;
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let content = (0..15)
+            .map(|i| format!("Paragraph {i}.\n\n"))
+            .collect::<String>();
+        let parsed = Arc::new(super::ParsedChatMarkdown::parse(&content));
+        assert_eq!(parsed.block_count(), 15);
+        let (panel, window) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            panel.add_message("assistant", &content, cx);
+            let message = panel.state.messages.last_mut().unwrap();
+            message.content_markdown_len = content.len();
+            message.content_markdown = Some(parsed);
+            panel
+        });
+        window.simulate_resize(gpui::size(gpui::px(500.0), gpui::px(1000.0)));
+        let more = window
+            .debug_bounds("assistant-more")
+            .expect("expand control");
+        let before_height = window
+            .debug_bounds("assistant-markdown")
+            .unwrap()
+            .size
+            .height;
+        window.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert!(panel.assistant_message_views.last().unwrap().is_some());
+        });
+        window.simulate_click(more.center(), gpui::Modifiers::default());
+        for _ in 0..2 {
+            window.run_until_parked();
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(8));
+            window.run_until_parked();
+        }
+        window.update(|_, cx| {
+            let panel = panel.read(cx);
+            let view = panel
+                .assistant_message_views
+                .last()
+                .unwrap()
+                .as_ref()
+                .expect("retained view after click")
+                .read(cx);
+            assert_eq!(view.rendered_markdown_blocks, 15);
+            assert_eq!(view.markdown_block_views.len(), 15);
+        });
+        assert!(
+            window
+                .debug_bounds("assistant-markdown")
+                .unwrap()
+                .size
+                .height
+                > before_height
+        );
+        let less = window
+            .debug_bounds("assistant-more")
+            .expect("collapse remains available");
+        window.simulate_click(less.center(), gpui::Modifiers::default());
+        window.update(|_, cx| {
+            let view = panel
+                .read(cx)
+                .assistant_message_views
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .read(cx);
+            assert_eq!(view.rendered_markdown_blocks, 8);
+            assert!(!view.markdown_expanded);
+        });
+    }
+
+    #[gpui::test]
+    fn streaming_markdown_hydrates_without_a_manual_disclosure(cx: &mut gpui::TestAppContext) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let content = (0..15)
+            .map(|i| format!("Live paragraph {i}.\n\n"))
+            .collect::<String>();
+        let (panel, window) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            panel.update_streaming(&content, cx);
+            panel
+        });
+        window.simulate_resize(gpui::size(gpui::px(500.0), gpui::px(1000.0)));
+        for _ in 0..4 {
+            window.run_until_parked();
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(8));
+            window.run_until_parked();
+        }
+        window.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert!(panel.state.streaming);
+            let view = panel
+                .assistant_message_views
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .read(cx);
+            assert_eq!(view.rendered_markdown_blocks, 15);
+            assert_eq!(view.markdown_block_views.len(), 15);
+        });
+        assert!(window.debug_bounds("assistant-more").is_none());
+    }
+
+    #[gpui::test]
+    fn submission_shows_feedback_before_any_harness_event(cx: &mut gpui::TestAppContext) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (panel, view) = cx.add_window_view(AgentPanel::new);
+        view.simulate_resize(gpui::size(gpui::px(320.0), gpui::px(640.0)));
+        view.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.add_message("user", "Check the repository.", cx);
+                assert_eq!(panel.status_text().unwrap().1, "Working…");
+                assert!(!panel.state.streaming);
+                assert_eq!(
+                    panel.state.activity(),
+                    con_core::terminal_status::Activity::Busy
+                );
+            })
+        });
+        view.run_until_parked();
+        assert!(view.debug_bounds("busy-bars").is_some());
+        assert!(view.debug_bounds("agent-status-label").is_some());
+        view.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.update_streaming("The repository", cx);
+                assert_eq!(panel.status_text().unwrap().1, "Writing…");
+            })
+        });
+        view.run_until_parked();
+        assert!(view.debug_bounds("busy-bars").is_some());
+        view.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.stop(cx);
+            })
+        });
+        view.run_until_parked();
+        assert!(view.debug_bounds("busy-bars").is_none());
+        assert!(view.debug_bounds("agent-status-label").is_none());
+    }
+
+    #[gpui::test]
+    fn latest_action_fits_the_transcript_and_resumes_tail_following(cx: &mut gpui::TestAppContext) {
+        use gpui::{px, size};
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        for (font_size, width) in [(16.0, 280.0), (24.0, 280.0)] {
+            let (panel, view) = cx.add_window_view(|window, cx| {
+                gpui_component::Theme::update(cx, |theme| theme.font_size = px(font_size));
+                window.set_rem_size(px(font_size));
+                let mut panel = AgentPanel::new(window, cx);
+                panel.set_show_inline_input(true, cx);
+                for index in 0..40 {
+                    panel.state.restore_message(
+                        "assistant",
+                        &format!("Message {index}: inspect the terminal configuration."),
+                        None,
+                        None,
+                    );
+                }
+                panel
+            });
+            view.simulate_resize(size(px(width), px(500.0)));
+            view.update(|_, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.message_list_state.scroll_to(gpui::ListOffset {
+                        item_ix: 0,
+                        offset_in_item: px(0.0),
+                    });
+                    panel.follow_output = super::FollowOutputState::Detached;
+                    cx.notify();
+                })
+            });
+            view.run_until_parked();
+            let button = view.debug_bounds("agent-jump-to-latest").unwrap();
+            let transcript = view.debug_bounds("agent-transcript-viewport").unwrap();
+            let composer = view.debug_bounds("agent-composer-surface").unwrap();
+            assert!(button.left() > transcript.left());
+            assert!(button.right() < transcript.right());
+            assert!(button.top() >= transcript.top());
+            assert!(button.bottom() < composer.top());
+            view.simulate_click(button.center(), gpui::Modifiers::default());
+            view.run_until_parked();
+            view.update(|_, cx| assert!(panel.read(cx).is_scrolled_near_bottom()));
+            assert!(view.debug_bounds("agent-jump-to-latest").is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn user_message_and_hover_actions_fit_the_shared_transcript_measure(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{px, size};
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        for (font_size, width) in [(16.0, 280.0), (16.0, 640.0), (24.0, 280.0)] {
+            let (panel, view) = cx.add_window_view(|window, cx| {
+                gpui_component::Theme::update(cx, |theme| theme.font_size = px(font_size));
+                window.set_rem_size(px(font_size));
+                let mut panel = AgentPanel::new(window, cx);
+                panel.state.add_message("user", "检查补全路径：/opt/homebrew/share/zsh/site-functions/_alacritty\n\n这个错误来自哪里？");
+                panel.state.complete_response("先检查这个软链接。", None, None);
+                panel
+            });
+            view.simulate_resize(size(px(width), px(1000.0)));
+            let bubble = view.debug_bounds("agent-user-bubble").unwrap();
+            let actions = view.debug_bounds("agent-user-actions").unwrap();
+            let reply = view.debug_bounds("agent-assistant-message").unwrap();
+            assert!(bubble.left() >= reply.left());
+            assert!(bubble.right() <= reply.right());
+            assert!(actions.left() >= reply.left());
+            assert!(actions.right() <= reply.right());
+            assert!(actions.top() >= bubble.bottom());
+            assert!(
+                actions.bottom() <= reply.top(),
+                "hover actions must not overlap the reply"
+            );
+            assert!(reply.right() < px(width));
+            view.simulate_mouse_move(bubble.center(), None, gpui::Modifiers::default());
+            view.run_until_parked();
+            let edit = view.debug_bounds("agent-user-edit").unwrap();
+            view.simulate_mouse_move(edit.center(), None, gpui::Modifiers::default());
+            view.run_until_parked();
+            view.simulate_click(edit.center(), gpui::Modifiers::default());
+            view.update(|_, cx| assert_eq!(panel.read(cx).editing_msg_idx, Some(1)));
+        }
+    }
+
+    #[gpui::test]
+    fn trace_feedback_replaces_duplicate_footer_without_hiding_initial_wait(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (panel, view) = cx.add_window_view(AgentPanel::new);
+        view.simulate_resize(gpui::size(gpui::px(320.0), gpui::px(800.0)));
+        view.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.add_message("user", "Inspect the shell configuration.", cx);
+            })
+        });
+        view.run_until_parked();
+        assert!(view.debug_bounds("agent-status-label").is_some());
+        view.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel
+                    .state
+                    .update_thinking("Check the completion symlink first.");
+                cx.notify();
+            })
+        });
+        view.run_until_parked();
+        assert!(view.debug_bounds("agent-run-title").is_some());
+        assert!(view.debug_bounds("agent-status-label").is_none());
+        view.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.update_streaming("I will check the symlink.", cx);
+            })
+        });
+        view.run_until_parked();
+        assert!(view.debug_bounds("agent-answer").is_some());
+        assert!(view.debug_bounds("agent-run-title").is_some());
+        assert!(view.debug_bounds("agent-status-label").is_none());
+    }
+
+    #[test]
+    fn awaiting_response_clears_on_error_completion_and_restore() {
+        let mut state = super::PanelState::new();
+        state.add_message("user", "Check the repository.");
+        assert_eq!(state.status, super::AgentStatus::AwaitingResponse);
+        state.apply_event(con_core::harness::HarnessEvent::Error("Offline".into()));
+        assert_eq!(state.status, super::AgentStatus::Idle);
+        state.add_message("user", "Try again.");
+        state.complete_response("Done.", None, None);
+        assert_eq!(state.status, super::AgentStatus::Idle);
+        state.restore_message("user", "An old request.", None, None);
+        assert_eq!(state.status, super::AgentStatus::Idle);
+    }
+
+    #[gpui::test]
+    fn status_uses_shared_busy_bars_and_disappears_when_idle(cx: &mut gpui::TestAppContext) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (panel, view) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            panel.state.status = super::AgentStatus::Thinking;
+            panel
+        });
+        view.simulate_resize(gpui::size(gpui::px(280.0), gpui::px(640.0)));
+        for status in [super::AgentStatus::Thinking, super::AgentStatus::Responding] {
+            view.update(|_, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.state.status = status;
+                    cx.notify();
+                })
+            });
+            view.run_until_parked();
+            let bars = view.debug_bounds("busy-bars").unwrap();
+            let label = view.debug_bounds("agent-status-label").unwrap();
+            assert!((bars.center().y - label.center().y).abs() <= gpui::px(0.5));
+            assert!(bars.right() < label.left());
+        }
+        view.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.state.status = super::AgentStatus::Idle;
+                cx.notify();
+            })
+        });
+        view.run_until_parked();
+        assert!(view.debug_bounds("busy-bars").is_none());
+        assert!(view.debug_bounds("agent-status-label").is_none());
+    }
+
+    #[gpui::test]
+    fn live_activity_keeps_label_and_details_inside_narrow_and_scaled_panels(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{px, size};
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        for (font_size, width) in [(16.0, 280.0), (16.0, 640.0), (24.0, 280.0)] {
+            let (_, view) = cx.add_window_view(|window, cx| {
+                gpui_component::Theme::update(cx, |theme| theme.font_size = px(font_size));
+                window.set_rem_size(px(font_size));
+                let mut panel = AgentPanel::new(window, cx);
+                panel.state.add_tool_call("layout-test", "terminal_exec",
+                    r#"{"command":"服务器 /workspace/a-long-project-directory/build --configuration release"}"#);
+                panel
+            });
+            view.simulate_resize(size(px(width), px(800.0)));
+            let strip = view.debug_bounds("agent-current-activity").unwrap();
+            let label = view.debug_bounds("agent-live-label").unwrap();
+            let detail = view.debug_bounds("agent-live-detail").unwrap();
+            assert!(strip.left() > px(0.0));
+            assert!(strip.right() < px(width));
+            assert!(label.right() <= detail.left());
+            assert_eq!(label.center().y, detail.center().y);
+            assert!(detail.right() <= strip.right());
+            assert!(detail.bottom() <= strip.bottom());
+        }
+    }
+
+    #[gpui::test]
+    fn session_controls_keep_actions_visible_with_long_models_and_large_text(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (_panel, view) = cx.add_window_view(|window, cx| {
+            gpui_component::Theme::update(cx, |theme| theme.font_size = gpui::px(24.0));
+            window.set_rem_size(gpui::px(24.0));
+            let mut panel = AgentPanel::new(window, cx);
+            panel.model_name = "provider/a-long-model-name-with-release-and-context-suffix".into();
+            panel.state.status = super::AgentStatus::Thinking;
+            panel
+        });
+        view.simulate_resize(gpui::size(gpui::px(280.0), gpui::px(640.0)));
+        let header = view.debug_bounds("agent-header").unwrap();
+        let model = view.debug_bounds("agent-model-region").unwrap();
+        let actions = view.debug_bounds("agent-header-actions").unwrap();
+        assert!(model.right() <= actions.left());
+        assert!(actions.right() < header.right());
+        assert!(actions.top() >= header.top());
+        assert!(actions.bottom() <= header.bottom());
+    }
+
+    #[gpui::test]
+    fn activity_header_keeps_title_and_count_inside_narrow_panels(cx: &mut gpui::TestAppContext) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (_panel, view) = cx.add_window_view(|window, cx| {
+            gpui_component::Theme::update(cx, |theme| theme.font_size = gpui::px(24.0));
+            window.set_rem_size(gpui::px(24.0));
+            let mut panel = AgentPanel::new(window, cx);
+            panel.state.add_message("assistant", "Command was denied.");
+            panel.state.add_step("Run command");
+            panel.state.messages.last_mut().unwrap().steps[0].status = super::StepStatus::Denied;
+            panel
+        });
+        view.simulate_resize(gpui::size(gpui::px(280.0), gpui::px(640.0)));
+        let card = view.debug_bounds("agent-run-card").unwrap();
+        let answer = view.debug_bounds("agent-answer").unwrap();
+        assert!(
+            card.bottom() <= answer.top(),
+            "activity must precede the final reply"
+        );
+        let title = view.debug_bounds("agent-run-title").unwrap();
+        let summary = view.debug_bounds("agent-run-summary").unwrap();
+        let toggle = view.debug_bounds("agent-run-toggle").unwrap();
+        assert!(
+            toggle.left() >= card.left(),
+            "hover must stay inside the transcript clip"
+        );
+        assert!(toggle.right() <= card.right());
+        assert!(
+            summary.right() < toggle.right(),
+            "summary hover must retain trailing breathing room"
+        );
+        assert!(title.right() <= summary.left());
+        assert!(title.top() >= card.top());
+        assert!(summary.bottom() <= card.bottom());
+        assert!(title.right() < card.right());
+        assert!(summary.right() < card.right());
+    }
+
+    #[gpui::test]
+    fn reasoning_and_tool_headers_share_columns_at_narrow_and_scaled_widths(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        for (font_size, width) in [(16.0, 280.0), (16.0, 640.0), (24.0, 280.0)] {
+            let (_, view) = cx.add_window_view(|window, cx| {
+                gpui_component::Theme::update(cx, |theme| theme.font_size = gpui::px(font_size));
+                window.set_rem_size(gpui::px(font_size));
+                let mut panel = AgentPanel::new(window, cx);
+                panel
+                    .state
+                    .update_thinking("Check the repository before running the build.");
+                panel.state.add_tool_call(
+                    "build",
+                    "terminal_exec",
+                    r#"{"command":"cargo build --release"}"#,
+                );
+                panel.state.complete_tool_call("build", "Build complete.");
+                panel
+                    .state
+                    .complete_response("The build passed.", None, None);
+                panel.state.messages.last_mut().unwrap().steps_collapsed = false;
+                panel
+            });
+            view.simulate_resize(gpui::size(gpui::px(width), gpui::px(800.0)));
+            let reasoning_icon = view.debug_bounds("agent-reasoning-icon").unwrap();
+            let tool_icon = view.debug_bounds("agent-tool-icon").unwrap();
+            let reasoning_label = view.debug_bounds("agent-reasoning-label").unwrap();
+            let tool_label = view.debug_bounds("agent-tool-label").unwrap();
+            assert_eq!(reasoning_icon.left(), tool_icon.left());
+            assert_eq!(reasoning_label.left(), tool_label.left());
+            // GPUI rounds the differently sized icon and text boxes to pixels.
+            assert!(
+                (reasoning_icon.center().y - reasoning_label.center().y).abs() <= gpui::px(0.5)
+            );
+            assert!((tool_icon.center().y - tool_label.center().y).abs() <= gpui::px(0.5));
+            assert_eq!(reasoning_label.size.height, tool_label.size.height);
+            assert!(view.debug_bounds("agent-tool-detail").unwrap().right() < gpui::px(width));
+        }
+    }
+
+    #[gpui::test]
+    fn reasoning_only_reply_expands_inside_the_activity_group(cx: &mut gpui::TestAppContext) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (panel, view) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            panel
+                .state
+                .update_thinking("First check the repository state.");
+            panel
+                .state
+                .complete_response("The repository is clean.", None, None);
+            panel
+        });
+        view.simulate_resize(gpui::size(gpui::px(500.0), gpui::px(800.0)));
+        assert!(view.debug_bounds("agent-reasoning-toggle").is_none());
+        let title = view.debug_bounds("agent-run-title").unwrap();
+        view.simulate_click(title.center(), gpui::Modifiers::default());
+        view.run_until_parked();
+        let reasoning = view.debug_bounds("agent-reasoning-toggle").unwrap();
+        view.simulate_click(reasoning.center(), gpui::Modifiers::default());
+        view.run_until_parked();
+        let content = view.debug_bounds("agent-reasoning-content").unwrap();
+        let answer = view.debug_bounds("agent-answer").unwrap();
+        assert!(content.bottom() <= answer.top());
+        view.update(|_, cx| {
+            let message = panel.read(cx).state.messages.last().unwrap();
+            assert!(!message.steps_collapsed);
+            assert!(!message.thinking_collapsed);
+        });
+    }
+
+    #[gpui::test]
+    fn approval_row_has_intrinsic_height_inside_the_transcript(cx: &mut gpui::TestAppContext) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (_panel, view) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            let _approval_rx = pending_approval(&mut panel.state, "preview-call");
+            panel
+        });
+        view.simulate_resize(gpui::size(gpui::px(320.0), gpui::px(640.0)));
+        let footer = view.debug_bounds("agent-current-activity").unwrap();
+        assert!(
+            footer.size.height > gpui::px(40.0),
+            "approval actions collapsed: {footer:?}"
+        );
+        assert!(footer.size.height <= gpui::px(320.0));
+        assert!(footer.bottom() <= gpui::px(640.0));
+    }
+
+    #[gpui::test]
+    fn completed_reply_replaces_live_activity_at_the_same_list_index(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (panel, view) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            panel.state.add_message("user", "Check the working tree.");
+            panel.state.add_tool_call("check", "shell_exec", "{}");
+            panel
+        });
+        view.simulate_resize(gpui::size(gpui::px(500.0), gpui::px(1000.0)));
+        assert!(view.debug_bounds("agent-current-activity").is_some());
+        let before = view.update(|_, cx| panel.read(cx).message_list_state.item_count());
+        view.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.state.complete_tool_call("check", "clean");
+                panel
+                    .state
+                    .complete_response("The working tree is clean.", None, None);
+                panel.sync_message_list_count();
+                cx.notify();
+            });
+        });
+        view.run_until_parked();
+        assert!(view.debug_bounds("agent-current-activity").is_none());
+        assert!(view.debug_bounds("agent-answer").is_some());
+        view.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert_eq!(before, panel.message_list_state.item_count());
+            assert_eq!(
+                panel.message_list_state.item_count(),
+                panel.state.messages.len()
+            );
+        });
+    }
+
+    fn pending_approval(
+        state: &mut PanelState,
+        call_id: &str,
+    ) -> crossbeam_channel::Receiver<con_agent::ToolApprovalDecision> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        state.add_pending_approval(call_id, "shell", "{}", tx);
+        rx
+    }
+
+    #[test]
+    fn presentation_attention_precedes_streaming_without_resolving_approval() {
+        let mut state = PanelState::new();
+        state.streaming = true;
+        assert_eq!(state.activity(), Activity::Busy);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        state.add_pending_approval("call", "shell", "{}", tx);
+        assert_eq!(state.activity(), Activity::NeedsInput);
+        assert!(rx.try_recv().is_err());
+        state.pending_approvals.clear();
+        assert_eq!(state.activity(), Activity::Busy);
+        state.streaming = false;
+        assert_eq!(state.activity(), Activity::Idle);
+    }
+
+    #[test]
+    fn out_of_order_request_completion_uses_approval_channel_identity() {
+        let mut state = PanelState::new();
+        let (first_tx, first_rx) = crossbeam_channel::bounded(1);
+        let (second_tx, second_rx) = crossbeam_channel::bounded(1);
+        state.add_pending_approval("first-call", "shell", "{}", first_tx.clone());
+        state.add_pending_approval("second-call", "shell", "{}", second_tx.clone());
+
+        state.apply_event(con_core::harness::HarnessEvent::RequestFinished {
+            approval_tx: second_tx,
+        });
+
+        assert!(first_rx.try_recv().is_err());
+        assert!(!second_rx.try_recv().expect("second request denial").allowed);
+        assert_eq!(state.pending_approvals.len(), 1);
+        assert_eq!(state.activity(), Activity::NeedsInput);
+
+        state.apply_event(con_core::harness::HarnessEvent::RequestFinished {
+            approval_tx: first_tx,
+        });
+        assert!(!first_rx.try_recv().expect("first request denial").allowed);
+        assert!(state.pending_approvals.is_empty());
+        assert_eq!(state.activity(), Activity::Idle);
+    }
+
+    #[test]
+    fn approval_end_is_scoped_to_channel_and_call_id() {
+        let mut state = PanelState::new();
+        let (first_tx, first_rx) = crossbeam_channel::bounded(1);
+        let (second_tx, second_rx) = crossbeam_channel::bounded(1);
+        state.add_pending_approval("shared-call", "shell", "{}", first_tx.clone());
+        state.add_pending_approval("other-call", "shell", "{}", first_tx.clone());
+        state.add_pending_approval("shared-call", "shell", "{}", second_tx.clone());
+
+        state.apply_event(con_core::harness::HarnessEvent::ToolApprovalEnded {
+            call_id: "shared-call".into(),
+            approval_tx: first_tx,
+        });
+
+        assert_eq!(state.pending_approvals.len(), 2);
+        assert!(state.pending_approvals.iter().any(|approval| {
+            approval.call_id == "other-call" && !approval.approval_tx.same_channel(&second_tx)
+        }));
+        assert!(state.pending_approvals.iter().any(|approval| {
+            approval.call_id == "shared-call" && approval.approval_tx.same_channel(&second_tx)
+        }));
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn clear_and_truncate_deny_pending_approvals() {
+        let mut state = PanelState::new();
+        let clear_rx = pending_approval(&mut state, "clear-call");
+        state.clear();
+        assert!(!clear_rx.try_recv().expect("clear denial").allowed);
+
+        let truncate_rx = pending_approval(&mut state, "truncate-call");
+        state.truncate_to(0);
+        assert!(!truncate_rx.try_recv().expect("truncate denial").allowed);
+    }
+
+    #[test]
+    fn stop_denies_all_pending_approvals_and_becomes_idle() {
+        let mut state = PanelState::new();
+        state.add_message("user", "stop");
+        state.streaming = true;
+        let first_rx = pending_approval(&mut state, "first-call");
+        let second_rx = pending_approval(&mut state, "second-call");
+        state.stop();
+
+        assert!(!first_rx.try_recv().expect("first denial").allowed);
+        assert!(!second_rx.try_recv().expect("second denial").allowed);
+        assert_eq!(state.activity(), Activity::Idle);
+    }
+
+    #[gpui::test]
+    fn inline_composer_fits_narrow_panels_and_keeps_submit_inside(cx: &mut gpui::TestAppContext) {
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        for (font_size, width) in [(16.0, 240.0), (16.0, 400.0), (24.0, 280.0)] {
+            let (panel, view) = cx.add_window_view(|window, cx| {
+                gpui_component::Theme::update(cx, |theme| theme.font_size = gpui::px(font_size));
+                window.set_rem_size(gpui::px(font_size));
+                let mut panel = AgentPanel::new(window, cx);
+                panel.set_show_inline_input(true, cx);
+                panel
+            });
+            view.simulate_resize(gpui::size(gpui::px(width), gpui::px(500.0)));
+            view.update(|window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel
+                        .inline_input_state
+                        .as_ref()
+                        .unwrap()
+                        .update(cx, |input, cx| {
+                            input.set_value("Follow up\n第二行", window, cx);
+                        });
+                    cx.notify();
+                });
+            });
+            let surface = view.debug_bounds("agent-composer-surface").unwrap();
+            let transcript = view.debug_bounds("agent-transcript-viewport").unwrap();
+            assert!(
+                transcript.bottom() <= surface.top(),
+                "the input must reserve layout space, not cover messages"
+            );
+            let field = view.debug_bounds("agent-composer-field").unwrap();
+            let send = view.debug_bounds("agent-composer-send").unwrap();
+            assert!(surface.left() >= gpui::px(0.0));
+            #[cfg(not(target_os = "macos"))]
+            assert!(surface.left() > gpui::px(0.0));
+            assert!(surface.right() < gpui::px(width));
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(surface.bottom(), gpui::px(500.0));
+                assert_eq!(surface.left(), gpui::px(0.0));
+                assert_eq!(
+                    surface.right(),
+                    gpui::px(width - crate::workspace::frame::CARD_OUTER_INSET)
+                );
+                let visible_pane_edge = -gpui::px(crate::workspace::frame::CARD_OUTER_INSET);
+                assert_eq!(
+                    surface.left() - visible_pane_edge,
+                    gpui::px(width) - surface.right()
+                );
+                let header = view.debug_bounds("agent-header").unwrap();
+                assert_eq!(
+                    header.left(),
+                    gpui::px(crate::workspace::frame::AGENT_CONTENT_INSET)
+                );
+                assert_eq!(transcript.left(), header.left());
+            }
+            assert!(field.size.width > gpui::px(0.0));
+            assert!(field.right() <= send.left());
+            assert!(send.right() < surface.right());
+            assert!(send.bottom() < surface.bottom());
+        }
+    }
+
+    #[gpui::test]
+    fn completed_inline_skill_leaves_completion_and_can_submit(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        use std::{cell::RefCell, rc::Rc};
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let submits = Rc::new(RefCell::new(Vec::new()));
+        let observed = submits.clone();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            panel.set_show_inline_input(true, cx);
+            panel.set_skills(
+                (0..8)
+                    .map(|index| crate::input_bar::SkillEntry {
+                        name: format!("build-{index}"),
+                        description: "Build".into(),
+                    })
+                    .collect(),
+                cx,
+            );
+            panel
+                .inline_input_state
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+            panel
+        });
+        cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &super::InlineInputSubmit, _| {
+                observed.borrow_mut().push(event.text.clone());
+            })
+            .detach();
+        });
+        cx.simulate_input("/bu");
+        cx.simulate_keystrokes("down down down down down down down enter");
+        cx.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert_eq!(
+                panel.inline_input_state.as_ref().unwrap().read(cx).value(),
+                "/build-7 "
+            );
+            assert!(panel.filtered_inline_skills(cx).is_empty());
+            assert!(submits.borrow().is_empty());
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(*submits.borrow(), vec!["/build-7 ".to_string()]);
+    }
+
+    #[gpui::test]
+    fn inline_composer_submits_without_inserting_or_removing_text(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+        use std::{cell::RefCell, rc::Rc};
+
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let submissions = Rc::new(RefCell::new(Vec::new()));
+        let events = submissions.clone();
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            panel.set_show_inline_input(true, cx);
+            panel
+                .inline_input_state
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+            panel
+        });
+        cx.update(|_, cx| {
+            cx.subscribe(&panel, move |_, event: &super::InlineInputSubmit, _| {
+                events.borrow_mut().push(event.text.clone());
+            })
+            .detach();
+        });
+        cx.simulate_input("first");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("second");
+        assert!(submissions.borrow().is_empty());
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input("third");
+        cx.simulate_keystrokes("secondary-enter");
+        cx.simulate_input("clicked message");
+        let send = cx.debug_bounds("agent-composer-send").unwrap();
+        cx.simulate_click(send.center(), gpui::Modifiers::default());
+        cx.update(|window, cx| {
+            assert_eq!(
+                *submissions.borrow(),
+                ["first\nsecond", "third", "clicked message"]
+            );
+            let input = panel.read(cx).inline_input_state.as_ref().unwrap().read(cx);
+            assert_eq!(input.value(), "");
+            assert!(input.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn editing_shift_enter_preserves_draft_until_plain_enter(cx: &mut gpui::TestAppContext) {
+        use gpui::Focusable;
+
+        con_core::release_channel::init();
+        cx.update(gpui_component::init);
+        let (panel, cx) = cx.add_window_view(|window, cx| {
+            let mut panel = AgentPanel::new(window, cx);
+            panel.state.add_message("user", "original");
+            panel.state.add_message("assistant", "existing reply");
+            panel.start_editing(1, "original", window, cx);
+            let input = panel.edit_input_state.as_ref().unwrap();
+            input.update(cx, |input, cx| {
+                input.set_cursor_position(gpui_component::input::Position::new(0, 8), window, cx);
+                input.focus_handle(cx).focus(window, cx);
+            });
+            panel
+        });
+
+        cx.simulate_keystrokes("shift-enter");
+        cx.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert_eq!(panel.editing_msg_idx, Some(1));
+            assert_eq!(panel.state.messages.len(), 3);
+            assert_eq!(panel.state.messages[2].content, "existing reply");
+            assert_eq!(
+                panel.edit_input_state.as_ref().unwrap().read(cx).value(),
+                "original\n"
+            );
+        });
+
+        cx.simulate_input("continued");
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| {
+            let panel = panel.read(cx);
+            assert_eq!(panel.editing_msg_idx, None);
+            assert!(panel.edit_input_state.is_none());
+            assert_eq!(panel.state.messages.len(), 2);
+            assert_eq!(
+                panel.state.messages[1].content.trim_end(),
+                "original\ncontinued"
+            );
+        });
+    }
 
     #[test]
     fn humanize_strips_date_suffix() {
@@ -5203,6 +6289,32 @@ mod tests {
     }
 
     #[test]
+    fn local_codex_route_remains_selectable_without_con_auth() {
+        let mut config = AgentConfig::default();
+        config.provider = ProviderKind::CodexLocal;
+        config.providers.set(
+            &ProviderKind::Anthropic,
+            ProviderConfig {
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let providers = AgentPanel::configured_session_providers(&config);
+        assert_eq!(providers.first(), Some(&ProviderKind::CodexLocal));
+        assert_eq!(
+            AgentPanel::provider_short_label(&ProviderKind::CodexLocal),
+            "Codex"
+        );
+        config
+            .providers
+            .set(&ProviderKind::CodexLocal, ProviderConfig::default());
+        config.provider = ProviderKind::Anthropic;
+        assert!(
+            AgentPanel::configured_session_providers(&config).contains(&ProviderKind::CodexLocal)
+        );
+    }
+
+    #[test]
     fn configured_provider_list_excludes_model_only_entries() {
         let mut config = AgentConfig::default();
         config.provider = ProviderKind::Anthropic;
@@ -5224,6 +6336,19 @@ mod tests {
         let providers = AgentPanel::configured_session_providers(&config);
         assert!(providers.contains(&ProviderKind::Anthropic));
         assert!(!providers.contains(&ProviderKind::OpenAI));
+    }
+
+    #[test]
+    fn magpie_is_available_without_a_vendor_key() {
+        let mut config = AgentConfig::default();
+        config.select_provider(ProviderKind::Magpie);
+        assert!(AgentPanel::configured_session_providers(&config).contains(&ProviderKind::Magpie));
+        config.select_provider(ProviderKind::Anthropic);
+        config.providers.magpie = Some(ProviderConfig {
+            model: Some("group/coding".into()),
+            ..ProviderConfig::default()
+        });
+        assert!(AgentPanel::configured_session_providers(&config).contains(&ProviderKind::Magpie));
     }
 
     #[test]

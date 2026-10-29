@@ -74,34 +74,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.17.0
         # Same Zig the linux CI smoke test installs — needed for
         # con-ghostty's libghostty-vt build.
         shell: bash
+        timeout-minutes: 12
         run: |
-          set -euo pipefail
-          ZIG_VERSION="0.15.2"
-          ZIG_ARCH="x86_64"
-          ZIG_DIR="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}"
-          ZIG_TARBALL="${ZIG_DIR}.tar.xz"
-          for base_url in \
-            "https://zigmirror.hryx.net/zig" \
-            "https://zig.linus.dev/zig" \
-            "https://zig.mirror.mschae23.de/zig" \
-            "https://ziglang.freetls.fastly.net" \
-            "https://pkg.hexops.org/zig" \
-            "https://ziglang.org/download/${ZIG_VERSION}"; do
-            if curl --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
-              -sSfL "${base_url}/${ZIG_TARBALL}" \
-              -o "/tmp/${ZIG_TARBALL}"; then
-              break
-            fi
-          done
-          test -s "/tmp/${ZIG_TARBALL}"
-          mkdir -p "$HOME/.local"
-          tar -xJf "/tmp/${ZIG_TARBALL}" -C "$HOME/.local"
-          echo "$HOME/.local/${ZIG_DIR}" >> "$GITHUB_PATH"
-          "$HOME/.local/${ZIG_DIR}/zig" version
+          bash scripts/ci/test-install-zig.sh
+          bash scripts/ci/install-zig.sh
 
       - name: apt deps for gpui_linux (wayland/x11 + font stack)
         # Mirror the matrix from .github/workflows/ci-portable.yml so
@@ -221,7 +201,13 @@ jobs:
             -print0)
 
   update-appcast:
-    name: Update Sparkle appcast (linux-x86_64)
+    name: Prepare signed updater metadata (linux-x86_64)
+    concurrency:
+      # Each platform owns a different appcast file. Do not put these jobs
+      # in one GitHub concurrency group: it has only one pending slot, so a
+      # later platform completion silently cancels an earlier appcast job.
+      group: con-gh-pages-publish-linux
+      cancel-in-progress: false
     # Run on macOS because Sparkle's `sign_update` tool ships only in
     # the macOS Sparkle distribution. Identical pattern to
     # release-windows.yml's appcast job — same Ed25519 keypair, same
@@ -268,7 +254,8 @@ jobs:
         run: |
           if [[ -z "${SPARKLE_SIGNING_KEY:-}" ]]; then
             echo "available=false" >>"$GITHUB_OUTPUT"
-            echo "::warning::SPARKLE_SIGNING_KEY not set — skipping appcast update"
+            echo "::error::SPARKLE_SIGNING_KEY not set — cannot prepare signed updater metadata"
+            exit 1
           else
             echo "available=true" >>"$GITHUB_OUTPUT"
           fi
@@ -293,7 +280,7 @@ jobs:
           git clone --single-branch --branch gh-pages \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
             gh-pages 2>/dev/null || {
-            mkdir -p gh-pages/appcast
+            mkdir -p "gh-pages/release-staging/$GITHUB_REF_NAME/appcast"
             cd gh-pages
             git init
             git checkout -b gh-pages
@@ -327,12 +314,12 @@ jobs:
           channel="${{ steps.meta.outputs.channel }}"
           build_number="${{ github.run_number }}"
 
-          mkdir -p gh-pages/appcast
+          mkdir -p "gh-pages/release-staging/$GITHUB_REF_NAME/appcast"
 
           tarball=$(find release-artifacts -name "*-linux-x86_64.tar.gz" -type f | head -1)
           if [[ -z "$tarball" ]]; then
-            echo "::warning::No Linux tarball found — skipping"
-            exit 0
+            echo "::error::No Linux tarball found"
+            exit 1
           fi
 
           sig_output=$(./scripts/sparkle/sign-artifact.sh "$tarball")
@@ -346,7 +333,7 @@ jobs:
           tarball_name=$(basename "$tarball")
           download_url="https://github.com/${repo}/releases/download/${tag}/${tarball_name}"
 
-          appcast_file="gh-pages/appcast/${channel}-linux-x86_64.xml"
+          appcast_file="gh-pages/release-staging/${tag}/appcast/${channel}-linux-x86_64.xml"
 
           # Re-use the same appcast generator macOS + Windows use.
           # Linux has no OS-minimum equivalent in the Sparkle schema
@@ -371,7 +358,7 @@ jobs:
 
           echo "Updated appcast: ${channel}-linux-x86_64.xml (build $build_number)"
 
-      - name: Push appcast to gh-pages
+      - name: Stage signed appcasts without notifying clients
         if: steps.meta.outputs.channel != 'dev' && steps.sparkle.outputs.available == 'true'
         shell: bash
         run: |
@@ -379,15 +366,21 @@ jobs:
           cd gh-pages
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Keep install.sh in sync from main repo. The macOS release
-          # job also copies it, but if a Linux-only tag fires (or the
-          # macOS job hasn't run yet) we still want the latest script.
-          cp "${{ github.workspace }}/scripts/install.sh" install.sh
-          git add appcast/ install.sh
+          git add "release-staging/$GITHUB_REF_NAME/appcast/"
           if git diff --cached --quiet; then
             echo "No appcast changes to commit"
             exit 0
           fi
           git commit -m "Update Linux appcast for $GITHUB_REF_NAME"
-          git pull --rebase origin gh-pages 2>/dev/null || true
-          git push origin gh-pages
+          for attempt in 1 2 3 4 5; do
+            git fetch origin gh-pages
+            if git rebase origin/gh-pages && git push origin gh-pages; then
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "::error::Unable to push Linux appcast after $attempt attempts"
+              exit 1
+            fi
+            sleep $((attempt * 2))
+          done

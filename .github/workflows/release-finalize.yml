@@ -1,240 +1,237 @@
 name: Finalize release
 
-# Promotes a draft release to public once every platform-specific
-# release workflow (release-linux.yml, release-macos.yml,
-# release-windows.yml) has reported a `success` conclusion for the
-# same tag.
-#
-# Why this exists
-# ---------------
-# The three platform release workflows are independent (each fans out
-# from `push: tags`). They share a single GitHub release: whichever
-# job calls `gh release create` first wins the create, and the others
-# just upload to it. Until this workflow existed, the create call
-# also published the release immediately, so the moment the FASTEST
-# platform finished its `publish` job the release became visible at
-# `/releases/latest` — even though the other two platforms still
-# hadn't uploaded their assets. Fresh installs hit the symptom
-#
-#   irm https://nowled.ge/con-ps1 | iex
-#   ✗ no ZIP found for windows-x86_64
-#
-# (the tag was "latest" but only the Linux tarball was attached).
-#
-# Fix shape
-# ---------
-# release-{linux,macos,windows}.yml now create the release with
-# `--draft`. Drafts are invisible to `/releases/latest`, the public
-# REST API, and the public UI listing — install.sh / install.ps1
-# behave as if the tag does not exist yet, which is the correct
-# answer while assets are still uploading.
-#
-# This workflow watches the three release workflows, verifies the
-# release assets/appcasts/installers still agree on the same tag,
-# and only then flips the draft to public via
-# `gh release edit --draft=false`. If one platform or the final
-# release gate fails, the draft stays a draft (intentional — better
-# to block than to ship an incomplete release; the maintainer can
-# either re-run the failing job or flip the draft manually via the
-# UI once the situation is understood).
-#
-# Notes on workflow_run semantics
-# -------------------------------
-# - `workflow_run` only fires when the file is on the default branch.
-#   That matches every other tag-driven workflow in this repo.
-# - For tag pushes, `github.event.workflow_run.head_branch` is the
-#   tag name (e.g. `v0.1.0-beta.35`). We use it to derive the tag,
-#   and we use `head_sha` to correlate runs across the three sibling
-#   workflows.
-# - `gh release edit --draft=false` is idempotent for an already-
-#   published release, so concurrent finalize runs (which can fire
-#   roughly simultaneously when the slowest two platforms finish
-#   close together) are safe.
-
+# Signed metadata is prepared at tag-scoped staging paths. Only this workflow
+# can update the canonical feeds, after publication and anonymous HTTP checks.
 on:
   workflow_run:
     workflows:
       - "Release Linux"
       - "Release macOS"
       - "Release Windows"
-    types:
-      - completed
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to reconcile (no rebuild or retag)"
+        required: true
+        type: string
 
 permissions:
   contents: write
   actions: read
 
-# Serialize finalize attempts per-tag so two near-simultaneous
-# triggering completions don't both call `gh release edit` at the
-# same instant. Cheap insurance — the operation is idempotent, but
-# this also avoids two concurrent runs racing to compute the
-# "all green?" result with a stale cache.
+# Do not collapse sibling completion events into one pending concurrency slot.
 concurrency:
-  group: release-finalize-${{ github.event.workflow_run.head_branch }}
+  group: release-finalize-${{ github.event.workflow_run.id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   finalize:
-    name: Promote draft when all platforms ship
+    name: Reconcile release and publish verified updater feeds
     runs-on: ubuntu-latest
-
-    # Skip everything that didn't come from a `push` to a tag —
-    # workflow_run fires for every conclusion (cancelled, skipped,
-    # failure, success) and for every event type the source workflow
-    # accepts. We only care about tag-push completions.
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.ctx.outputs.tag }}
+      ready: ${{ steps.gate.outputs.ready }}
     if: >-
-      github.event.workflow_run.event == 'push' &&
-      startsWith(github.event.workflow_run.head_branch, 'v')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
 
     steps:
-      - name: Resolve tag and head sha
+      # Use maintained finalization logic so recovery need not rebuild an old
+      # tag. Accept only tags whose commits are on main, never dispatch code.
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve and validate immutable tag
         id: ctx
         env:
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          TRIGGER_WORKFLOW: ${{ github.event.workflow_run.name }}
-          TRIGGER_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          echo "Triggered by: $TRIGGER_WORKFLOW (conclusion=$TRIGGER_CONCLUSION)"
-          echo "Tag:          $HEAD_BRANCH"
-          echo "Head SHA:     $HEAD_SHA"
-          echo "tag=$HEAD_BRANCH" >>"$GITHUB_OUTPUT"
-          echo "sha=$HEAD_SHA"   >>"$GITHUB_OUTPUT"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(beta|dev)\.[0-9]+)?$ ]] || exit 1
+          sha="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          git merge-base --is-ancestor "$sha" origin/main
+          [[ -z "$EXPECTED_SHA" || "$sha" == "$EXPECTED_SHA" ]] || exit 1
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
 
-      - name: Wait for all three platform workflows to succeed
+      - name: Reconcile required platform workflows
         id: gate
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ steps.ctx.outputs.sha }}
-        # Strategy: for each of the three release workflow files,
-        # query its workflow_runs filtered by head_sha and event=push.
-        # If at least one of those runs has conclusion=success, that
-        # platform is "done". If all three are done, we promote.
-        # Otherwise we exit cleanly — the next sibling's completion
-        # will trigger another finalize attempt.
-        #
-        # We don't use `--branch` because for tag pushes that filter
-        # is inconsistent across GitHub's REST surface in some
-        # corner cases; head_sha is unambiguous (all three sibling
-        # workflows run on exactly the same commit the tag points
-        # at).
-        run: |
-          set -euo pipefail
+          TAG: ${{ steps.ctx.outputs.tag }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+        run: python3 scripts/release/publication.py wait "$TAG" "$SHA"
 
-          workflows=(
-            "release-linux.yml"
-            "release-macos.yml"
-            "release-windows.yml"
-          )
-
-          all_done=1
-          for wf in "${workflows[@]}"; do
-            # `gh api` paginates with --paginate; cap the page size
-            # to avoid scanning the whole history for an old tag.
-            # The triggering run is recent, so the matching siblings
-            # are also in the last few pages of runs for that file.
-            runs_json=$(gh api \
-              "repos/${GH_REPO}/actions/workflows/${wf}/runs?head_sha=${HEAD_SHA}&event=push&per_page=20")
-
-            success_count=$(jq -r \
-              '[.workflow_runs[] | select(.conclusion == "success")] | length' \
-              <<<"$runs_json")
-
-            total_count=$(jq -r '.total_count' <<<"$runs_json")
-
-            echo "${wf}: head_sha=${HEAD_SHA} total=${total_count} success=${success_count}"
-
-            if [[ "$success_count" -lt 1 ]]; then
-              all_done=0
-            fi
-          done
-
-          if [[ "$all_done" -eq 1 ]]; then
-            echo "ready=true" >>"$GITHUB_OUTPUT"
-            echo "All three platform workflows succeeded for $HEAD_SHA — ready to promote."
-          else
-            echo "ready=false" >>"$GITHUB_OUTPUT"
-            echo "Not all platforms have succeeded yet; waiting for the next sibling's completion."
-          fi
-
-      - uses: actions/checkout@v5
-        if: steps.gate.outputs.ready == 'true'
-        with:
-          ref: ${{ steps.ctx.outputs.sha }}
-
-      - name: Checkout gh-pages for release gate
+      - name: Checkout gh-pages staging
         if: steps.gate.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git clone --single-branch --branch gh-pages \
-            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" \
-            gh-pages
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages
+          git -C gh-pages config user.name "github-actions[bot]"
+          git -C gh-pages config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Sync public installer scripts
-        if: steps.gate.outputs.ready == 'true'
-        run: |
-          set -euo pipefail
-
-          cp scripts/install.sh gh-pages/install.sh
-          cp scripts/install.ps1 gh-pages/install.ps1
-
-          cd gh-pages
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add install.sh install.ps1
-          if git diff --cached --quiet; then
-            echo "Installer scripts are already current."
-            exit 0
-          fi
-
-          git commit -m "Sync installer scripts for ${{ steps.ctx.outputs.tag }}"
-          git pull --rebase origin gh-pages
-          git push origin gh-pages
-
-      - name: Verify release payload before promotion
-        if: steps.gate.outputs.ready == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          ./scripts/release/verify-release-gate.sh "${{ steps.ctx.outputs.tag }}" gh-pages
-
-      - name: Promote draft to public release
+      - name: Verify payload, publish release, then notify updater clients
         if: steps.gate.outputs.ready == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.ctx.outputs.tag }}
-        # `gh release edit --draft=false` is idempotent: if a
-        # previous finalize run already promoted the release (e.g.
-        # because all three siblings finished within the same
-        # second), this call is a no-op. We still want to call it so
-        # any state drift (someone manually re-drafting via the UI
-        # mid-pipeline) gets corrected.
-        #
-        # We deliberately do NOT touch --prerelease here: the create
-        # step in each platform workflow set it correctly at draft
-        # time (true for *-dev.*, unset otherwise), and re-passing
-        # it would re-introduce the regression where beta tags
-        # appeared as Pre-release in the GitHub UI.
+          SHA: ${{ steps.ctx.outputs.sha }}
+        run: python3 scripts/release/publication.py finish "$TAG" "$SHA"
+
+  update-homebrew:
+    name: Update Homebrew cask
+    runs-on: macos-15
+    timeout-minutes: 10
+    needs: finalize
+    if: needs.finalize.outputs.ready == 'true' && !contains(needs.finalize.outputs.tag, '-dev.')
+    env:
+      RELEASE_TAG: ${{ needs.finalize.outputs.tag }}
+
+    steps:
+      - name: Derive release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          channel="stable"
+          if [[ "$version" == *"-beta."* ]]; then
+            channel="beta"
+          elif [[ "$version" == *"-dev."* ]]; then
+            channel="dev"
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "channel=$channel" >>"$GITHUB_OUTPUT"
+
+      - name: Download release artifacts
+        if: steps.meta.outputs.channel != 'dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release download "$RELEASE_TAG" --pattern '*-macos-*.dmg' --dir release-artifacts
+
+      - name: Update cask formula
+        if: steps.meta.outputs.channel != 'dev'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           set -euo pipefail
 
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::warning::release $TAG no longer exists — nothing to promote"
+          version="${{ steps.meta.outputs.version }}"
+          channel="${{ steps.meta.outputs.channel }}"
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN not set — skipping cask update"
             exit 0
           fi
 
-          is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
-          if [[ "$is_draft" != "true" ]]; then
-            echo "$TAG is already published — nothing to do."
+          # Determine cask name
+          if [[ "$channel" == "beta" ]]; then
+            cask="con-beta"
+            app_name="con Beta"
+          else
+            cask="con"
+            app_name="con"
+          fi
+
+          # Compute SHA256 for each arch DMG
+          arm64_dmg=$(find release-artifacts -name "*-macos-arm64.dmg" -type f | head -1)
+          x86_64_dmg=$(find release-artifacts -name "*-macos-x86_64.dmg" -type f | head -1)
+
+          arm64_sha=""
+          x86_64_sha=""
+          [[ -n "$arm64_dmg" ]] && arm64_sha=$(shasum -a 256 "$arm64_dmg" | cut -d' ' -f1)
+          [[ -n "$x86_64_dmg" ]] && x86_64_sha=$(shasum -a 256 "$x86_64_dmg" | cut -d' ' -f1)
+
+          if [[ -z "$arm64_sha" && -z "$x86_64_sha" ]]; then
+            echo "::warning::No DMGs found — skipping cask update"
             exit 0
           fi
 
-          echo "Promoting $TAG from draft to public release."
-          gh release edit "$TAG" --draft=false
+          # Pre-compute values to avoid mixing Ruby/bash syntax in heredoc
+          dmg_prefix="${app_name// /-}"
+          if [[ "$channel" == "beta" ]]; then
+            bundle_suffix=".beta"
+          else
+            bundle_suffix=""
+          fi
+
+          # Clone tap and update cask
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/nowledge-co/homebrew-tap.git" tap
+          cd tap
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3 4 5; do
+          git fetch origin main
+          git checkout --detach origin/main
+          current=$(ruby -e 'puts File.read(ARGV[0])[/version "([^"]+)"/, 1]' "Casks/${cask}.rb" 2>/dev/null || true)
+          if [[ -n "$current" ]] && ruby -e 'exit(Gem::Version.new(ARGV[0]) >= Gem::Version.new(ARGV[1]) ? 0 : 1)' "$current" "$version"; then
+            echo "Homebrew already has $current; refusing to downgrade."
+            exit 0
+          fi
+
+          cat > "Casks/${cask}.rb" <<EOF
+          cask "${cask}" do
+            version "${version}"
+
+            on_arm do
+              sha256 "${arm64_sha}"
+              url "https://github.com/nowledge-co/con-terminal/releases/download/v#{version}/${dmg_prefix}-#{version}-macos-arm64.dmg"
+            end
+
+            on_intel do
+              sha256 "${x86_64_sha}"
+              url "https://github.com/nowledge-co/con-terminal/releases/download/v#{version}/${dmg_prefix}-#{version}-macos-x86_64.dmg"
+            end
+
+            name "${app_name}"
+            desc "GPU-accelerated terminal emulator with built-in AI agent"
+            homepage "https://github.com/nowledge-co/con-terminal"
+
+            livecheck do
+              url :url
+              strategy :github_latest
+              regex(/v?(\d+(?:\.\d+)*(?:-beta\.\d+)?)/i)
+            end
+
+            auto_updates true
+            depends_on :macos
+
+            app "${app_name}.app"
+            binary "#{appdir}/${app_name}.app/Contents/MacOS/con-cli", target: "con-cli"
+
+            zap trash: [
+              "~/.config/con",
+              "~/Library/Caches/co.nowledge.con${bundle_suffix}",
+              "~/Library/Preferences/co.nowledge.con${bundle_suffix}.plist",
+            ]
+          end
+          EOF
+          sed -i '' 's/^          //' "Casks/${cask}.rb"
+
+          git add "Casks/${cask}.rb"
+          if git diff --cached --quiet; then
+            echo "No cask changes"
+            exit 0
+          fi
+          git commit -m "Update ${cask} to ${version}"
+          if git push origin HEAD:main; then
+            exit 0
+          fi
+          sleep $((attempt * 2))
+          done
+          echo "::error::Unable to publish Homebrew cask after retries"
+          exit 1

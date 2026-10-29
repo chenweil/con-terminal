@@ -27,6 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Test ticket-service retry policy
+        shell: bash
+        run: |
+          bash scripts/macos/test-stapler-retry.sh
+          bash scripts/macos/test-prebuilt-app.sh
+          bash scripts/macos/test-dependencies.sh
+
       - name: Derive release metadata
         id: meta
         shell: bash
@@ -44,40 +51,14 @@ jobs:
 
       - name: Install macOS dependencies
         shell: bash
-        run: |
-          set -euo pipefail
-          brew update
-          brew install cmake
+        run: bash scripts/macos/prepare-dependencies.sh
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.17.0
+        timeout-minutes: 12
         shell: bash
         run: |
-          set -euo pipefail
-          ZIG_VERSION="0.15.2"
-          case "${{ matrix.arch }}" in
-            arm64)  ZIG_ARCH="aarch64" ;;
-            x86_64) ZIG_ARCH="x86_64" ;;
-          esac
-          ZIG_DIR="zig-${ZIG_ARCH}-macos-${ZIG_VERSION}"
-          ZIG_TARBALL="${ZIG_DIR}.tar.xz"
-          for base_url in \
-            "https://zigmirror.hryx.net/zig" \
-            "https://zig.linus.dev/zig" \
-            "https://zig.mirror.mschae23.de/zig" \
-            "https://ziglang.freetls.fastly.net" \
-            "https://pkg.hexops.org/zig" \
-            "https://ziglang.org/download/${ZIG_VERSION}"; do
-            if curl --retry 3 --retry-all-errors --retry-delay 5 --connect-timeout 30 \
-              -sSfL "${base_url}/${ZIG_TARBALL}" \
-              -o "/tmp/${ZIG_TARBALL}"; then
-              break
-            fi
-          done
-          test -s "/tmp/${ZIG_TARBALL}"
-          mkdir -p "$HOME/.local"
-          tar -xf "/tmp/${ZIG_TARBALL}" -C "$HOME/.local"
-          echo "$HOME/.local/${ZIG_DIR}" >> "$GITHUB_PATH"
-          "$HOME/.local/${ZIG_DIR}/zig" version
+          bash scripts/ci/test-install-zig.sh
+          bash scripts/ci/install-zig.sh
 
       - name: Configure Rust toolchain
         shell: bash
@@ -90,15 +71,7 @@ jobs:
         shell: bash
         run: ./scripts/sparkle/download.sh
 
-      - name: Import Developer ID certificate
-        shell: bash
-        env:
-          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
-        run: ./scripts/macos/import-certificate.sh
-
-      - name: Build, sign, notarize, and package
+      - name: Build native app bundle
         shell: bash
         env:
           CON_CHANNEL: ${{ steps.meta.outputs.channel }}
@@ -106,6 +79,78 @@ jobs:
           CON_BUILD_NUMBER: ${{ github.run_number }}
           CON_ARCH: ${{ matrix.arch }}
           CON_RUST_TARGET: ${{ matrix.rust_target }}
+          CON_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          ./scripts/macos/build-app.sh
+          source ./scripts/macos/common.sh
+          setup_release_env
+          for binary in con con-cli; do
+            verify_native_binary_architecture "$CON_APP_BUNDLE_PATH/Contents/MacOS/$binary" "$CON_ARCH"
+          done
+          "$CON_APP_BUNDLE_PATH/Contents/MacOS/con-cli" --help >/dev/null
+          ditto -c -k --keepParent "$CON_APP_BUNDLE_PATH" "$RUNNER_TEMP/native-app.zip"
+
+      - name: Retain native bundle for packaging
+        uses: actions/upload-artifact@v5
+        with:
+          name: native-app-${{ matrix.arch }}
+          path: ${{ runner.temp }}/native-app.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: Package ${{ matrix.arch }}
+    needs: build
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: native-app-${{ matrix.arch }}
+          path: native-bundle
+
+      - name: Derive release metadata
+        id: meta
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          channel="stable"
+          case "$version" in
+            *-beta.*) channel="beta" ;;
+            *-dev.*) channel="dev" ;;
+          esac
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "channel=$channel" >>"$GITHUB_OUTPUT"
+
+      - name: Prepare Intel CLI validation on Apple Silicon
+        if: matrix.arch == 'x86_64'
+        run: /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+
+      - name: Test ticket-service retry policy
+        run: |
+          bash scripts/macos/test-stapler-retry.sh
+          bash scripts/macos/test-prebuilt-app.sh
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_KEYCHAIN_PASSWORD }}
+        run: ./scripts/macos/import-certificate.sh
+
+      - name: Sign, notarize, and package native bundle
+        env:
+          CON_CHANNEL: ${{ steps.meta.outputs.channel }}
+          CON_APP_VERSION: ${{ steps.meta.outputs.version }}
+          CON_BUILD_NUMBER: ${{ github.run_number }}
+          CON_ARCH: ${{ matrix.arch }}
+          CON_PREBUILT_APP_ARCHIVE: ${{ github.workspace }}/native-bundle/native-app.zip
           CON_REQUIRE_NOTARIZATION: "1"
           CON_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -121,7 +166,6 @@ jobs:
           CON_APP_VERSION: ${{ steps.meta.outputs.version }}
           CON_BUILD_NUMBER: ${{ github.run_number }}
           CON_ARCH: ${{ matrix.arch }}
-          CON_RUST_TARGET: ${{ matrix.rust_target }}
           CON_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
         run: |
           set -euo pipefail
@@ -143,13 +187,14 @@ jobs:
   publish:
     name: Publish GitHub release
     runs-on: ubuntu-latest
-    needs: build
+    needs: package
 
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/download-artifact@v5
         with:
+          pattern: macos-*
           path: release-artifacts
 
       - name: Derive release metadata
@@ -216,7 +261,13 @@ jobs:
             -print0)
 
   update-appcast:
-    name: Update Sparkle appcast
+    name: Prepare signed updater metadata
+    concurrency:
+      # Keep macOS retries independent from the other platform jobs. The
+      # push below rebases against the shared branch when another platform
+      # publishes first.
+      group: con-gh-pages-publish-macos
+      cancel-in-progress: false
     runs-on: macos-15
     needs: publish
 
@@ -236,9 +287,11 @@ jobs:
             channel="dev"
           fi
           marketing="${version%%[-+]*}"
-          echo "version=$version" >>"$GITHUB_OUTPUT"
-          echo "channel=$channel" >>"$GITHUB_OUTPUT"
-          echo "marketing=$marketing" >>"$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "channel=$channel"
+            echo "marketing=$marketing"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Check Sparkle signing key
         id: sparkle
@@ -249,7 +302,8 @@ jobs:
         run: |
           if [[ -z "${SPARKLE_SIGNING_KEY:-}" ]]; then
             echo "available=false" >>"$GITHUB_OUTPUT"
-            echo "::warning::SPARKLE_SIGNING_KEY not set — skipping appcast update"
+            echo "::error::SPARKLE_SIGNING_KEY not set — cannot prepare signed updater metadata"
+            exit 1
           else
             echo "available=true" >>"$GITHUB_OUTPUT"
           fi
@@ -263,6 +317,7 @@ jobs:
         if: steps.meta.outputs.channel != 'dev' && steps.sparkle.outputs.available == 'true'
         uses: actions/download-artifact@v5
         with:
+          pattern: macos-*
           path: release-artifacts
 
       - name: Checkout gh-pages
@@ -275,7 +330,7 @@ jobs:
           git clone --single-branch --branch gh-pages \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
             gh-pages 2>/dev/null || {
-            mkdir -p gh-pages/appcast
+            mkdir -p "gh-pages/release-staging/$GITHUB_REF_NAME/appcast"
             cd gh-pages
             git init
             git checkout -b gh-pages
@@ -298,19 +353,18 @@ jobs:
 
           repo="${{ github.repository }}"
           tag="$GITHUB_REF_NAME"
-          version="${{ steps.meta.outputs.version }}"
           channel="${{ steps.meta.outputs.channel }}"
           marketing="${{ steps.meta.outputs.marketing }}"
           build_number="${{ github.run_number }}"
 
-          mkdir -p gh-pages/appcast
+          mkdir -p "gh-pages/release-staging/$GITHUB_REF_NAME/appcast"
 
           for arch in arm64 x86_64; do
             # Find the DMG for this arch
             dmg=$(find release-artifacts -name "*-macos-${arch}.dmg" -type f | head -1)
             if [[ -z "$dmg" ]]; then
-              echo "::warning::No DMG found for $arch — skipping"
-              continue
+              echo "::error::No DMG found for $arch"
+              exit 1
             fi
 
             # Sign the artifact and extract signature
@@ -328,7 +382,7 @@ jobs:
             download_url="https://github.com/${repo}/releases/download/${tag}/${dmg_name}"
 
             # Update the appcast for this channel+arch
-            appcast_file="gh-pages/appcast/${channel}-macos-${arch}.xml"
+            appcast_file="gh-pages/release-staging/${tag}/appcast/${channel}-macos-${arch}.xml"
 
             APPCAST_FILE="$appcast_file" \
             APPCAST_TITLE="con" \
@@ -345,7 +399,7 @@ jobs:
             echo "Updated appcast: ${channel}-macos-${arch}.xml (build $build_number)"
           done
 
-      - name: Push appcast to gh-pages
+      - name: Stage signed appcasts without notifying clients
         if: steps.meta.outputs.channel != 'dev' && steps.sparkle.outputs.available == 'true'
         shell: bash
         run: |
@@ -353,141 +407,21 @@ jobs:
           cd gh-pages
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Keep install.sh in sync from main repo
-          cp "${{ github.workspace }}/scripts/install.sh" install.sh
-          git add appcast/ install.sh
+          git add "release-staging/$GITHUB_REF_NAME/appcast/"
           if git diff --cached --quiet; then
             echo "No appcast changes to commit"
             exit 0
           fi
           git commit -m "Update appcast for $GITHUB_REF_NAME"
-          # Pull-rebase to handle concurrent pushes gracefully
-          git pull --rebase origin gh-pages 2>/dev/null || true
-          git push origin gh-pages
-
-  update-homebrew:
-    name: Update Homebrew cask
-    runs-on: macos-15
-    needs: publish
-
-    steps:
-      - name: Derive release metadata
-        id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          channel="stable"
-          if [[ "$version" == *"-beta."* ]]; then
-            channel="beta"
-          elif [[ "$version" == *"-dev."* ]]; then
-            channel="dev"
-          fi
-          echo "version=$version" >>"$GITHUB_OUTPUT"
-          echo "channel=$channel" >>"$GITHUB_OUTPUT"
-
-      - name: Download release artifacts
-        if: steps.meta.outputs.channel != 'dev'
-        uses: actions/download-artifact@v5
-        with:
-          path: release-artifacts
-
-      - name: Update cask formula
-        if: steps.meta.outputs.channel != 'dev'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          version="${{ steps.meta.outputs.version }}"
-          channel="${{ steps.meta.outputs.channel }}"
-
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN not set — skipping cask update"
-            exit 0
-          fi
-
-          # Determine cask name
-          if [[ "$channel" == "beta" ]]; then
-            cask="con-beta"
-            app_name="con Beta"
-          else
-            cask="con"
-            app_name="con"
-          fi
-
-          # Compute SHA256 for each arch DMG
-          arm64_dmg=$(find release-artifacts -name "*-macos-arm64.dmg" -type f | head -1)
-          x86_64_dmg=$(find release-artifacts -name "*-macos-x86_64.dmg" -type f | head -1)
-
-          arm64_sha=""
-          x86_64_sha=""
-          [[ -n "$arm64_dmg" ]] && arm64_sha=$(shasum -a 256 "$arm64_dmg" | cut -d' ' -f1)
-          [[ -n "$x86_64_dmg" ]] && x86_64_sha=$(shasum -a 256 "$x86_64_dmg" | cut -d' ' -f1)
-
-          if [[ -z "$arm64_sha" && -z "$x86_64_sha" ]]; then
-            echo "::warning::No DMGs found — skipping cask update"
-            exit 0
-          fi
-
-          # Pre-compute values to avoid mixing Ruby/bash syntax in heredoc
-          dmg_prefix="${app_name// /-}"
-          if [[ "$channel" == "beta" ]]; then
-            bundle_suffix=".beta"
-          else
-            bundle_suffix=""
-          fi
-
-          # Clone tap and update cask
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/nowledge-co/homebrew-tap.git" tap
-          cd tap
-
-          cat > "Casks/${cask}.rb" <<EOF
-          cask "${cask}" do
-            version "${version}"
-
-            on_arm do
-              sha256 "${arm64_sha}"
-              url "https://github.com/nowledge-co/con-terminal/releases/download/v#{version}/${dmg_prefix}-#{version}-macos-arm64.dmg"
-            end
-
-            on_intel do
-              sha256 "${x86_64_sha}"
-              url "https://github.com/nowledge-co/con-terminal/releases/download/v#{version}/${dmg_prefix}-#{version}-macos-x86_64.dmg"
-            end
-
-            name "${app_name}"
-            desc "GPU-accelerated terminal emulator with built-in AI agent"
-            homepage "https://github.com/nowledge-co/con-terminal"
-
-            livecheck do
-              url :url
-              strategy :github_latest
-              regex(/v?(\d+(?:\.\d+)*(?:-beta\.\d+)?)/i)
-            end
-
-            auto_updates true
-            depends_on macos: ">= :catalina"
-
-            app "${app_name}.app"
-            binary "#{appdir}/${app_name}.app/Contents/MacOS/con-cli", target: "con-cli"
-
-            zap trash: [
-              "~/.config/con",
-              "~/Library/Caches/co.nowledge.con${bundle_suffix}",
-              "~/Library/Preferences/co.nowledge.con${bundle_suffix}.plist",
-            ]
-          end
-          EOF
-          sed -i '' 's/^          //' "Casks/${cask}.rb"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "Casks/${cask}.rb"
-          if git diff --cached --quiet; then
-            echo "No cask changes"
-            exit 0
-          fi
-          git commit -m "Update ${cask} to ${version}"
-          git push origin main
+          for attempt in 1 2 3 4 5; do
+            git fetch origin gh-pages
+            if git rebase origin/gh-pages && git push origin gh-pages; then
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "::error::Unable to push macOS appcast after $attempt attempts"
+              exit 1
+            fi
+            sleep $((attempt * 2))
+          done

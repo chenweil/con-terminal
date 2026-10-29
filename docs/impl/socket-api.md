@@ -33,9 +33,13 @@ The result in con is a hybrid:
 - CLI override: `con-cli --socket /custom/path ...`
 
 The app removes stale socket files on startup and creates the live socket with
-user-only permissions. Debug builds intentionally use a separate default
-endpoint so `cargo run -p con` can run beside an installed Con without making
-startup treat the dev process as another window for the production app.
+user-only permissions. When Con must create the socket's parent directory, it
+creates that directory with mode `0700`. Existing parents such as `/tmp`,
+`XDG_RUNTIME_DIR`, or a directory supplied through `CON_SOCKET_PATH` retain
+their ownership and permissions; the socket itself is restricted to mode
+`0600`. Debug builds intentionally use a separate default endpoint so
+`cargo run -p con` can run beside an installed Con without making startup
+treat the dev process as another window for the production app.
 
 ## Protocol
 
@@ -110,6 +114,10 @@ JSON-RPC 2.0 over a Unix domain socket, one JSON request per line and one JSON r
 ## CLI surface
 
 The first shipped client is `con-cli`.
+
+The same binary also provides the macOS shell-integration compatibility
+commands `+ssh` and `+ssh-cache`. Their protocol and fallback behavior are
+documented in [`ssh-integration.md`](ssh-integration.md).
 
 Examples:
 
@@ -235,4 +243,4 @@ Verified behavior notes:
 
 Current known limitation from the same live run:
 
-- `panes.create` returns promptly with `tab_index`, `pane_index`, `pane_id`, `surface_ready`, `is_alive`, and `has_shell_integration`. Use `pane_id` for follow-up targeting, then confirm the created pane exposes the exact control capabilities you need before driving it further.
+- `panes.create` returns promptly with `tab_index`, `pane_index`, `pane_id`, `surface_ready`, `is_alive`, and `has_shell_integration`. Its `observation_support` object distinguishes unsupported process metadata from temporarily unavailable values; on macOS, `foreground_process_group_id` and `tty_name` are supported. Use `pane_id` for follow-up targeting, then confirm the created pane exposes the exact control capabilities you need before driving it further.

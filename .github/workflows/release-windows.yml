@@ -100,10 +100,11 @@ jobs:
           Add-MpPreference -ExclusionPath "$env:USERPROFILE\.local" -ErrorAction SilentlyContinue
           Add-MpPreference -ExclusionPath $env:ZIG_GLOBAL_CACHE_DIR -ErrorAction SilentlyContinue
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.17.0
         shell: pwsh
         run: |
-          $ZigVersion = "0.15.2"
+          $ZigVersion = "0.17.0"
+          $ZigSha256 = "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428"
           $ZigDir    = "zig-x86_64-windows-$ZigVersion"
           $ZigZip    = "$ZigDir.zip"
           $Dest      = "$env:USERPROFILE\.local"
@@ -124,6 +125,11 @@ jobs:
               try {
                 Invoke-WebRequest -Uri $Url -OutFile $Out -TimeoutSec 120
                 if ((Test-Path $Out) -and ((Get-Item $Out).Length -gt 0)) {
+                  if ((Get-FileHash -Algorithm SHA256 $Out).Hash.ToLowerInvariant() -ne $ZigSha256) {
+                    Write-Warning "Zig checksum mismatch from $Url"
+                    Remove-Item -Force $Out
+                    continue
+                  }
                   $Downloaded = $true
                   break
                 }
@@ -395,7 +401,12 @@ jobs:
             -print0)
 
   update-appcast:
-    name: Update Sparkle appcast (windows-x86_64)
+    name: Prepare signed updater metadata (windows-x86_64)
+    concurrency:
+      # Keep Windows appcast publication independent from Linux/macOS. The
+      # three jobs update different appcast files and rebase before pushing.
+      group: con-gh-pages-publish-windows
+      cancel-in-progress: false
     # Run on macOS because Sparkle's `sign_update` tool ships only in
     # the macOS Sparkle distribution. The signing key is the same
     # Ed25519 keypair used for macOS artifacts — the Windows client
@@ -420,9 +431,11 @@ jobs:
             channel="dev"
           fi
           marketing="${version%%[-+]*}"
-          echo "version=$version"     >>"$GITHUB_OUTPUT"
-          echo "channel=$channel"     >>"$GITHUB_OUTPUT"
-          echo "marketing=$marketing" >>"$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "channel=$channel"
+            echo "marketing=$marketing"
+          } >>"$GITHUB_OUTPUT"
 
       - name: Check Sparkle signing key
         id: sparkle
@@ -433,7 +446,8 @@ jobs:
         run: |
           if [[ -z "${SPARKLE_SIGNING_KEY:-}" ]]; then
             echo "available=false" >>"$GITHUB_OUTPUT"
-            echo "::warning::SPARKLE_SIGNING_KEY not set — skipping appcast update"
+            echo "::error::SPARKLE_SIGNING_KEY not set — cannot prepare signed updater metadata"
+            exit 1
           else
             echo "available=true" >>"$GITHUB_OUTPUT"
           fi
@@ -458,7 +472,7 @@ jobs:
           git clone --single-branch --branch gh-pages \
             "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
             gh-pages 2>/dev/null || {
-            mkdir -p gh-pages/appcast
+            mkdir -p "gh-pages/release-staging/$GITHUB_REF_NAME/appcast"
             cd gh-pages
             git init
             git checkout -b gh-pages
@@ -483,15 +497,14 @@ jobs:
           tag="$GITHUB_REF_NAME"
           version="${{ steps.meta.outputs.version }}"
           channel="${{ steps.meta.outputs.channel }}"
-          marketing="${{ steps.meta.outputs.marketing }}"
           build_number="${{ github.run_number }}"
 
-          mkdir -p gh-pages/appcast
+          mkdir -p "gh-pages/release-staging/$GITHUB_REF_NAME/appcast"
 
           zip=$(find release-artifacts -name "*-windows-x86_64.zip" -type f | head -1)
           if [[ -z "$zip" ]]; then
-            echo "::warning::No Windows ZIP found — skipping"
-            exit 0
+            echo "::error::No Windows ZIP found"
+            exit 1
           fi
 
           sig_output=$(./scripts/sparkle/sign-artifact.sh "$zip")
@@ -505,7 +518,7 @@ jobs:
           zip_name=$(basename "$zip")
           download_url="https://github.com/${repo}/releases/download/${tag}/${zip_name}"
 
-          appcast_file="gh-pages/appcast/${channel}-windows-x86_64.xml"
+          appcast_file="gh-pages/release-staging/${tag}/appcast/${channel}-windows-x86_64.xml"
 
           # Re-use the same appcast generator the macOS pipeline uses.
           # Windows has no OS minimum so we feed a harmless sentinel;
@@ -532,7 +545,7 @@ jobs:
 
           echo "Updated appcast: ${channel}-windows-x86_64.xml (build $build_number)"
 
-      - name: Push appcast to gh-pages
+      - name: Stage signed appcasts without notifying clients
         if: steps.meta.outputs.channel != 'dev' && steps.sparkle.outputs.available == 'true'
         shell: bash
         run: |
@@ -540,13 +553,21 @@ jobs:
           cd gh-pages
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Keep install.ps1 in sync from main repo
-          cp "${{ github.workspace }}/scripts/install.ps1" install.ps1
-          git add appcast/ install.ps1
+          git add "release-staging/$GITHUB_REF_NAME/appcast/"
           if git diff --cached --quiet; then
             echo "No appcast changes to commit"
             exit 0
           fi
           git commit -m "Update Windows appcast for $GITHUB_REF_NAME"
-          git pull --rebase origin gh-pages 2>/dev/null || true
-          git push origin gh-pages
+          for attempt in 1 2 3 4 5; do
+            git fetch origin gh-pages
+            if git rebase origin/gh-pages && git push origin gh-pages; then
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            if [[ "$attempt" -eq 5 ]]; then
+              echo "::error::Unable to push Windows appcast after $attempt attempts"
+              exit 1
+            fi
+            sleep $((attempt * 2))
+          done

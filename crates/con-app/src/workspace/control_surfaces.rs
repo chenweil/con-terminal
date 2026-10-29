@@ -137,6 +137,9 @@ impl ConWorkspace {
                 surface_ready: terminal.surface_ready(cx),
                 is_alive: terminal.is_alive(cx),
                 has_shell_integration: terminal.has_shell_integration(cx),
+                observation_support: terminal.observation_support(cx),
+                foreground_process_group_id: terminal.foreground_process_group_id(cx),
+                tty_name: terminal.tty_name(cx),
             });
             created_any = true;
         }
@@ -360,7 +363,7 @@ impl ConWorkspace {
                     let closing = close_outcome.terminal.clone();
                     closing.set_focus_state(false, cx);
                     closing.set_native_view_visible(false, cx);
-                    closing.shutdown_surface(cx);
+                    closing.shutdown_surface(Some(window), cx);
                     if tab_idx == self.active_tab {
                         if close_outcome.closed_pane {
                             #[cfg(target_os = "macos")]
@@ -377,13 +380,12 @@ impl ConWorkspace {
                             }
                         }
                         self.sync_active_tab_native_view_visibility(cx);
-                        if closing_was_focused || close_outcome.closed_pane {
-                            if let Some(replacement) =
+                        if (closing_was_focused || close_outcome.closed_pane)
+                            && let Some(replacement) =
                                 self.tabs[tab_idx].pane_tree.try_focused_terminal().cloned()
-                            {
-                                replacement.ensure_surface(window, cx);
-                                replacement.focus(window, cx);
-                            }
+                        {
+                            replacement.ensure_surface(window, cx);
+                            replacement.focus(window, cx);
                         }
                         self.sync_active_terminal_focus_states(cx);
                     }
@@ -758,6 +760,9 @@ impl ConWorkspace {
             "surface_ready": terminal.surface_ready(cx),
             "is_alive": terminal.is_alive(cx),
             "has_shell_integration": terminal.has_shell_integration(cx),
+            "observation_support": terminal.observation_support(cx),
+            "foreground_process_group_id": terminal.foreground_process_group_id(cx),
+            "tty_name": terminal.tty_name(cx),
         })
     }
 
@@ -779,6 +784,9 @@ impl ConWorkspace {
             "is_alive": resolved.terminal.is_alive(cx),
             "has_shell_integration": resolved.terminal.has_shell_integration(cx),
             "is_busy": resolved.terminal.is_busy(cx),
+            "observation_support": resolved.terminal.observation_support(cx),
+            "foreground_process_group_id": resolved.terminal.foreground_process_group_id(cx),
+            "tty_name": resolved.terminal.tty_name(cx),
         })
     }
 
@@ -810,6 +818,9 @@ impl ConWorkspace {
             "is_alive": surface.terminal.is_alive(cx),
             "has_shell_integration": surface.terminal.has_shell_integration(cx),
             "is_busy": surface.terminal.is_busy(cx),
+            "observation_support": surface.terminal.observation_support(cx),
+            "foreground_process_group_id": surface.terminal.foreground_process_group_id(cx),
+            "tty_name": surface.terminal.tty_name(cx),
             "rows": rows,
             "cols": cols,
             "owner": surface.owner,
@@ -831,13 +842,14 @@ impl ConWorkspace {
                 if key.chars().count() == 1 {
                     return Ok(key.as_bytes().to_vec());
                 }
-                return Err(ControlError::invalid_params(format!(
+                Err(ControlError::invalid_params(format!(
                     "Unsupported surface key `{key}`. Supported keys: escape, enter, tab, backspace, ctrl-<letter>, ctrl-space/ctrl-@, ctrl-[, ctrl-\\, ctrl-], ctrl-^, ctrl-_, ctrl-/, ctrl-?, ctrl-~, ctrl-2..8."
-                )));
+                )))
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_shell_anchor_command<F>(
         &self,
         _tab_idx: usize,
@@ -866,15 +878,12 @@ impl ConWorkspace {
                     .update(cx, |_, cx| pane.recent_lines(400, cx))
                     .unwrap_or_default();
 
-                match parse_response(lines.clone()) {
-                    Ok(response) => {
-                        let _ = this.update(cx, |_, cx| {
-                            pane.recover_shell_prompt_state(cx);
-                        });
-                        let _ = response_tx.send(response);
-                        return;
-                    }
-                    Err(_) => {}
+                if let Ok(response) = parse_response(lines.clone()) {
+                    let _ = this.update(cx, |_, cx| {
+                        pane.recover_shell_prompt_state(cx);
+                    });
+                    let _ = response_tx.send(response);
+                    return;
                 }
 
                 if std::time::Instant::now() >= deadline {
@@ -1011,6 +1020,8 @@ impl ConWorkspace {
                         hostname_source: runtime.remote_host_source,
                         remote_workspace,
                         title: observation.title.clone(),
+                        foreground_process_group_id: observation.foreground_process_group_id,
+                        tty_name: observation.tty_name.clone(),
                         front_state: runtime.front_state,
                         mode: runtime.mode,
                         has_shell_integration: observation.has_shell_integration,
@@ -1143,6 +1154,9 @@ impl ConWorkspace {
                 surface_ready,
                 is_alive,
                 has_shell_integration,
+                observation_support,
+                foreground_process_group_id,
+                tty_name,
             } => Ok(json!({
                 "tab_index": tab_idx + 1,
                 "pane_index": pane_index,
@@ -1150,6 +1164,9 @@ impl ConWorkspace {
                 "surface_ready": surface_ready,
                 "is_alive": is_alive,
                 "has_shell_integration": has_shell_integration,
+                "observation_support": observation_support,
+                "foreground_process_group_id": foreground_process_group_id,
+                "tty_name": tty_name,
             })),
             con_agent::PaneResponse::Error(err) => Err(ControlError::invalid_params(err)),
         }
@@ -1158,6 +1175,9 @@ impl ConWorkspace {
     pub(super) fn terminal_exec_response_to_control_result(
         response: TerminalExecResponse,
     ) -> ControlResult {
+        if let Some(error) = response.completion_error_with_output() {
+            return Err(ControlError::internal(error));
+        }
         Ok(json!({
             "output": response.output,
             "exit_code": response.exit_code,

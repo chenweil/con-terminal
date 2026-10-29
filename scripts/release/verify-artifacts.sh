@@ -28,6 +28,38 @@ require_executable() {
   [[ -x "$path" ]] || fail "missing executable: $path"
 }
 
+require_symlink_target() {
+  local path="$1"
+  local expected_target="$2"
+  [[ -L "$path" ]] || fail "missing symlink: $path"
+  [[ "$(readlink "$path")" == "$expected_target" ]] \
+    || fail "$path must point to $expected_target"
+}
+
+require_desktop_entry() {
+  local desktop="$1"
+  local entry="$2"
+  grep -Fqx "$entry" "$desktop" \
+    || fail "$(basename "$desktop") is missing desktop entry: $entry"
+}
+
+verify_terminal_desktop_contract() {
+  local desktop="$1"
+  require_file "$desktop"
+  require_desktop_entry "$desktop" "X-TerminalArgExec=-e"
+  require_desktop_entry "$desktop" "X-TerminalArgDir=--working-directory="
+  require_desktop_entry "$desktop" "X-TerminalArgTitle=--title="
+  require_desktop_entry "$desktop" "X-TerminalArgAppId=--app-id="
+}
+
+verify_macos_app_contract() {
+  local app="$1"
+  require_executable "$app/Contents/MacOS/con"
+  require_executable "$app/Contents/MacOS/con-cli"
+  require_symlink_target "$app/Contents/MacOS/ghostty" con-cli
+  "$app/Contents/MacOS/con-cli" --help >/dev/null
+}
+
 verify_linux() {
   local tarball="$1"
   local checksum="$2"
@@ -55,6 +87,8 @@ verify_linux() {
     || fail "$tarball_name does not contain con-cli"
   tar -tzf "$tarball" | grep -E "/co\\.nowledge\\.con\\.desktop$" >/dev/null \
     || fail "$tarball_name does not contain co.nowledge.con.desktop"
+  tar -tzf "$tarball" | grep -E "/co\\.nowledge\\.con\\.png$" >/dev/null \
+    || fail "$tarball_name does not contain co.nowledge.con.png"
 
   local tmp
   tmp="$(mktemp -d)"
@@ -72,6 +106,11 @@ verify_linux() {
 
   require_executable "$root/con"
   require_executable "$root/con-cli"
+  require_file "$root/co.nowledge.con.desktop"
+  require_file "$root/co.nowledge.con.png"
+  require_desktop_entry "$root/co.nowledge.con.desktop" "TryExec=con"
+  require_desktop_entry "$root/co.nowledge.con.desktop" "Icon=co.nowledge.con"
+  verify_terminal_desktop_contract "$root/co.nowledge.con.desktop"
   "$root/con-cli" --help >/dev/null
   log "Linux artifact OK: $tarball_name"
 }
@@ -87,9 +126,7 @@ verify_macos() {
   require_file "$dmg"
   require_file "$checksum"
 
-  require_executable "$app/Contents/MacOS/con"
-  require_executable "$app/Contents/MacOS/con-cli"
-  "$app/Contents/MacOS/con-cli" --help >/dev/null
+  verify_macos_app_contract "$app"
 
   log "checking macOS checksum"
   (
@@ -98,8 +135,19 @@ verify_macos() {
   )
 
   log "checking macOS ZIP layout"
-  unzip -l "$zip" | grep -F ".app/Contents/MacOS/con-cli" >/dev/null \
-    || fail "$(basename "$zip") does not contain bundled con-cli"
+  local zip_root
+  zip_root="$(mktemp -d)"
+  unzip -q "$zip" -d "$zip_root"
+  local zip_app=""
+  for candidate in "$zip_root"/*.app; do
+    if [[ -d "$candidate" ]]; then
+      zip_app="$candidate"
+      break
+    fi
+  done
+  [[ -n "$zip_app" ]] || fail "$(basename "$zip") does not contain an app bundle"
+  verify_macos_app_contract "$zip_app"
+  rm -rf "$zip_root"
 
   log "checking macOS DMG layout"
   local mount_point
@@ -115,14 +163,17 @@ verify_macos() {
     fi
   done
   [[ -n "$mounted_app" ]] || fail "$(basename "$dmg") does not contain an app bundle"
-  require_executable "$mounted_app/Contents/MacOS/con"
-  require_executable "$mounted_app/Contents/MacOS/con-cli"
-  "$mounted_app/Contents/MacOS/con-cli" --help >/dev/null
+  verify_macos_app_contract "$mounted_app"
 
   log "macOS artifact OK: $(basename "$dmg")"
 }
 
 case "${1:-}" in
+  desktop)
+    [[ "$#" -eq 2 ]] || fail "usage: $0 desktop <desktop-entry>"
+    verify_terminal_desktop_contract "$2"
+    log "terminal desktop contract OK: $(basename "$2")"
+    ;;
   linux)
     [[ "$#" -eq 3 ]] || fail "usage: $0 linux <tarball> <checksum>"
     verify_linux "$2" "$3"
@@ -132,6 +183,6 @@ case "${1:-}" in
     verify_macos "$2" "$3" "$4" "$5"
     ;;
   *)
-    fail "usage: $0 {linux|macos} ..."
+    fail "usage: $0 {desktop|linux|macos} ..."
     ;;
 esac

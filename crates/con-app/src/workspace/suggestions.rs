@@ -598,7 +598,7 @@ impl ConWorkspace {
     }
 
     pub(super) fn should_defer_top_chrome_refresh_when_tab_strip_appears() -> bool {
-        true
+        cfg!(not(target_os = "macos"))
     }
 
     #[cfg(test)]
@@ -607,9 +607,11 @@ impl ConWorkspace {
     }
 
     pub(super) fn request_tab_summaries(&self, cx: &App) {
+        log::trace!(target: "con::activity", "summary_poll");
         if !self.harness.config().suggestion_model.enabled {
             return;
         }
+        let started = std::time::Instant::now();
         let tx = self.tab_summary_tx.clone();
         let generation = self.tab_summary_generation;
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -626,7 +628,7 @@ impl ConWorkspace {
             let req = TabSummaryRequest {
                 tab_id: tab.summary_id,
                 cwd: terminal.current_dir(cx),
-                title: terminal.title(cx),
+                title: terminal.title_name(cx),
                 ssh_host: self.effective_remote_host_for_tab(i, &terminal, cx),
                 recent_commands: {
                     let mut histories: Vec<_> = tab.shell_history.iter().collect();
@@ -639,11 +641,21 @@ impl ConWorkspace {
                         .collect()
                 },
                 recent_output,
+                agent_cli: tab.agent_cli,
             };
             let tx = tx.clone();
             self.tab_summary_engine.request(req, move |summary| {
                 let _ = tx.send((generation, summary_epoch, summary));
             });
+        }
+        let elapsed = started.elapsed();
+        if elapsed > std::time::Duration::from_millis(50) {
+            log::warn!(
+                target: "con::perf",
+                "tab summary sampling blocked UI for {:.1}ms (tabs={})",
+                elapsed.as_secs_f64() * 1000.0,
+                self.tabs.len(),
+            );
         }
     }
 }
