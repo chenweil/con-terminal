@@ -12,6 +12,7 @@ con is still pre-release, so entries may group related beta work while the produ
 
 - Copy Path and Copy Name on a file or directory row copy the selected path or
   final name to the clipboard.
+  _(PR [#537](https://github.com/nowledge-co/con-terminal/pull/537) by [@chenweil](https://github.com/chenweil))_
 
 ## `v0.1.0-beta.161`
 
