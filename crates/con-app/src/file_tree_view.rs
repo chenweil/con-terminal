@@ -725,12 +725,12 @@ fn copy_path_text(path: &Path) -> String {
 
 /// Text copied by the "Copy Name" row action: the final path component.
 ///
-/// Returns an empty string for paths without a final component (for example
-/// a filesystem root), matching what the clipboard receives in that case.
+/// Filesystem roots such as `/` or `C:\` have no final component, so the
+/// displayed root name is copied instead, matching the tree row.
 fn copy_name_text(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_default()
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Build the context menu for a file/directory row in the file tree.
@@ -1303,7 +1303,8 @@ mod tests {
         assert_eq!(copy_name_text(Path::new("/project/src/main.rs")), "main.rs");
         // A directory row copies the directory name, not its contents.
         assert_eq!(copy_name_text(Path::new("/project/src")), "src");
-        // Paths without a final component copy an empty string.
-        assert_eq!(copy_name_text(Path::new("/")), "");
+        // Filesystem roots have no final component; copy the displayed root
+        // name (e.g. `/`) instead of an empty string.
+        assert_eq!(copy_name_text(Path::new("/")), "/");
     }
 }

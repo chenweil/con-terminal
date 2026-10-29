@@ -4,6 +4,15 @@ All notable changes to con are documented here.
 
 con is still pre-release, so entries may group related beta work while the product shape is stabilizing.
 
+## `v0.1.0-beta.162`
+
+### Added
+
+**File tree**
+
+- Copy Path and Copy Name on a file or directory row copy the selected path or
+  final name to the clipboard.
+
 ## `v0.1.0-beta.161`
 
 ### Changed
