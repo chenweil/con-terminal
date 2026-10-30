@@ -364,6 +364,9 @@ pub struct SessionSidebar {
     rail_scroll: gpui::ScrollHandle,
     /// Smooth width animation between rail (0.0) and pinned (1.0).
     width_motion: SidebarMotion,
+    /// Pinning a wide hover preview still starts with compact icon geometry.
+    /// Its layout must move independently of the already revealed width.
+    peek_pin_layout_motion: Option<SidebarMotion>,
     /// User-resized width of the pinned panel. Collapsed mode ignores
     /// this and stays at the fixed rail width.
     panel_width: f32,
@@ -571,6 +574,7 @@ impl SessionSidebar {
             peek_menu_subscription: None,
             rail_scroll: gpui::ScrollHandle::new(),
             width_motion: SidebarMotion::new(0.0),
+            peek_pin_layout_motion: None,
             panel_width: PANEL_WIDTH,
             effective_panel_max_width: PANEL_MAX_WIDTH,
             rename: None,
@@ -631,17 +635,23 @@ impl SessionSidebar {
         } else {
             PanelMode::Collapsed
         };
-        if self.mode != new_mode {
+        if self.mode != new_mode || had_rail_only_override {
             self.mode = new_mode;
             self.cancel_rename(cx);
             self.hovered_rail = None;
             let target = if pinned { 1.0 } else { 0.0 };
             if let Some(progress) = preview_progress {
                 self.width_motion = SidebarMotion::new(progress);
+            } else if pinned && had_rail_only_override {
+                self.width_motion = SidebarMotion::new(0.0);
+            }
+            if pinned && (preview_progress.is_some() || had_rail_only_override) {
+                self.peek_pin_layout_motion = Some(SidebarMotion::new(0.0));
+            }
+            if let Some(motion) = self.peek_pin_layout_motion.as_mut() {
+                motion.set_target(target);
             }
             self.width_motion.set_target(target);
-            cx.notify();
-        } else if had_rail_only_override {
             cx.notify();
         }
     }
@@ -684,7 +694,11 @@ impl SessionSidebar {
 
     pub fn advance_width_motion(&mut self, window: &mut Window, cx: &App) -> bool {
         self.width_motion.value(window, cx);
-        self.width_motion.is_animating()
+        let layout_animating = self.peek_pin_layout_motion.as_mut().is_some_and(|motion| {
+            motion.value(window, cx);
+            motion.is_animating()
+        });
+        self.width_motion.is_animating() || layout_animating
     }
 
     pub fn set_tools_panel_open(&mut self, open: bool, active_slot: ActivitySlot) -> bool {
@@ -2228,6 +2242,18 @@ impl Render for SessionSidebar {
         // The workspace samples this too, so terminal reservation follows
         // the same animated compact/expanded extent.
         let progress = self.width_motion.value(window, cx);
+        let layout_progress = self
+            .peek_pin_layout_motion
+            .as_mut()
+            .map_or(progress, |motion| motion.value(window, cx));
+        if self
+            .peek_pin_layout_motion
+            .as_ref()
+            .is_some_and(|motion| !motion.is_animating())
+            && !self.width_motion.is_animating()
+        {
+            self.peek_pin_layout_motion = None;
+        }
 
         if self.tools_panel_open || self.rail_only_override {
             return div()
@@ -2243,13 +2269,17 @@ impl Render for SessionSidebar {
 
         if self.is_pinned() || progress > 0.0 {
             let theme = cx.theme();
-            let layout = NavigationLayout::new(
+            let mut layout = NavigationLayout::new(
                 self.effective_panel_width(),
                 self.leading_top_pad.max(0.0),
                 ui_px(theme, ROW_HEIGHT).max(px(ROW_HEIGHT)).as_f32(),
                 ui_icon_px(theme, 16.0).as_f32(),
-                progress,
+                layout_progress,
             );
+            // Keep the preview's revealed width and labels while its compact
+            // icons travel into the pinned toolbar/list arrangement.
+            layout.width = RAIL_WIDTH + (self.effective_panel_width() - RAIL_WIDTH) * progress;
+            layout.label_opacity = ((progress - 0.15) / 0.7).clamp(0.0, 1.0);
             let panel = self
                 .render_panel_body(layout, window, cx)
                 .relative()
@@ -3354,6 +3384,66 @@ mod tests {
             }
             root
         }
+    }
+
+    #[gpui::test]
+    fn pinning_hover_animates_icons_even_when_preview_width_is_complete(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext;
+        use std::time::Instant;
+        cx.update(gpui_component::init);
+        let sidebar = cx.new(|cx| {
+            let mut sidebar = SessionSidebar::new(cx);
+            sidebar.sessions = vec![session(None, None)];
+            sidebar.peek_open = true;
+            sidebar.peek_motion = crate::motion::SidebarMotion::new(1.0);
+            sidebar
+        });
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            cx.observe(&sidebar, |_, _, cx| cx.notify()).detach();
+            NavigationPeekTestView(sidebar.clone())
+        });
+        let compact_icon = cx.debug_bounds("tab-sidebar-rail-files-icon").unwrap();
+        let preview_width = cx
+            .debug_bounds("sidebar-navigation-peek")
+            .unwrap()
+            .size
+            .width;
+        sidebar.update(cx, |sidebar, cx| sidebar.set_pinned(true, cx));
+        let start_icon = cx.debug_bounds("tab-sidebar-rail-files-icon").unwrap();
+        assert!((start_icon.top() - compact_icon.top()).abs() < px(2.0));
+        assert_eq!(
+            sidebar.read_with(cx, |s, _| px(s.rendered_width())),
+            preview_width
+        );
+        sidebar.update(cx, |sidebar, cx| {
+            let mut motion = crate::motion::SidebarMotion::new(0.0);
+            motion.retarget_at(1.0, Instant::now() - Duration::from_millis(48));
+            sidebar.peek_pin_layout_motion = Some(motion);
+            cx.notify();
+        });
+        let intermediate = cx.debug_bounds("tab-sidebar-rail-files-icon").unwrap();
+        assert!(intermediate.top() < start_icon.top() - px(2.0));
+        assert!(intermediate.top() > px(16.0));
+        sidebar.update(cx, |sidebar, cx| sidebar.set_pinned(false, cx));
+        let reversed = cx.debug_bounds("tab-sidebar-rail-files-icon").unwrap();
+        assert!((reversed.top() - intermediate.top()).abs() < px(2.0));
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        sidebar.update(cx, |_, cx| cx.notify());
+        assert_eq!(
+            sidebar.read_with(cx, |s, _| s.rendered_width()),
+            super::RAIL_WIDTH
+        );
+        sidebar.update(cx, |sidebar, cx| {
+            sidebar.peek_open = true;
+            sidebar.peek_motion = crate::motion::SidebarMotion::new(1.0);
+            sidebar.set_pinned(true, cx);
+        });
+        let reduced = cx.debug_bounds("tab-sidebar-rail-files-icon").unwrap();
+        let mode = cx.debug_bounds("tab-sidebar-rail-expand-icon").unwrap();
+        assert_eq!(reduced.top(), mode.top());
+        assert!(sidebar.read_with(cx, |s, _| s.peek_pin_layout_motion.is_none()));
     }
 
     #[gpui::test]

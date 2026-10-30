@@ -40,3 +40,9 @@ same quiet, borderless and shadowless treatment as the surrounding UI.
 The preview is attached chrome, not a floating card: its internal edge must
 continue straight from the caption to the window bottom. Independent corner
 rounding exposes the terminal at the joint and makes the surface look detached.
+
+Pinning also exposed an animation coupling: a fully revealed hover preview has
+width progress 1 while its icons still occupy compact positions. Reusing that
+progress for pinned geometry skipped the compact-to-expanded icon animation.
+A separate geometry spring carries this handoff, retaining the revealed width
+and labels, preserving reversal velocity and participating in frame scheduling.

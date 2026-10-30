@@ -232,6 +232,9 @@ It should feel like the best place to do terminal-native work in the AI era.
   The preview continues the caption surface down to the window bottom. Keep its
   internal right edge straight; local rounded corners cut visible notches into
   this attached chrome. The native window owns the exterior corner treatment.
+  Pinning a hover preview retains its revealed width and labels, but animates
+  compact icon geometry into the pinned toolbar/list. Width completion must not
+  skip icon motion; preserve continuity on reversal and respect Reduce Motion.
 - Explicit compact/pinned geometry shares the existing sidebar spring. Tool icons
   move from the rail into the toolbar, and tab identities move up into the
   full-width list. Mount one identity and one status marker per row, not two
