@@ -145,6 +145,20 @@ impl ConWorkspace {
             };
             let max_width = max_sidebar_panel_width(win_w, agent_w);
             let delta = f32::from(event.position.x) - start_x;
+            if should_collapse_vertical_tabs_on_resize(
+                start_width + delta,
+                self.vertical_tabs_enabled(),
+                self.sidebar_tools_open,
+            ) {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    // Reopening restores the width from before this gesture,
+                    // rather than leaving the navigator stuck at its minimum.
+                    sidebar.set_panel_width(start_width, cx);
+                    sidebar.set_pinned(false, cx);
+                });
+                self.finish_active_resize_drag(cx);
+                return true;
+            }
             let new_width = (start_width + delta).clamp(PANEL_MIN_WIDTH, max_width);
             let current_width = self.sidebar.read(cx).panel_width();
             if (current_width - new_width).abs() > 0.5 {
@@ -389,8 +403,10 @@ impl Render for ConWorkspace {
                 && self.vertical_tabs_enabled()
                 && self.sidebar_tools_open;
             let slot = self.activity_slot;
-            self.sidebar.update(cx, |sidebar, _| {
-                sidebar.set_tools_panel_open(tools_open, slot)
+            self.sidebar.update(cx, |sidebar, cx| {
+                if sidebar.set_tools_panel_open(tools_open, slot) {
+                    cx.notify();
+                }
             });
         }
         let rail_transitioning = self
@@ -500,22 +516,35 @@ impl Render for ConWorkspace {
         let agent_panel_reserved_for_layout = self.agent_panel_open || agent_panel_progress > 0.0;
         let agent_panel_outer_width = (effective_agent_panel_width + 1.0) * agent_panel_progress;
         let sidebar_max_width = max_sidebar_panel_width(window_width, agent_panel_outer_width);
-        self.sidebar.update(cx, |sidebar, _| {
-            sidebar.set_effective_panel_max_width(sidebar_max_width);
-        });
         let vertical_tabs_enabled = self.vertical_tabs_enabled();
         let show_left_panel = self.left_panel_open || left_panel_progress > 0.0;
         let show_vertical_tabs = show_left_panel && vertical_tabs_enabled;
         let show_sidebar_tools =
             show_left_panel && (!vertical_tabs_enabled || self.sidebar_tools_open);
         #[cfg(not(target_os = "macos"))]
+        let terminal_gutter = 0.0;
+        #[cfg(target_os = "macos")]
+        let terminal_gutter = if show_sidebar_tools {
+            0.0
+        } else {
+            frame::CARD_OUTER_INSET * canvas_depth
+        };
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_effective_panel_max_width(sidebar_max_width);
+            if sidebar.set_terminal_gutter(terminal_gutter) {
+                cx.notify();
+            }
+        });
+        #[cfg(not(target_os = "macos"))]
         {
             let activity_slot = self.activity_slot;
-            self.sidebar.update(cx, |sidebar, _cx| {
-                sidebar.set_tools_panel_open(
+            self.sidebar.update(cx, |sidebar, cx| {
+                if sidebar.set_tools_panel_open(
                     show_left_panel && vertical_tabs_enabled && show_sidebar_tools,
                     activity_slot,
-                );
+                ) {
+                    cx.notify();
+                }
             });
         }
 
@@ -1683,9 +1712,17 @@ impl Render for ConWorkspace {
         // clipped by the sidebar's overflow-hidden container. Only composed
         // while the rail is actually in the layout; when it is not, clear
         // stale hover state (an unmounted rail cannot deliver hover-leave).
-        if !show_vertical_tabs {
+        if !show_vertical_tabs || !self.left_panel_open {
             self.sidebar
-                .update(cx, |sidebar, _cx| sidebar.clear_hovered_rail());
+                .update(cx, |sidebar, cx| sidebar.clear_hovered_rail(cx));
+        }
+        if show_vertical_tabs && self.left_panel_open {
+            let top = self.current_top_bar_height();
+            if let Some(peek) = self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.render_navigation_peek_overlay(top, top_bar_surface_color, window, cx)
+            }) {
+                root = root.child(peek);
+            }
         }
         if show_vertical_tabs
             && let Some(hover_card) = self.sidebar.update(cx, |sidebar, cx| {

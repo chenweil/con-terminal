@@ -208,10 +208,34 @@ It should feel like the best place to do terminal-native work in the AI era.
 - Compact tabs retain a 40px interaction target inside the 44px rail. Their
   visible selection fill is a centered 32px square with 10px rounding, leaving
   breathing room without making click or drag targets smaller.
+  On macOS, center navigation content across the reserved sidebar width plus
+  the actual adjacent terminal gutter. Apply the same correction to expanded
+  rows and the toolbar; do not change pane geometry or Files/Search alignment.
 - Expanded navigation has no permanent left tool column and no redundant
   "Tabs / count" heading. The mode control's tooltip includes the tab count.
-  Four 28px toolbar targets stay usable at the minimum 184px sidebar width.
-- Compact/expanded geometry shares the existing sidebar spring. Tool icons
+  Four toolbar targets stay usable at the minimum 184px sidebar width. Use
+  official Phosphor Regular assets at 16px: List for tab navigation,
+  Tree View for files and List Magnifying Glass for search.
+- Hovering compact navigation briefly reveals the existing expanded list as
+  an opaque root overlay. Keep the compact layout reservation, terminal size,
+  caption and saved pinned preference unchanged. Hover changes only width and
+  label visibility: keep the rail toolbar, every tab's y position, 40px row
+  height, identity/status layout and scroll offset stable. Delay opening and closing to
+  tolerate incidental crossing; respect Reduce Motion. Pinning is an explicit
+  action. Dismiss the preview when navigation unmounts or Files/Search opens.
+  Pulling a pinned tab panel 24px past its minimum width folds it into the rail
+  and preserves the width from the start of that gesture for the next expansion.
+  Files/Search and horizontal-navigation drawers never fold through this gesture.
+  Preview actions with visible text do not repeat their label in a tooltip.
+  Navigation hover/press feedback uses quiet foreground-derived fills, never
+  elevation. Icon-only navigation and close hints remain borderless and shadowless.
+  The preview continues the caption surface down to the window bottom. Keep its
+  internal right edge straight; local rounded corners cut visible notches into
+  this attached chrome. The native window owns the exterior corner treatment.
+  Pinning a hover preview retains its revealed width and labels, but animates
+  compact icon geometry into the pinned toolbar/list. Width completion must not
+  skip icon motion; preserve continuity on reversal and respect Reduce Motion.
+- Explicit compact/pinned geometry shares the existing sidebar spring. Tool icons
   move from the rail into the toolbar, and tab identities move up into the
   full-width list. Mount one identity and one status marker per row, not two
   overlaid navigators. Preserve the compact endpoint geometry so settling does

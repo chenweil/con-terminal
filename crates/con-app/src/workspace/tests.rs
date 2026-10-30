@@ -146,6 +146,29 @@ fn resize_drag_stops_when_left_button_is_no_longer_pressed() {
 }
 
 #[test]
+fn resizing_only_collapses_vertical_tab_navigation_after_a_deliberate_pull() {
+    use super::{PANEL_MIN_WIDTH, should_collapse_vertical_tabs_on_resize};
+    assert!(!should_collapse_vertical_tabs_on_resize(
+        PANEL_MIN_WIDTH,
+        true,
+        false
+    ));
+    assert!(!should_collapse_vertical_tabs_on_resize(
+        PANEL_MIN_WIDTH - 24.0,
+        true,
+        false
+    ));
+    assert!(should_collapse_vertical_tabs_on_resize(
+        PANEL_MIN_WIDTH - 25.0,
+        true,
+        false
+    ));
+    // Files/Search and horizontal-navigation drawers retain their resize behavior.
+    assert!(!should_collapse_vertical_tabs_on_resize(44.0, true, true));
+    assert!(!should_collapse_vertical_tabs_on_resize(44.0, false, false));
+}
+
+#[test]
 fn editor_only_tabs_focus_editor_when_no_terminal_exists() {
     assert_eq!(
         active_pane_focus_target(true, true),
