@@ -4,7 +4,30 @@ All notable changes to con are documented here.
 
 con is still pre-release, so entries may group related beta work while the product shape is stabilizing.
 
-## `v0.1.0-beta.161`
+## `v0.1.0-beta.162`
+
+### Changed
+
+**Tabs**
+
+- Reveal compact vertical-tab names and navigation actions on hover without
+  resizing terminal panes or moving tab/control baselines. Drag a pinned
+  navigator past its minimum width to return to compact mode.
+  _(PR [#538](https://github.com/nowledge-co/con-terminal/pull/538) by [@wey-gu](https://github.com/wey-gu))_
+- Balance vertical navigation spacing, use clearer navigation icons, and refine
+  hover feedback and the preview's connection to the titlebar. Pinning a hover
+  preview animates icons into the full layout, including reversals and Reduce Motion.
+  _(PR [#538](https://github.com/nowledge-co/con-terminal/pull/538) by [@wey-gu](https://github.com/wey-gu))_
+
+### Fixed
+
+**Agent identity**
+
+- Use Claude's starburst for Claude Code across horizontal/vertical tabs and
+  multi-pane icon groups, instead of Anthropic's corporate mark.
+  _(PR [#538](https://github.com/nowledge-co/con-terminal/pull/538) by [@wey-gu](https://github.com/wey-gu))_
+
+## `v0.1.0-beta.161` - 2026-10-29
 
 ### Changed
 
