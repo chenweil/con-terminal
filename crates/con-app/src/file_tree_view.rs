@@ -16,10 +16,11 @@
 
 use futures::{StreamExt, channel::mpsc};
 use gpui::{
-    ClipboardItem, Context, EventEmitter, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Render, SharedString, Styled, Window, div, prelude::*, px, svg, uniform_list,
+    ClipboardItem, Context, Entity, EventEmitter, Focusable, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, Styled, Subscription,
+    Window, anchored, deferred, div, prelude::*, px, svg, uniform_list,
 };
-use gpui_component::menu::{ContextMenuExt, PopupMenu};
+use gpui_component::menu::PopupMenu;
 use gpui_component::{ActiveTheme, tooltip::Tooltip};
 use notify::{EventKind, RecursiveMode, Watcher, event::ModifyKind};
 use parking_lot::Mutex;
@@ -34,6 +35,13 @@ use crate::ui_scale::ui_icon_px;
 const ROW_HEIGHT: f32 = 24.0;
 const INDENT_PER_LEVEL: f32 = 12.0;
 const ICON_SIZE: f32 = 13.0;
+
+struct FileContextMenu {
+    menu: Entity<PopupMenu>,
+    position: Point<Pixels>,
+    _dismiss: Subscription,
+    _observe: Subscription,
+}
 
 /// A single entry in the flat file tree list.
 #[derive(Clone, PartialEq, Eq)]
@@ -70,6 +78,7 @@ pub struct FileTreeView {
     expanded_paths: HashSet<PathBuf>,
     watcher: Option<Arc<Mutex<TreeWatcher>>>,
     watch_task: Option<gpui::Task<()>>,
+    context_menu: Option<FileContextMenu>,
 }
 
 impl FileTreeView {
@@ -83,6 +92,7 @@ impl FileTreeView {
             expanded_paths: HashSet::new(),
             watcher: None,
             watch_task: None,
+            context_menu: None,
         }
     }
 
@@ -94,6 +104,7 @@ impl FileTreeView {
         self.root_generation = self.root_generation.wrapping_add(1);
         self.load_generation = self.load_generation.wrapping_add(1);
         self.watch_task = None;
+        self.context_menu = None;
         self.watcher = None;
         self.root = Some(root.clone());
         self.expanded_paths = HashSet::from([root.clone()]);
@@ -111,6 +122,37 @@ impl FileTreeView {
 
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    fn open_context_menu(
+        &mut self,
+        path: PathBuf,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_focus = window.focused(cx);
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let menu = if let Some(handle) = previous_focus {
+                menu.action_context(handle)
+            } else {
+                menu
+            };
+            build_file_context_menu(menu, path)
+        });
+        let dismiss = cx.subscribe(&menu, |this, _, _: &gpui::DismissEvent, cx| {
+            this.context_menu = None;
+            cx.notify();
+        });
+        let observe = cx.observe(&menu, |_, _, cx| cx.notify());
+        menu.focus_handle(cx).focus(window, cx);
+        self.context_menu = Some(FileContextMenu {
+            menu,
+            position,
+            _dismiss: dismiss,
+            _observe: observe,
+        });
+        cx.notify();
     }
 
     pub fn active_path(&self) -> Option<&Path> {
@@ -524,7 +566,30 @@ fn build_entries(dir: &Path, depth: usize, _expand_root: bool) -> Vec<FileEntry>
 }
 
 impl Render for FileTreeView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rendered_menu = self.context_menu.as_ref().map(|state| {
+            let element = state.menu.update(cx, |menu, cx| {
+                let mut element = menu.render(window, cx).into_any_element();
+                // The pinned component exposes a stateful Div as its render root.
+                // Refine that surface only; retain its menu items, focus path,
+                // keyboard handlers and dismissal behavior intact.
+                let root = element
+                    .downcast_mut::<gpui::Stateful<gpui::Div>>()
+                    .expect("gpui-component 0.7 PopupMenu renders a stateful Div");
+                root.style().box_shadow = Some(Vec::new());
+                let theme = cx.theme();
+                let fill = theme
+                    .background
+                    .blend(
+                        theme
+                            .foreground
+                            .opacity(if theme.is_dark() { 0.04 } else { 0.025 }),
+                    );
+                root.style().background = Some(gpui::Hsla { a: 1.0, ..fill }.into());
+                element
+            });
+            (state.position, element)
+        });
         let theme = cx.theme();
 
         if self.root.is_none() {
@@ -595,6 +660,7 @@ impl Render for FileTreeView {
                     };
 
                     let weak = weak.clone();
+                    let weak_for_menu = weak.clone();
                     let path_for_menu = path.clone();
                     div()
                         .id(("file-row", idx))
@@ -698,8 +764,18 @@ impl Render for FileTreeView {
                                 }
                             },
                         )
-                        .context_menu(move |menu, _window, _cx| {
-                            build_file_context_menu(menu, path_for_menu.clone())
+                        .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                            cx.stop_propagation();
+                            if let Some(tree) = weak_for_menu.upgrade() {
+                                tree.update(cx, |tree, cx| {
+                                    tree.open_context_menu(
+                                        path_for_menu.clone(),
+                                        event.position,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
                         })
                         .into_any_element()
                 })
@@ -716,6 +792,31 @@ impl Render for FileTreeView {
             .flex_col()
             .occlude()
             .child(list)
+            .when_some(rendered_menu, |root, (position, menu)| {
+                root.child(
+                    deferred(
+                        anchored().child(
+                            div()
+                                .w(window.viewport_size().width)
+                                .h(window.viewport_size().height)
+                                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    anchored()
+                                        .position(position)
+                                        .snap_to_window_with_margin(px(8.0))
+                                        .child(
+                                            div()
+                                                .debug_selector(|| "file-copy-menu-surface".into())
+                                                .occlude()
+                                                .child(menu),
+                                        ),
+                                ),
+                        ),
+                    )
+                    // The paired gpui-base 0.7 popup layer uses priority 100.
+                    .with_priority(100),
+                )
+            })
             .into_any_element()
     }
 }
@@ -751,7 +852,7 @@ fn build_file_context_menu(menu: PopupMenu, path: PathBuf) -> PopupMenu {
         )));
     });
 
-    menu.min_w(px(180.0))
+    menu.min_w(px(160.0))
         .item(copy_path_item)
         .item(copy_name_item)
 }
@@ -786,6 +887,11 @@ mod tests {
             tree.active_path = Some(file.clone());
         });
         let (_, cx) = cx.add_window_view(|_, _| FileTreeTestView(tree.clone()));
+        let previous_focus = cx.update(|window, cx| {
+            let handle = cx.focus_handle();
+            handle.focus(window, cx);
+            handle
+        });
         let opened = Rc::new(Cell::new(0));
         cx.update(|_, cx| {
             let opened = opened.clone();
@@ -810,11 +916,14 @@ mod tests {
             let bounds = cx.debug_bounds(row).unwrap();
             cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Default::default());
             cx.simulate_mouse_up(bounds.center(), MouseButton::Right, Default::default());
+            assert!(cx.debug_bounds("file-copy-menu-surface").is_some());
             cx.simulate_keystrokes(keys);
             cx.run_until_parked();
             let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
             assert_eq!(copied.as_deref(), Some(expected.as_str()));
             assert_eq!(opened.get(), 0, "copy must not preview a file");
+            assert!(cx.debug_bounds("file-copy-menu-surface").is_none());
+            assert!(cx.update(|window, _| previous_focus.is_focused(window)));
             tree.read_with(cx, |tree, _| {
                 assert!(
                     tree.entries[0].is_expanded,
@@ -823,6 +932,12 @@ mod tests {
                 assert_eq!(tree.active_path(), Some(file.as_path()));
             });
         }
+        let bounds = cx.debug_bounds("file-tree-row-0").unwrap();
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(bounds.center(), MouseButton::Right, Default::default());
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("file-copy-menu-surface").is_none());
+        assert!(cx.update(|window, _| previous_focus.is_focused(window)));
     }
 
     #[gpui::test]

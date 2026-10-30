@@ -290,6 +290,13 @@ It should feel like the best place to do terminal-native work in the AI era.
 - Set the UI font on tab navigation and file-tree containers, not only their text labels:
   deferred context menus inherit their trigger's text style. Keep directory
   metadata and code explicitly monospace.
+- Pane-local file and terminal-surface tabs share one height, selection/hover
+  fill, corner treatment, and circular close target. Their header height stays
+  unchanged. Hover remains quieter than selection even in an unfocused pane;
+  use foreground-derived fills rather than a heavy light-theme capsule.
+- File-copy context menus retain the component's navigation and focus behavior.
+  Refine its render-root surface to remove the default exterior ring/shadow, keep cursor
+  anchoring and viewport clamping, and restore focus after selection or Escape.
 
 ### 1. Terminal First
 
