@@ -709,6 +709,8 @@ impl Render for FileTreeView {
 
         div()
             .id("file-tree")
+            // Deferred context menus inherit the trigger container's font.
+            .font_family(theme.font_family.clone())
             .size_full()
             .flex()
             .flex_col()
@@ -765,6 +767,61 @@ mod tests {
     impl Render for FileTreeTestView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn row_copy_menu_targets_the_clicked_entry_without_opening_or_collapsing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::Cell, rc::Rc};
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes with spaces.txt");
+        fs::write(&file, "notes").unwrap();
+        let tree = cx.new(|_| FileTreeView::new());
+        tree.update(cx, |tree, _| {
+            tree.root = Some(dir.path().to_path_buf());
+            tree.entries = Arc::new(build_root_entries(dir.path()));
+            tree.active_path = Some(file.clone());
+        });
+        let (_, cx) = cx.add_window_view(|_, _| FileTreeTestView(tree.clone()));
+        let opened = Rc::new(Cell::new(0));
+        cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.subscribe(&tree, move |_, _: &OpenFile, _| {
+                opened.set(opened.get() + 1);
+            })
+            .detach();
+        });
+        for (row, keys, expected) in [
+            ("file-tree-row-1", "down enter", file.display().to_string()),
+            (
+                "file-tree-row-1",
+                "down down enter",
+                "notes with spaces.txt".to_string(),
+            ),
+            (
+                "file-tree-row-0",
+                "down down enter",
+                copy_name_text(dir.path()),
+            ),
+        ] {
+            let bounds = cx.debug_bounds(row).unwrap();
+            cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Default::default());
+            cx.simulate_mouse_up(bounds.center(), MouseButton::Right, Default::default());
+            cx.simulate_keystrokes(keys);
+            cx.run_until_parked();
+            let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+            assert_eq!(copied.as_deref(), Some(expected.as_str()));
+            assert_eq!(opened.get(), 0, "copy must not preview a file");
+            tree.read_with(cx, |tree, _| {
+                assert!(
+                    tree.entries[0].is_expanded,
+                    "copy must not collapse folders"
+                );
+                assert_eq!(tree.active_path(), Some(file.as_path()));
+            });
         }
     }
 

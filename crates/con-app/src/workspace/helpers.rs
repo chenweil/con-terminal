@@ -94,6 +94,16 @@ pub(super) fn resize_drag_should_continue(pressed_button: Option<MouseButton>) -
     pressed_button == Some(MouseButton::Left)
 }
 
+pub(super) fn should_collapse_vertical_tabs_on_resize(
+    proposed_width: f32,
+    vertical_tabs: bool,
+    tools_open: bool,
+) -> bool {
+    // A short deliberate pull beyond the minimum avoids accidental collapse
+    // while precisely sizing the panel near its smallest useful width.
+    vertical_tabs && !tools_open && proposed_width < PANEL_MIN_WIDTH - 24.0
+}
+
 pub(super) fn workspace_close_intent(
     pane_count: usize,
     editor_file_tabs: Option<usize>,
